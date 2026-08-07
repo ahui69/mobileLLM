@@ -120,6 +120,11 @@ class DeviceE2ETestCase: XCTestCase {
             withDescription: "Unknown-system-alert firewall"
         ) { alert in
             MainActor.assumeIsolated {
+                // The device matrix deliberately exercises the Calendar / Reminders / Location tools
+                // (matrix test29). Those tools request TCC authorization through the normal system
+                // prompt; granting the narrowest requested access is part of the scenario, exactly
+                // like a user enabling the tool. Everything else stays a hard boundary below.
+                if Self.grantToolPermissionIfRequested(alert) { return true }
                 // Handoff's "Pasting from <Mac>" prompt is unrelated to the app under test; dismiss it
                 // so memory/typing tests are not derailed by an ambient system UI. Everything else stays
                 // a hard boundary below.
@@ -144,6 +149,22 @@ class DeviceE2ETestCase: XCTestCase {
                 return true
             }
         }
+    }
+
+    /// Taps the least-privileged Allow action on a Calendar / Reminders / Location TCC prompt.
+    /// Returns false when the alert is not one of those prompts, so the caller keeps its hard boundary.
+    @MainActor
+    private static func grantToolPermissionIfRequested(_ alert: XCUIElement) -> Bool {
+        let label = alert.label
+        guard label.localizedCaseInsensitiveContains("would like to access") else { return false }
+        for buttonLabel in ["Allow While Using App", "Allow Once", "Allow"] {
+            let button = alert.buttons[buttonLabel]
+            if button.exists, button.isHittable {
+                button.tap()
+                return true
+            }
+        }
+        return false
     }
 
     override func tearDownWithError() throws {
