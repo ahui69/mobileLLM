@@ -304,7 +304,11 @@ struct AppFrozenInputBuilder: Sendable {
         let contextBudget = try ContextTokenBudget(
             maximumContextTokens: effectiveContext,
             reservedOutputTokens: 1_024,
-            maximumToolSchemaTokens: 1_024
+            // Tool schemas are charged to this budget during context compilation; with the default
+            // 1_024 tokens only ~4-5 built-ins fit and silently drop user-selected tools from the
+            // model's actual tools array. Online services have large contexts and receive rich
+            // schemas, so give them a generous schema budget; small local models keep the tight cap.
+            maximumToolSchemaTokens: online ? 16_384 : 1_024
         )
         // Online reasoning is an explicit per-service setting: `.enabled` lets the service run its own
         // thinking phase (the provider then omits the reasoning field), `.disabled` asks the service
@@ -380,6 +384,10 @@ struct AppFrozenInputBuilder: Sendable {
             selectionPolicyVersion: 1,
             materializedFromGlobalTemplate: false
         )
+        // Online services have large contexts and strong tool callers: advertise every enabled tool
+        // (protocol cap 64) so a user-selected tool is never silently truncated out of the prompt.
+        // Small local models keep the conservative 8-tool ceiling to protect their context window.
+        // (`online` is already bound above for the context budget.)
         return try FrozenAgentRunInputs(
             modelSelection: try selection(snapshot: snapshot),
             generationParameters: generationParameters,
@@ -398,7 +406,7 @@ struct AppFrozenInputBuilder: Sendable {
             ]),
             activeSkillToolHints: [],
             explicitlyRequestedToolIDs: toolCatalog.descriptors.map(\.id.logicalID),
-            maximumAdvertisedTools: 8,
+            maximumAdvertisedTools: online ? 64 : 8,
             contextPolicyVersion: 1,
             approvalPolicyVersion: 1
         )

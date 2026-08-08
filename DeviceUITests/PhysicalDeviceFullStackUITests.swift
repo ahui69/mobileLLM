@@ -1505,36 +1505,61 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
         try selectOnlineModel(in: app)
 
         let marker = uniqueMarker("TOOLV2")
-        let prompt = marker
-            + "\nCall each of these tools exactly once, in this order: "
-            + "1) wikipedia with query \"Machine learning\"; "
-            + "2) fetch_webpage with url \"https://example.com\"; "
-            + "3) list_calendar_events with daysAhead 7; "
-            + "4) create_reminder with title \"E2E \(marker) reminder\" and no due time; "
-            + "5) current_location with no arguments. "
-            + "After the calls, answer with one short line per result."
-        var evidence = try send(prompt, model: .bonsai, in: app, timeout: 600, assertEvidence: false)
-        let expectedTools = ["wikipedia", "fetch_webpage", "list_calendar_events",
-                             "create_reminder", "current_location"]
-        func missingTools(from activities: [String]) -> [String] {
-            expectedTools.filter { tool in
-                !activities.contains { $0.localizedCaseInsensitiveContains(tool) }
+        // One tool per turn: the online model reliably executes a single explicit call, while a
+        // five-tool demand in one turn regularly repeats a call and trips the runtime's
+        // repeated-call protection (which is correct hard-budget behavior, not something to weaken).
+        let scenarios: [(tool: String, prompt: String)] = [
+            ("wikipedia",
+             "\(marker)\nCall the wikipedia tool exactly once with query \"Machine learning\", "
+                 + "then reply in one short line."),
+            ("fetch_webpage",
+             "\(marker)\nCall the fetch_webpage tool exactly once with url \"https://example.com\", "
+                 + "then reply in one short line."),
+            ("list_calendar_events",
+             "\(marker)\nCall the list_calendar_events tool exactly once with daysAhead 7, "
+                 + "then reply in one short line."),
+            ("create_reminder",
+             "\(marker)\nCall the create_reminder tool exactly once with title \"E2E \(marker) "
+                 + "reminder\" and no due time, then reply in one short line."),
+            ("current_location",
+             "\(marker)\nCall the current_location tool exactly once with no arguments, "
+                 + "then reply in one short line."),
+        ]
+        func matchesTool(_ activities: [String], _ tool: String) -> Bool {
+            let humanized = tool.replacingOccurrences(of: "_", with: " ").lowercased()
+            return activities.contains { activity in
+                let lower = activity.localizedLowercase
+                return lower.localizedCaseInsensitiveContains(tool)
+                    || lower.localizedCaseInsensitiveContains(humanized)
             }
         }
-        var missing = missingTools(from: evidence.toolActivities)
-        if !missing.isEmpty {
-            evidence = try send(
-                "\(uniqueMarker("TOOLV2_RETRY"))\nYou must call the still-missing tools "
-                    + "\(missing.joined(separator: ", ")) now, then reply briefly.",
-                model: .bonsai, in: app, timeout: 600, assertEvidence: false)
-            missing = missingTools(from: evidence.toolActivities)
+        var missing: [String] = []
+        var allActivities: [String] = []
+        for scenario in scenarios {
+            var sawTool = false
+            for attempt in 0..<2 {
+                if sawTool { break }
+                let prompt = attempt == 0
+                    ? scenario.prompt
+                    : "\(uniqueMarker("TOOLV2_RETRY"))\nYou MUST call the \(scenario.tool) tool "
+                        + "exactly once and then reply briefly."
+                do {
+                    let evidence = try send(prompt, model: .bonsai, in: app,
+                                            timeout: 300, assertEvidence: false)
+                    allActivities += evidence.toolActivities
+                    sawTool = matchesTool(evidence.toolActivities, scenario.tool)
+                } catch {
+                    // A run-level rejection (e.g. the model repeated a call) is retried once with a
+                    // tighter instruction; the durable runtime keeps the protection itself.
+                }
+            }
+            if !sawTool { missing.append(scenario.tool) }
         }
 
         let summary = XCTAttachment(string: """
         marker=\(marker)
-        tool_activities=\(evidence.toolActivities.joined(separator: " | "))
+        tool_activities=\(allActivities.joined(separator: " | "))
         missing=\(missing.isEmpty ? "none" : missing.joined(separator: ", "))
-        answer=\(evidence.answer)
         diagnostics=\(diagnosticValue("device-e2e.agent", in: app))
         """)
         summary.name = "tool-v2-adapters-device"

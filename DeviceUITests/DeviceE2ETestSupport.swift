@@ -153,10 +153,11 @@ class DeviceE2ETestCase: XCTestCase {
 
     /// Taps the least-privileged Allow action on a Calendar / Reminders / Location TCC prompt.
     /// Returns false when the alert is not one of those prompts, so the caller keeps its hard boundary.
+    /// Deliberately avoids reading `alert.label`: the system can dismiss the prompt between monitor
+    /// dispatch and snapshot, and a stale label query becomes an automatic XCUITest failure instead of
+    /// a graceful "already gone". Button existence queries return false for a vanished alert.
     @MainActor
     private static func grantToolPermissionIfRequested(_ alert: XCUIElement) -> Bool {
-        let label = alert.label
-        guard label.localizedCaseInsensitiveContains("would like to access") else { return false }
         for buttonLabel in ["Allow While Using App", "Allow Once", "Allow"] {
             let button = alert.buttons[buttonLabel]
             if button.exists, button.isHittable {
