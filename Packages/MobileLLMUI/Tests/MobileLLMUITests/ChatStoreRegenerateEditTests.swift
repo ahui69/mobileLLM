@@ -235,13 +235,14 @@ private final class RecordingBox: @unchecked Sendable {
 private struct RecordingAgentRunRequestBuilder: AgentRunRequestBuilding {
     let box: RecordingBox
 
-    func buildSubmission(
+    @MainActor
+    func prepareSubmission(
         conversationID: UUID,
         userTurnID: UUID,
         assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
-    ) async throws -> AgentRunSubmission {
+    ) throws -> AgentRunSubmissionPreparation {
         box.append(text)
         throw AgentExecutionError.internalInvariant("test builder unavailable")
     }

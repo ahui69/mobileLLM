@@ -1990,7 +1990,7 @@
       "selectors": [
         {
           "kind": "xctest",
-          "value": "MobileLLMUITests.ChatStoreTests/testLegacyLoopRemainsTheRolloutOffPathUntilAgentRuntimeAttaches"
+          "value": "MobileLLMUITests.ChatStoreTests/testTestHarnessCanStillExerciseLegacyLoopUntilAgentRuntimeAttaches"
         }
       ],
       "platforms": [

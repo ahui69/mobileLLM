@@ -57,7 +57,9 @@ struct Composer: View {
             contextMeter
             if let skill = chat.activeSkill { activeSkillChip(skill) }
             if !chat.pendingImages.isEmpty { pendingImageChips }
-            if chat.hasModel {
+            if chat.agentRuntimeUnavailableReason != nil {
+                runtimeUnavailableBar
+            } else if chat.hasModel {
                 HStack(alignment: .bottom, spacing: Theme.Space.sm) {
                     plusMenu
                     field
@@ -116,6 +118,33 @@ struct Composer: View {
             }
         }
         .onDisappear { dictation.stop() }   // never leave the audio session running behind us
+    }
+
+    private var runtimeUnavailableBar: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.danger)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Agent runtime unavailable")
+                    .font(.callout.weight(.semibold))
+                Text("Restart the app to try again.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Theme.Space.md)
+        .frame(minHeight: max(44, controlSize))
+        .background(
+            Theme.surface2,
+            in: RoundedRectangle(cornerRadius: Theme.Radius.field, style: .continuous)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.Radius.field, style: .continuous)
+                .strokeBorder(Theme.hairline)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Agent runtime unavailable. Restart the app to try again.")
     }
 
     private func merge(base: String, dictated: String) -> String {

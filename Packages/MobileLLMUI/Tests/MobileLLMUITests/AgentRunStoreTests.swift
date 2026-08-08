@@ -61,13 +61,14 @@ final class AgentRunStoreTests: XCTestCase {
             delivered = (text, reasoning)
         }
 
-        let runID = try await store.start(
+        let prepared = try store.prepareStart(
             conversationID: conversationID,
             userMessageID: UUID(),
             assistantMessageID: assistantID,
             text: "hello",
             imageRefs: []
         )
+        let runID = try await store.start(prepared)
         let handle = try XCTUnwrap(executor.handle)
         try await waitUntil {
             store.presentation(for: conversationID)?.state == .created
@@ -121,13 +122,14 @@ final class AgentRunStoreTests: XCTestCase {
         let builder = MockAgentRunRequestBuilder(submission: try makeSubmission())
         let store = AgentRunStore(executor: executor, requestBuilder: builder)
         let conversationID = UUID()
-        _ = try await store.start(
+        let prepared = try store.prepareStart(
             conversationID: conversationID,
             userMessageID: UUID(),
             assistantMessageID: UUID(),
             text: "hello",
             imageRefs: []
         )
+        _ = try await store.start(prepared)
         let handle = try XCTUnwrap(executor.handle)
         handle.currentStatus = try AgentRunStatus(
             state: .paused,
@@ -148,13 +150,14 @@ final class AgentRunStoreTests: XCTestCase {
         let builder = MockAgentRunRequestBuilder(submission: try makeSubmission())
         let store = AgentRunStore(executor: executor, requestBuilder: builder)
         let conversationID = UUID()
-        let runID = try await store.start(
+        let prepared = try store.prepareStart(
             conversationID: conversationID,
             userMessageID: UUID(),
             assistantMessageID: UUID(),
             text: "hello",
             imageRefs: []
         )
+        let runID = try await store.start(prepared)
         let handle = try XCTUnwrap(executor.handle)
         let interaction = try UserInputRequest(
             id: InteractionRequestID(rawValue: UUID()),
@@ -183,26 +186,51 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertEqual(executor.submitCount, 1, "responding must not create a new root run")
     }
 
+    func testPreparedStartNeverRereadsMutableBuilderStateAfterCapture() async throws {
+        let executor = MockAgentExecutor()
+        let builder = MutableAgentRunRequestBuilder(
+            submission: try makeSubmission(instruction: "conversation A")
+        )
+        let store = AgentRunStore(executor: executor, requestBuilder: builder)
+        let prepared = try store.prepareStart(
+            conversationID: UUID(),
+            userMessageID: UUID(),
+            assistantMessageID: UUID(),
+            text: "conversation A",
+            imageRefs: []
+        )
+
+        // Models, settings, and the visible conversation may all change while attachment/model
+        // preparation suspends. Starting must still build the value captured above.
+        builder.submission = try makeSubmission(instruction: "conversation B")
+        _ = try await store.start(prepared)
+
+        XCTAssertEqual(executor.submittedRequests.map(\.instruction), ["conversation A"])
+        XCTAssertEqual(builder.captureCount, 1)
+    }
+
     func testQuiesceForBackgroundPausesEveryActiveRunWithForegroundLost() async throws {
         let executor = MockAgentExecutor()
         let builder = MockAgentRunRequestBuilder(submission: try makeSubmission())
         let store = AgentRunStore(executor: executor, requestBuilder: builder)
         let first = UUID()
         let second = UUID()
-        _ = try await store.start(
+        let firstPrepared = try store.prepareStart(
             conversationID: first,
             userMessageID: UUID(),
             assistantMessageID: UUID(),
             text: "one",
             imageRefs: []
         )
-        _ = try await store.start(
+        _ = try await store.start(firstPrepared)
+        let secondPrepared = try store.prepareStart(
             conversationID: second,
             userMessageID: UUID(),
             assistantMessageID: UUID(),
             text: "two",
             imageRefs: []
         )
+        _ = try await store.start(secondPrepared)
         let handle = try XCTUnwrap(executor.handle)
         handle.currentStatus = try AgentRunStatus(state: .generating, stateVersion: 4)
 
@@ -227,13 +255,14 @@ final class AgentRunStoreTests: XCTestCase {
         var terminated: (AgentTerminalReason, String?)?
         store.onRunTerminated = { _, _, reason, message in terminated = (reason, message) }
 
-        _ = try await store.start(
+        let prepared = try store.prepareStart(
             conversationID: conversationID,
             userMessageID: UUID(),
             assistantMessageID: assistantID,
             text: "hello",
             imageRefs: []
         )
+        _ = try await store.start(prepared)
         let handle = try XCTUnwrap(executor.handle)
         try await waitUntil {
             store.presentation(for: conversationID) != nil
@@ -269,26 +298,51 @@ final class AgentRunStoreTests: XCTestCase {
 private struct MockAgentRunRequestBuilder: AgentRunRequestBuilding {
     let submission: AgentRunSubmission
 
-    func buildSubmission(
+    @MainActor
+    func prepareSubmission(
         conversationID: UUID,
         userTurnID: UUID,
         assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
-    ) async throws -> AgentRunSubmission {
-        submission
+    ) throws -> AgentRunSubmissionPreparation {
+        AgentRunSubmissionPreparation { submission }
+    }
+}
+
+@MainActor
+private final class MutableAgentRunRequestBuilder: AgentRunRequestBuilding {
+    var submission: AgentRunSubmission
+    private(set) var captureCount = 0
+
+    init(submission: AgentRunSubmission) {
+        self.submission = submission
+    }
+
+    func prepareSubmission(
+        conversationID: UUID,
+        userTurnID: UUID,
+        assistantMessageID: UUID,
+        text: String,
+        imageRefs: [ImageRef]
+    ) throws -> AgentRunSubmissionPreparation {
+        captureCount += 1
+        let captured = submission
+        return AgentRunSubmissionPreparation { captured }
     }
 }
 
 private final class MockAgentExecutor: AgentExecutor, @unchecked Sendable {
     let handle = MockAgentExecutionHandle()
     private(set) var submitCount = 0
+    private(set) var submittedRequests: [AgentRequest] = []
 
     func submit(
         _ request: AgentRequest,
         commandID: AgentCommandID
     ) async throws -> AgentExecutionHandleID {
         submitCount += 1
+        submittedRequests.append(request)
         return handle.id
     }
 
@@ -449,7 +503,7 @@ private func waitUntil(
     throw AgentExecutionError.internalInvariant("condition timed out")
 }
 
-private func makeSubmission() throws -> AgentRunSubmission {
+private func makeSubmission(instruction: String = "hello") throws -> AgentRunSubmission {
     guard let version = SemanticVersion("1.0.0") else {
         throw AgentExecutionError.internalInvariant("test version")
     }
@@ -466,7 +520,7 @@ private func makeSubmission() throws -> AgentRunSubmission {
         conversationID: ConversationID(rawValue: UUID()),
         userTurnID: UserTurnID(rawValue: UUID()),
         role: "assistant",
-        instruction: "hello",
+        instruction: instruction,
         outputRequirement: .text,
         modelPolicy: AgentModelPolicy(
             localOnly: true,
@@ -503,7 +557,7 @@ private func makeSubmission() throws -> AgentRunSubmission {
         currentUser: try CurrentUserContextSource(
             userTurnID: request.userTurnID,
             revision: "v1",
-            content: "hello"
+            content: instruction
         ),
         toolCatalog: try ToolCatalogSnapshot(revision: 1, descriptors: []),
         toolPolicy: try ConversationToolPolicy(

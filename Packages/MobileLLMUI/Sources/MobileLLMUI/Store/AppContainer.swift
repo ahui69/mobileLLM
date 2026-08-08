@@ -35,13 +35,13 @@ public final class AppContainer {
     public let toolLocationProvider: (any LocationProviding)?
     /// OpenAI Responses API key store (Keychain-backed in the app; injectable for tests/previews).
     public let openAICredentials: any OpenAICredentialStoring
-    /// The durable agent runtime projection and command surface (spec §20). Nil keeps the legacy
-    /// in-process loop (tests/previews and the rollout-off state).
+    /// The durable agent runtime projection and command surface (spec §20). Tests/previews may omit it;
+    /// the production app treats assembly failure as unavailable rather than falling back.
     public private(set) var agentRuns: AgentRunStore?
     /// Production outbox projector (spec §9.1/§33 gap 2): claims journal outbox rows and applies them
     /// to the conversation JSON idempotently. Wired by the app shell; nil in tests/previews.
     public var outboxProjector: ConversationOutboxProjector?
-    /// When the agent runtime failed to assemble, the reason (rollout-off state stays functional).
+    /// When the production agent runtime failed to assemble, the diagnostic reason.
     public private(set) var agentRuntimeError: String?
     /// App-assembled hook that returns the bounded redacted agent-runtime log (diagnostics only).
     public var agentDiagnosticSnapshot: (@MainActor () async -> String)?
@@ -205,10 +205,10 @@ public final class AppContainer {
         }
     }
 
-    /// Records why the agent runtime could not be assembled (diagnostics only; the legacy loop
-    /// remains the fallback).
+    /// Records why the production agent runtime could not be assembled and fail-closes sending.
     public func recordAgentRuntimeFailure(_ error: Error) {
         agentRuntimeError = error.localizedDescription
+        chat.markAgentRuntimeUnavailable(error.localizedDescription)
     }
 
     /// Activate the (model, variant) a conversation remembers, if it's still installed. Falls back to any

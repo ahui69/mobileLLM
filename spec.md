@@ -1459,7 +1459,7 @@ Implementation is one dependency-ordered program, followed by one consolidated i
 **Status (2026-08-08):** the runtime, SQLite journal and idempotent conversation outbox projection, Tool V2/MCP/
 online adapters, approvals, budgets, subagents, bounded parallel tool batches, staged workflow orchestrator,
 explicit workflow recovery, progressive UI, static traceability gate, and a deterministic model-free simulator CI
-gate are implemented. The implementation is not release-green: compatibility fallback removal, quantitative
+gate are implemented. The implementation is not release-green: quantitative
 accessibility/performance evidence, the complete physical-device matrix, and consolidated release evidence remain
 open. Step 6 is in progress; steps 7-8 remain pending.
 
@@ -1596,8 +1596,10 @@ Open conformance gaps:
    App bootstrap only installs the recovery handler: it never resumes work automatically. A running workflow stays
    inert until the user presses **Resume**, and recovery errors remain visible while durable state stays resumable.
    Evidence: `MultiAgentWorkflowIntegrationTests` and `WorkflowStoreTests` explicit-resume coverage.
-4. **Compatibility fallback:** an assembly failure still activates the legacy in-process `ToolLoop`. This is an
-   explicit development fallback, not evidence that every production send has AgentRuntime semantics.
+4. **Compatibility fallback:** CLOSED (2026-08-08). Production assembly now performs one explicit
+   `AgentRuntimeAssembly` attempt. Failure records the diagnostic, disables sending, and presents a visible
+   restart-required composer state; it never silently executes the legacy `ToolLoop`. Tests/previews may still
+   construct an intentionally unwired `ChatStore` to cover legacy compatibility in isolation.
 5. **Verification enforcement:** the checked-in pull-request simulator gate now executes a deterministic,
    model-free neutral-launch/navigation XCUITest. Rich online-model tests and the physical-device plan remain
    credentialed release gates. Accessibility, exhaustive semantic/fault gates, performance baselines, the
@@ -1612,6 +1614,14 @@ Open conformance gaps:
    (`authorizeMatchingReceipt`/`boundedConversationRead`). `agent-harness-verify static` exits 0.
 6. **Evidence freshness:** verification manifests, semantic registries, spec digest, coverage evidence, and device
    results must be regenerated from one source commit. Conflicting `passed`/`pending` claims are not release evidence.
+7. **Accepted-send execution snapshot:** CLOSED (2026-08-08). `ChatStore` now asks `AgentRunStore` to capture an
+   immutable submission recipe synchronously after appending the accepted user/assistant identities and before the
+   first attachment write or model-residency await. Deferred artifact resolution builds only from that captured value.
+   Snapshot lookup derives model, variant, sampling, context, skill, tool policy, approval mode, and reasoning settings
+   from the requested conversation rather than the visible conversation. The freezer handoff is keyed by run ID so
+   concurrent preparations cannot replace one another. Online selections also carry a digest identity for the exact
+   accepted service endpoint/reasoning/output configuration, so later settings edits or another service cannot redirect
+   an in-flight or recovered run; the API key remains a Keychain reference resolved only at execution.
 
 Terminology: the shipped feature is **staged multi-agent workflows v1**. **Dynamic Workflows** is reserved for the
 future language/graph system with branching, repetition, saved versioned definitions, and a complete recovery driver.

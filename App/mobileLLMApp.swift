@@ -7,6 +7,7 @@ import LLMCore
 import LLMEngineMLX
 import LLMEngineLlama
 import LLMEngineApple
+import AgentRuntime
 
 #if DEBUG && os(macOS)
 import AppKit
@@ -221,8 +222,8 @@ struct MobileLLMApp: App {
                 continuedProcessing: continuedProcessing
             )
         }
-        // The lifecycle coordinator's weight-unload seam works even when the agent runtime is in its
-        // rollout-off state (no attachAgentRuns call); the quiesce seam stays nil there by design.
+        // Weight unloading is independent of agent assembly. If assembly later fails, sending is
+        // fail-closed, but the app can still release any selected model cleanly.
         container.lifecycle.suspendModel = { [weak container] in
             container?.suspendModel()
         }
@@ -267,10 +268,23 @@ struct MobileLLMApp: App {
             }
         }
         #endif
+        // Rehydrate every configuration identity a durable run can legitimately reference after a
+        // relaunch. If the service was deleted or its endpoint changed, the old identity is absent and
+        // recovery fails closed instead of redirecting data. Reasoning effort has three finite values.
+        for service in container.settings.onlineServices {
+            for effort in ReasoningEffort.allCases {
+                onlineConfigBox.update(
+                    serviceID: service.id,
+                    baseURL: service.baseURL,
+                    modelID: service.modelID,
+                    reasoningEffort: effort,
+                    maximumOutputTokens: service.maximumOutputTokens
+                )
+            }
+        }
         // Attach the durable agent runtime (spec §6 / §20): SQLite journal, artifact store, local
         // model providers over the same routing engine, and the run store the UI projects. A failure
-        // here keeps the legacy in-process loop — the rollout switch (spec §26) is the assembly's
-        // presence, and the app never crashes on it.
+        // is visible and fail-closed; production never silently changes to the legacy tool loop.
         MainActor.assumeIsolated {
             #if os(iOS)
             // Register the iOS 26 continued-processing launch handler (spec §19.2). The wildcard
@@ -303,34 +317,35 @@ struct MobileLLMApp: App {
                 }
             }
             #endif
-            if let assembly = try? AgentRuntimeAssembly(
-                engine: engine,
-                downloadBase: base,
-                conversationDirectory: container.conversationStore.directory,
-                snapshot: { [weak container] conversationID, userTurnID, text, imageRefs in
-                    if let template = AppWorkflowSnapshotRegistry.shared.template(
-                        conversationID: conversationID,
-                        userTurnID: userTurnID
-                    ) {
-                        return template.withText(text)
-                    }
-                    guard let container else { return nil }
-                    return makeAgentSnapshot(
-                        container: container,
-                        conversationID: conversationID,
-                        userTurnID: userTurnID,
-                        text: text,
-                        imageRefs: imageRefs,
-                        downloadBase: base,
-                        onlineConfigBox: onlineConfigBox
-                    )
-                },
-                memoryStore: container.chat.memoryBook?.store,
-                eventStore: container.toolEventStore,
-                locationProvider: container.toolLocationProvider,
-                mcpDiscovery: container.mcpDiscovery,
-                onlineConfiguration: { onlineConfigBox.configuration() }
-            ) {
+            do {
+                let assembly = try AgentRuntimeAssembly(
+                    engine: engine,
+                    downloadBase: base,
+                    conversationDirectory: container.conversationStore.directory,
+                    snapshot: { [weak container] conversationID, userTurnID, text, imageRefs in
+                        if let template = AppWorkflowSnapshotRegistry.shared.template(
+                            conversationID: conversationID,
+                            userTurnID: userTurnID
+                        ) {
+                            return template.withText(text)
+                        }
+                        guard let container else { return nil }
+                        return makeAgentSnapshot(
+                            container: container,
+                            conversationID: conversationID,
+                            userTurnID: userTurnID,
+                            text: text,
+                            imageRefs: imageRefs,
+                            downloadBase: base,
+                            onlineConfigBox: onlineConfigBox
+                        )
+                    },
+                    memoryStore: container.chat.memoryBook?.store,
+                    eventStore: container.toolEventStore,
+                    locationProvider: container.toolLocationProvider,
+                    mcpDiscovery: container.mcpDiscovery,
+                    onlineConfiguration: { onlineConfigBox.configuration(for: $0) }
+                )
                 container.attachAgentRuns(assembly.runStore)
                 // Production outbox projector (spec §9.1/§33 gap 2): claims journal outbox rows and
                 // applies them to the conversation JSON idempotently. Workflow root/child final
@@ -396,45 +411,11 @@ struct MobileLLMApp: App {
                 container.workflowStore.resumeHandler = { [launcher] workflowID in
                     try await launcher.resume(workflowID: workflowID)
                 }
-            } else {
-                // Diagnose the exact assembly failure instead of silently falling back, so device
-                // tests can distinguish a healthy rollout-off state from a wiring bug.
-                do {
-                    _ = try AgentRuntimeAssembly(
-                        engine: engine,
-                        downloadBase: base,
-                        conversationDirectory: container.conversationStore.directory,
-                        snapshot: { [weak container] conversationID, userTurnID, text, imageRefs in
-                            if let template = AppWorkflowSnapshotRegistry.shared.template(
-                                conversationID: conversationID,
-                                userTurnID: userTurnID
-                            ) {
-                                return template.withText(text)
-                            }
-                            guard let container else { return nil }
-                            return makeAgentSnapshot(
-                                container: container,
-                                conversationID: conversationID,
-                                userTurnID: userTurnID,
-                                text: text,
-                                imageRefs: imageRefs,
-                                downloadBase: base,
-                                onlineConfigBox: onlineConfigBox
-                            )
-                        },
-                        memoryStore: container.chat.memoryBook?.store,
-                        eventStore: container.toolEventStore,
-                        locationProvider: container.toolLocationProvider,
-                        mcpDiscovery: container.mcpDiscovery,
-                        onlineConfiguration: { onlineConfigBox.configuration() }
-                    )
-                } catch {
-                    container.recordAgentRuntimeFailure(error)
-                    AgentRuntimeAssembly.logger(
-                        "Agent runtime unavailable: \(error.localizedDescription)"
-                    )
-                }
-                AgentRuntimeAssembly.logger("Agent runtime unavailable — legacy chat loop active")
+            } catch {
+                container.recordAgentRuntimeFailure(error)
+                AgentRuntimeAssembly.logger(
+                    "Agent runtime unavailable; sending disabled: \(error.localizedDescription)"
+                )
             }
         }
         #if DEBUG && os(macOS)
@@ -532,35 +513,45 @@ func makeAgentSnapshot(
     onlineConfigBox: OpenAIOnlineConfigurationBox
 ) -> AgentRunRequestSnapshot? {
     guard let conversation = container.chat.conversation(id: conversationID) else { return nil }
-    // Keep the provider's config box in step with Settings before the snapshot freezes the selection.
-    if let service = container.settings.onlineActiveService {
-        onlineConfigBox.update(
-            serviceID: service.id,
-            baseURL: service.baseURL,
-            modelID: service.modelID,
-            reasoningEffort: container.chat.effectiveReasoningEffort,
-            maximumOutputTokens: service.maximumOutputTokens
+
+    // Derive every conversation-scoped field from the requested conversation, never `activeID` or
+    // the currently visible model. Workflow/recovery callers may legitimately snapshot a background
+    // conversation, and normal sends can suspend immediately after this boundary.
+    let onlineParts = OnlineModelIdentity.serviceParts(fromConversationModelID: conversation.modelID)
+    let onlineService = onlineParts.flatMap { parts in
+        container.settings.onlineServices.first { $0.id == parts.serviceID }
+    }
+    let onlineConfigurationID: String?
+    if let onlineParts, let onlineService {
+        onlineConfigurationID = onlineConfigBox.update(
+            serviceID: onlineParts.serviceID,
+            baseURL: onlineService.baseURL,
+            modelID: onlineParts.model,
+            reasoningEffort: conversation.reasoningEffort ?? .medium,
+            maximumOutputTokens: onlineService.maximumOutputTokens
         )
     } else {
-        onlineConfigBox.update(
-            serviceID: OnlineService.defaultID,
-            baseURL: container.settings.openAIBaseURL,
-            modelID: nil,
-            reasoningEffort: container.chat.effectiveReasoningEffort,
-            maximumOutputTokens: nil
-        )
+        onlineConfigurationID = nil
     }
-    let onlineModelID = container.chat.onlineModelID
+
+    let onlineModelID = onlineParts?.model
     // Online runs need no local weights, so a device with zero installed models can still send. The
     // fallback identity only feeds context-policy bookkeeping; the run selection is the online provider
     // and the runtime never touches its weights directory.
     let identity: (model: LLMModel, variant: LLMVariant, weightsDirectory: URL)
-    if let active = container.chat.activeModel {
+    if onlineParts == nil,
+       let model = container.models.model(id: conversation.modelID),
+       let variant = model.variants.first(where: { $0.id == conversation.variantID })
+            ?? model.variants.sorted(by: { $0.id < $1.id }).first(where: {
+                $0.matchesPersistedID(conversation.variantID)
+            })
+            ?? model.variants.sorted(by: { $0.id < $1.id }).first
+    {
         identity = (
-            active.model,
-            active.variant,
+            model,
+            variant,
             ModelDownloader(downloadBase: downloadBase)
-                .localURL(repoId: active.variant.source.huggingFaceRepo)
+                .localURL(repoId: variant.source.huggingFaceRepo)
         )
     } else if let onlineModelID,
               let fallback = container.models.model(id: container.settings.defaultModelID)
@@ -576,6 +567,32 @@ func makeAgentSnapshot(
     } else {
         return nil
     }
+    let contextLength = conversation.contextLength
+    let localContextLength = contextLength ?? container.settings.contextLength
+    let onlineContextLength = contextLength ?? container.settings.onlineContextLength
+    let sampling = conversation.sampling
+    let onlineOutputBudgetAuto = onlineParts != nil
+        && (sampling?.maxTokens.map { $0 == 0 } ?? (container.settings.onlineMaxTokens == 0))
+    let maxTokens: Int
+    if let override = sampling?.maxTokens {
+        maxTokens = onlineParts != nil && override == 0 ? onlineContextLength : override
+    } else if onlineParts != nil {
+        maxTokens = container.settings.onlineMaxTokens == 0
+            ? onlineContextLength
+            : container.settings.onlineMaxTokens
+    } else {
+        maxTokens = container.settings.maxTokens
+    }
+    let toolsEnabled = conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled
+    let localToolNames: [String]
+    if let policy = conversation.toolPolicy {
+        localToolNames = policy.allowedToolIDs
+            .filter { $0.providerID == "builtin" }
+            .map(\.name)
+            .sorted()
+    } else {
+        localToolNames = container.settings.builtInToolConfig.enabled.map(\.rawValue).sorted()
+    }
     return AgentRunRequestSnapshot(
         conversationID: conversationID,
         userTurnID: userTurnID,
@@ -584,40 +601,42 @@ func makeAgentSnapshot(
         messages: conversation.messages,
         systemPrompt: container.settings.systemPrompt,
         memoryFacts: container.chat.memoryBook?.facts ?? [],
-        activeSkill: container.chat.activeSkill,
+        activeSkill: conversation.skillID.flatMap { container.chat.skillStore?.skill(id: $0) },
         model: identity.model,
         variant: identity.variant,
         weightsDirectory: identity.weightsDirectory,
         thinkingEnabled: container.chat.thinkingEnabled,
-        contextLength: container.chat.localContextRequest,
-        maxTokens: container.chat.conversationMaxTokens,
-        temperature: container.chat.conversationTemperature,
-        topP: container.chat.conversationTopP,
+        contextLength: localContextLength,
+        maxTokens: maxTokens,
+        temperature: sampling?.temperature ?? container.settings.temperature,
+        topP: sampling?.topP ?? container.settings.topP,
         topK: container.settings.topK,
         repetitionPenalty: container.settings.repetitionPenalty,
-        toolsEnabled: conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled,
-        localToolNames: container.settings.builtInToolConfig.enabled.map(\.rawValue),
+        toolsEnabled: toolsEnabled,
+        localToolNames: localToolNames,
         memorySeamAvailable: container.chat.memoryBook != nil,
         eventSeamAvailable: container.toolEventStore != nil,
         locationSeamAvailable: container.toolLocationProvider != nil,
-        mcpToolDescriptors: (conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled)
+        mcpToolDescriptors: toolsEnabled
             ? container.mcpDiscovery.descriptors(for: container.settings.mcpServers)
             : [],
-        webSearchDestinations: (conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled)
+        webSearchDestinations: toolsEnabled
             ? (try? container.settings.builtInToolConfig.searchEngines.map {
                 try AppWebSearchToolAdapter.destination(engine: $0)
             }) ?? []
             : [],
         toolPolicy: conversation.toolPolicy,
-        onlineModelEnabled: container.settings.openAIOnlineEnabled,
+        onlineModelEnabled: onlineParts != nil,
         onlineModelID: onlineModelID,
-        onlineServiceID: container.chat.onlineServiceID,
-        onlineReasoningEnabled: container.chat.onlineReasoningEnabled,
-        onlineContextLength: container.chat.onlineContextRequest,
-        onlineOutputBudgetAuto: container.chat.isOnlineOutputBudgetAuto,
-        onlineMaximumOutputTokens: container.settings.onlineActiveService?.maximumOutputTokens,
-        approvalMode: container.chat.effectiveApprovalMode,
-        onlineReasoningEffort: container.chat.effectiveReasoningEffort
+        onlineServiceID: onlineParts?.serviceID,
+        onlineConfigurationID: onlineConfigurationID,
+        onlineReasoningEnabled: conversation.onlineReasoningEnabled
+            ?? container.settings.thinkingDefault,
+        onlineContextLength: onlineContextLength,
+        onlineOutputBudgetAuto: onlineOutputBudgetAuto,
+        onlineMaximumOutputTokens: onlineService?.maximumOutputTokens,
+        approvalMode: conversation.approvalMode ?? .safePreset,
+        onlineReasoningEffort: conversation.reasoningEffort ?? .medium
     )
 }
 

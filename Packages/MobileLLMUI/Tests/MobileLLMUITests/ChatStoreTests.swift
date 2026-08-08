@@ -68,7 +68,7 @@ final class ChatStoreTests: XCTestCase {
         XCTAssertEqual(chat.activeConversation?.title, "What is the capital of France?")
     }
 
-    func testLegacyLoopRemainsTheRolloutOffPathUntilAgentRuntimeAttaches() async throws {
+    func testTestHarnessCanStillExerciseLegacyLoopUntilAgentRuntimeAttaches() async throws {
         let (chat, dir) = makeStore(script: .init())
         defer { try? FileManager.default.removeItem(at: dir) }
         XCTAssertFalse(chat.agentRuntimeEnabled)
@@ -87,6 +87,20 @@ final class ChatStoreTests: XCTestCase {
             requestBuilder: UnavailableAgentRunRequestBuilder()
         ))
         XCTAssertTrue(chat.agentRuntimeEnabled)
+    }
+
+    func testProductionRuntimeAssemblyFailureDisablesSendingInsteadOfUsingLegacyLoop() async throws {
+        let (chat, dir) = makeStore(script: .init(answer: "must not execute"))
+        defer { try? FileManager.default.removeItem(at: dir) }
+        chat.draft = "hello"
+
+        chat.markAgentRuntimeUnavailable("journal unavailable")
+
+        XCTAssertFalse(chat.canSend)
+        chat.send()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertNil(chat.activeConversation)
+        XCTAssertEqual(chat.agentRuntimeUnavailableReason, "journal unavailable")
     }
 
     func testNewConversationMaterializesToolPolicyOnlyAfterAttachment() throws {
@@ -523,13 +537,14 @@ private struct UnavailableAgentExecutor: AgentExecutor {
 }
 
 private struct UnavailableAgentRunRequestBuilder: AgentRunRequestBuilding {
-    func buildSubmission(
+    @MainActor
+    func prepareSubmission(
         conversationID: UUID,
         userTurnID: UUID,
         assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
-    ) async throws -> AgentRunSubmission {
+    ) throws -> AgentRunSubmissionPreparation {
         throw AgentExecutionError.internalInvariant("test builder unavailable")
     }
 }

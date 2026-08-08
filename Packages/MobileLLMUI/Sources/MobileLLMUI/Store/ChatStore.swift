@@ -102,11 +102,14 @@ public final class ChatStore {
     /// raw 48 MP original). Capped at `maxAttachments`; cleared when the turn is sent. Held in memory
     /// only until send stamps them onto the user turn + writes them to disk.
     public private(set) var pendingImages: [PendingImage] = []
-    /// The durable agent runtime projection (spec §20). Nil in tests/previews that exercise the
-    /// legacy in-process loop; when present every send routes through `AgentRuntime`.
+    /// The durable agent runtime projection (spec §20). Nil only in tests/previews that deliberately
+    /// exercise legacy chat behavior; production attaches it or fail-closes sending.
     public private(set) var agentRuns: AgentRunStore?
     /// Last agent-runtime send failure (diagnostics; toasts already surface it transiently).
     public private(set) var agentLastSendError: String?
+    /// A production assembly failure disables sending instead of silently entering the legacy tool
+    /// loop. Tests/previews may still intentionally construct a ChatStore without an AgentRunStore.
+    public private(set) var agentRuntimeUnavailableReason: String?
     /// Durable workflow summaries (spec §23); nil keeps legacy behavior in tests/previews.
     public let workflowStore: WorkflowStore?
     /// App-assembled workflow launcher: (goal, conversationID, userMessageID, workflowID). The app
@@ -121,8 +124,8 @@ public final class ChatStore {
     /// Fired when a durable agent run reaches a terminal state, so continued-processing can complete
     /// or settle its system task.
     public var onAgentRunTerminal: (@MainActor (UUID, AgentTerminalReason) -> Void)?
-    /// Whether the app is wired to the durable agent runtime. A false value keeps the legacy loop,
-    /// which is how the rollout switch is implemented (spec §26).
+    /// Whether this store is wired to the durable agent runtime. Production requires this for sends;
+    /// an unwired test/preview can still exercise the isolated legacy implementation.
     public var agentRuntimeEnabled: Bool { agentRuns != nil }
 
     /// Whether any workflow is currently running in this conversation's app (spec §20: the top-right
@@ -508,8 +511,16 @@ public final class ChatStore {
     public var isStreaming: Bool { streaming != nil }
     public var hasModel: Bool { activeModel != nil || isOnlineActive }
     public var canSend: Bool {
-        acceptingNewActions && !conversationEraseInProgress && hasModel && streaming == nil
+        acceptingNewActions && !conversationEraseInProgress && agentRuntimeUnavailableReason == nil
+            && hasModel && streaming == nil
             && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingImages.isEmpty)
+    }
+
+    /// Marks the production agent path unavailable. This is intentionally sticky for the process:
+    /// recovering safely requires rebuilding the composition root, so the user should relaunch.
+    public func markAgentRuntimeUnavailable(_ reason: String) {
+        agentRuntimeUnavailableReason = reason
+        agentLastSendError = reason
     }
 
     /// The lifecycle coordinator calls this at the foreground→background boundary and back.
@@ -989,6 +1000,7 @@ public final class ChatStore {
         let stagedImages = pendingImages
         let images = stagedImages.map(\.data)
         guard acceptingNewActions,
+              agentRuntimeUnavailableReason == nil,
               !text.isEmpty || !images.isEmpty,
               hasModel,
               streaming == nil
@@ -1099,6 +1111,25 @@ public final class ChatStore {
     ) {
         let store = self.store
         let imageRefs = user.attachments ?? []
+        let prepared: PreparedAgentRunStart
+        do {
+            prepared = try agentRuns.prepareStart(
+                conversationID: conversationID,
+                userMessageID: user.id,
+                assistantMessageID: assistant.id,
+                text: text,
+                imageRefs: imageRefs
+            )
+        } catch {
+            agentLastSendError = "\(error)"
+            finalizeAgentRun(
+                conversationID: conversationID,
+                assistantMessageID: assistant.id,
+                failed: true,
+                errorMessage: error.localizedDescription
+            )
+            return
+        }
         streamingMessageID = assistant.id
         streaming = StreamingState(messageID: assistant.id)
         genTask = Task { @MainActor [weak self] in
@@ -1133,13 +1164,7 @@ public final class ChatStore {
                     )
                     return
                 }
-                _ = try await agentRuns.start(
-                    conversationID: conversationID,
-                    userMessageID: user.id,
-                    assistantMessageID: assistant.id,
-                    text: text,
-                    imageRefs: imageRefs
-                )
+                _ = try await agentRuns.start(prepared)
             } catch is CancellationError {
                 self?.agentLastSendError = "agent send cancelled before start"
                 self?.finalizeAgentRun(
@@ -1417,7 +1442,8 @@ public final class ChatStore {
     /// Regenerate an assistant turn: drop it (and anything after) and stream a fresh reply to the
     /// preceding user turn. `parentID` is preserved for the v1.0 branch pager.
     public func regenerate(assistantMessageID: UUID) {
-        guard streaming == nil, let ci = conversations.firstIndex(where: { $0.id == activeID }),
+        guard acceptingNewActions, agentRuntimeUnavailableReason == nil,
+              streaming == nil, let ci = conversations.firstIndex(where: { $0.id == activeID }),
               let mi = conversations[ci].messages.firstIndex(where: { $0.id == assistantMessageID }),
               conversations[ci].messages[mi].role == .assistant else { return }
         let parentID = conversations[ci].messages[mi].parentID
@@ -1471,7 +1497,8 @@ public final class ChatStore {
     /// UI is TODO(v1.0); the `parentID` plumbing is in place).
     public func editAndResend(userMessageID: UUID, newText: String) {
         let text = newText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, streaming == nil,
+        guard acceptingNewActions, agentRuntimeUnavailableReason == nil,
+              !text.isEmpty, streaming == nil,
               let ci = conversations.firstIndex(where: { $0.id == activeID }),
               let mi = conversations[ci].messages.firstIndex(where: { $0.id == userMessageID }),
               conversations[ci].messages[mi].role == .user else { return }

@@ -56,8 +56,8 @@ discovery/downloads, online models you enable and approve, or tools you explicit
   capability; the full Tool Settings screen adds descriptions, search-engine priority, and remote **MCP**
   controls (Streamable HTTP, per-server enable + per-tool mute). Tool access is off by default, only
   selected tools are advertised to the model, and tool results are framed as **untrusted data**
-  (prompt-injection fenced) before another model pass. Runtime assembly failure still has a legacy
-  compatibility fallback. Workflows inherit only the conversation's enabled tools; a missing required
+  (prompt-injection fenced) before another model pass. Runtime assembly failures are visible and
+  fail closed instead of silently changing execution semantics. Workflows inherit only the conversation's enabled tools; a missing required
   research tool pauses the launch and asks the user to enable it explicitly.
 - 🧩 **Subagents + parallel tool batches + staged workflows.** The runtime can spawn bounded
   subagents with attenuated ceilings, run tool batches in parallel inside one run, and orchestrate a

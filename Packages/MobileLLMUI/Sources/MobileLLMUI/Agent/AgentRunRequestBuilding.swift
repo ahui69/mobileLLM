@@ -18,16 +18,36 @@ public struct AgentRunSubmission: Sendable {
     }
 }
 
+/// A synchronously captured, immutable submission recipe.
+///
+/// `ChatStore` creates this value on the main actor at the user-send boundary, before attachment
+/// writes, model residency waits, or any other suspension. The deferred work may resolve artifact
+/// bytes asynchronously, but it can no longer re-read mutable conversation/settings state.
+public struct AgentRunSubmissionPreparation: Sendable {
+    private let buildClosure: @Sendable () async throws -> AgentRunSubmission
+
+    public init(
+        build: @escaping @Sendable () async throws -> AgentRunSubmission
+    ) {
+        buildClosure = build
+    }
+
+    public func build() async throws -> AgentRunSubmission {
+        try await buildClosure()
+    }
+}
+
 /// Builds the immutable request + frozen inputs for one user turn. Implemented at app-assembly
 /// time where the model catalog, memory, skills, and tool registry are all available.
 public protocol AgentRunRequestBuilding: Sendable {
-    func buildSubmission(
+    @MainActor
+    func prepareSubmission(
         conversationID: UUID,
         userTurnID: UUID,
         assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
-    ) async throws -> AgentRunSubmission
+    ) throws -> AgentRunSubmissionPreparation
 }
 
 /// Image reference used by the agent path. `ImageRef` lives in the UI layer; the resolver at app

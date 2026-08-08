@@ -11,7 +11,6 @@ import MobileLLMUI
 
 /// Everything execution-defining captured synchronously on the main actor at submission time. The
 /// agent runtime freezes this snapshot; it never re-reads mutable app stores during recovery.
-@MainActor
 public struct AgentRunRequestSnapshot: Sendable {
     public let conversationID: UUID
     public let userTurnID: UUID
@@ -54,6 +53,8 @@ public struct AgentRunRequestSnapshot: Sendable {
     public let onlineModelID: String?
     /// Stable id of the active online service (approval destination scope + Keychain account).
     public let onlineServiceID: String?
+    /// Immutable lookup key for the exact non-secret endpoint configuration accepted with this run.
+    public let onlineConfigurationID: String?
     /// Per-service opt-in for the service's own reasoning phase (explicit user setting, not the
     /// composer toggle, which has no meaning for online providers).
     public let onlineReasoningEnabled: Bool
@@ -98,6 +99,7 @@ public struct AgentRunRequestSnapshot: Sendable {
         onlineModelEnabled: Bool,
         onlineModelID: String?,
         onlineServiceID: String?,
+        onlineConfigurationID: String?,
         onlineReasoningEnabled: Bool,
         onlineContextLength: Int,
         onlineOutputBudgetAuto: Bool,
@@ -134,6 +136,7 @@ public struct AgentRunRequestSnapshot: Sendable {
         self.onlineModelEnabled = onlineModelEnabled
         self.onlineModelID = onlineModelID
         self.onlineServiceID = onlineServiceID
+        self.onlineConfigurationID = onlineConfigurationID
         self.onlineReasoningEnabled = onlineReasoningEnabled
         self.onlineContextLength = onlineContextLength
         self.onlineOutputBudgetAuto = onlineOutputBudgetAuto
@@ -177,6 +180,7 @@ extension AgentRunRequestSnapshot {
             onlineModelEnabled: onlineModelEnabled,
             onlineModelID: onlineModelID,
             onlineServiceID: onlineServiceID,
+            onlineConfigurationID: onlineConfigurationID,
             onlineReasoningEnabled: onlineReasoningEnabled,
             onlineContextLength: onlineContextLength,
             onlineOutputBudgetAuto: onlineOutputBudgetAuto,
@@ -223,8 +227,11 @@ struct AppFrozenInputBuilder: Sendable {
     /// Stable provider identity for the online Responses API provider. The request builder, the app
     /// assembly, and the provider itself MUST derive it the same way or resolution fails.
     static let onlineProviderID = "openai.responses"
-    /// Stable variant identity for the online selection (the service model id is the real identity).
-    static let onlineVariantID = "responses.default"
+    /// Stable variant identity for the exact accepted endpoint configuration. The digest is created
+    /// by the app configuration box and is safe to persist in a model selection.
+    static func onlineVariantID(configurationID: String) -> String {
+        "responses.config.\(configurationID)"
+    }
 
     /// Whether the snapshot requests the online provider. Both the toggle and a non-empty model id are
     /// required; the key itself is checked later at generation time (never frozen into the run).
@@ -246,11 +253,18 @@ struct AppFrozenInputBuilder: Sendable {
     /// The exact selection pinned for a run: online when the snapshot opted in, otherwise the local
     /// registration. Recovery uses the same derivation so a frozen request re-resolves identically.
     func selection(snapshot: AgentRunRequestSnapshot) throws -> AgentModelSelection {
-        if Self.isOnline(snapshot: snapshot), let modelID = snapshot.onlineModelID {
+        if Self.isOnline(snapshot: snapshot) {
+            guard let modelID = snapshot.onlineModelID,
+                  let configurationID = snapshot.onlineConfigurationID
+            else {
+                throw AgentExecutionError.internalInvariant(
+                    "online snapshot missing immutable configuration identity"
+                )
+            }
             return try AgentModelSelection(
                 providerID: AgentModelProviderID(Self.onlineProviderID),
                 modelID: AgentModelID(modelID.trimmingCharacters(in: .whitespacesAndNewlines)),
-                variantID: AgentModelVariantID(Self.onlineVariantID),
+                variantID: AgentModelVariantID(Self.onlineVariantID(configurationID: configurationID)),
                 capabilityVersion: capabilityVersion
             )
         }
@@ -964,36 +978,42 @@ struct AppAgentRunRequestBuilder: AgentRunRequestBuilding {
     let frozenBuilder: AppFrozenInputBuilder
     let snapshot: @MainActor (UUID, UUID, String, [ImageRef]) -> AgentRunRequestSnapshot?
     let artifacts: AppAgentArtifactResolver
-    let lastSubmission: LastSubmissionBox
+    let pendingSubmissions: PendingSubmissionCache
 
-    func buildSubmission(
+    @MainActor
+    func prepareSubmission(
         conversationID: UUID,
         userTurnID: UUID,
         assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
-    ) async throws -> AgentRunSubmission {
-        guard let snapshot = await snapshot(conversationID, userTurnID, text, imageRefs) else {
+    ) throws -> AgentRunSubmissionPreparation {
+        guard let snapshot = snapshot(conversationID, userTurnID, text, imageRefs) else {
             throw AgentExecutionError.internalInvariant("agent snapshot unavailable")
         }
-        let artifactReferences = try await artifacts.resolveCurrent(imageRefs, conversationID: conversationID)
-        let historyArtifacts = try await artifacts.resolveHistory(
-            in: snapshot,
-            excluding: userTurnID
-        )
-        let request = try frozenBuilder.request(
-            snapshot: snapshot,
-            artifactReferences: artifactReferences,
-            responseMessageID: assistantMessageID
-        )
-        let frozen = try frozenBuilder.frozenInputs(
-            snapshot: snapshot,
-            artifactReferences: artifactReferences,
-            historyArtifacts: historyArtifacts
-        )
-        let submission = AgentRunSubmission(request: request, frozenInputs: frozen)
-        lastSubmission.store(submission)
-        return submission
+        return AgentRunSubmissionPreparation {
+            let artifactReferences = try await artifacts.resolveCurrent(
+                imageRefs,
+                conversationID: conversationID
+            )
+            let historyArtifacts = try await artifacts.resolveHistory(
+                in: snapshot,
+                excluding: userTurnID
+            )
+            let request = try frozenBuilder.request(
+                snapshot: snapshot,
+                artifactReferences: artifactReferences,
+                responseMessageID: assistantMessageID
+            )
+            let frozen = try frozenBuilder.frozenInputs(
+                snapshot: snapshot,
+                artifactReferences: artifactReferences,
+                historyArtifacts: historyArtifacts
+            )
+            let submission = AgentRunSubmission(request: request, frozenInputs: frozen)
+            pendingSubmissions.store(submission)
+            return submission
+        }
     }
 }
 
@@ -1001,11 +1021,11 @@ struct AppAgentRunInputFreezer: AgentRunInputFreezing {
     let frozenBuilder: AppFrozenInputBuilder
     let snapshot: @MainActor (UUID, UUID, String, [ImageRef]) -> AgentRunRequestSnapshot?
     let artifacts: AppAgentArtifactResolver
-    let lastSubmission: LastSubmissionBox
+    let pendingSubmissions: PendingSubmissionCache
 
     func freeze(_ request: AgentRequest) async throws -> FrozenAgentRunInputs {
-        if let last = lastSubmission.value, last.request == request {
-            return last.frozenInputs
+        if let frozen = pendingSubmissions.take(matching: request) {
+            return frozen
         }
         guard let snapshot = await snapshot(
             request.conversationID.rawValue,
@@ -1027,18 +1047,36 @@ struct AppAgentRunInputFreezer: AgentRunInputFreezing {
     }
 }
 
-/// Small thread-safe holder for the most recent submission so the recovery freezer can reuse the
-/// exact frozen inputs without re-reading mutable app stores.
-final class LastSubmissionBox: @unchecked Sendable {
+/// Small bounded handoff cache between app-side preparation and `AgentExecutor.submit`.
+///
+/// It is keyed by run ID rather than "most recent": online provider lanes and future subagents may
+/// submit concurrently, and one preparation must never evict another run's exact frozen inputs.
+final class PendingSubmissionCache: @unchecked Sendable {
     private let lock = NSLock()
-    private var stored: AgentRunSubmission?
-
-    var value: AgentRunSubmission? {
-        lock.withLock { stored }
-    }
+    private var stored: [AgentRunID: AgentRunSubmission] = [:]
+    private var insertionOrder: [AgentRunID] = []
+    private let maximumEntries = 32
 
     func store(_ submission: AgentRunSubmission) {
-        lock.withLock { stored = submission }
+        lock.withLock {
+            let runID = submission.request.runID
+            if stored[runID] == nil { insertionOrder.append(runID) }
+            stored[runID] = submission
+            while insertionOrder.count > maximumEntries {
+                stored.removeValue(forKey: insertionOrder.removeFirst())
+            }
+        }
+    }
+
+    func take(matching request: AgentRequest) -> FrozenAgentRunInputs? {
+        lock.withLock {
+            guard let submission = stored[request.runID], submission.request == request else {
+                return nil
+            }
+            stored.removeValue(forKey: request.runID)
+            insertionOrder.removeAll { $0 == request.runID }
+            return submission.frozenInputs
+        }
     }
 }
 
@@ -1065,17 +1103,21 @@ struct SQLiteJournalRecoveryLister: AgentRunRecoveryListing {
 
 // MARK: - Assembly
 
-/// Thread-safe holder for the online Responses service configuration. The app refreshes the non-secret
-/// values (base URL, model id) from Settings on the main actor at each submission; the runtime provider
-/// reads a complete configuration on a worker thread and loads the API key from the Keychain on demand,
-/// so the secret is never retained by this box or frozen into a run.
+/// Thread-safe registry for accepted online Responses service configurations. Each immutable model
+/// selection carries a digest key, so a later settings edit or another concurrent service cannot
+/// redirect an already accepted run. API keys remain Keychain references and are loaded on demand.
 public final class OpenAIOnlineConfigurationBox: @unchecked Sendable {
+    private struct Entry: Sendable {
+        let serviceID: String
+        let baseURL: String
+        let reasoningEffort: ReasoningEffort?
+        let maximumOutputTokens: Int?
+    }
+
     private let lock = NSLock()
-    private var serviceID: String = ResponsesAPIConfiguration.defaultServiceID
-    private var baseURL: String
-    private var modelID: String?
-    private var reasoningEffort: ReasoningEffort?
-    private var maximumOutputTokens: Int?
+    private var entries: [String: Entry] = [:]
+    private var insertionOrder: [String] = []
+    private let maximumEntries = 256
     private let credentials: any OpenAICredentialStoring
 
     public init(
@@ -1084,43 +1126,68 @@ public final class OpenAIOnlineConfigurationBox: @unchecked Sendable {
         maximumOutputTokens: Int? = nil,
         credentials: any OpenAICredentialStoring
     ) {
-        self.serviceID = OnlineService.defaultID
-        self.baseURL = baseURL
-        self.modelID = modelID
-        self.maximumOutputTokens = maximumOutputTokens
         self.credentials = credentials
+        if modelID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            _ = update(
+                serviceID: OnlineService.defaultID,
+                baseURL: baseURL,
+                modelID: modelID,
+                maximumOutputTokens: maximumOutputTokens
+            )
+        }
     }
 
-    /// Refresh non-secret settings before a submission (called on the main actor).
+    /// Registers the exact non-secret settings accepted by a submission and returns their digest key.
+    @discardableResult
     public func update(
         serviceID: String,
         baseURL: String,
         modelID: String?,
         reasoningEffort: ReasoningEffort? = nil,
         maximumOutputTokens: Int? = nil
-    ) {
+    ) -> String {
+        let configurationID = StableDigest.fingerprint(
+            domain: "mobilellm.responses-configuration.v1",
+            components: [
+                Data(serviceID.utf8),
+                Data(baseURL.utf8),
+                Data((modelID ?? "").utf8),
+                Data((reasoningEffort?.rawValue ?? "").utf8),
+                Data(String(maximumOutputTokens ?? 0).utf8),
+            ]
+        ).rawValue
+        let entry = Entry(
+            serviceID: serviceID,
+            baseURL: baseURL,
+            reasoningEffort: reasoningEffort,
+            maximumOutputTokens: maximumOutputTokens
+        )
         lock.withLock {
-            self.serviceID = serviceID
-            self.baseURL = baseURL
-            self.modelID = modelID
-            self.reasoningEffort = reasoningEffort
-            self.maximumOutputTokens = maximumOutputTokens
+            if entries[configurationID] == nil { insertionOrder.append(configurationID) }
+            entries[configurationID] = entry
+            while insertionOrder.count > maximumEntries {
+                entries.removeValue(forKey: insertionOrder.removeFirst())
+            }
         }
+        return configurationID
     }
 
-    /// Provider-side read: returns a complete configuration only when the service is configured.
-    func configuration() -> ResponsesAPIConfiguration? {
-        lock.withLock {
-            guard let modelID, !modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  let key = try? credentials.loadAPIKey(serviceID: serviceID),
+    /// Provider-side read resolves only the exact configuration identity frozen in the selection.
+    func configuration(for selection: AgentModelSelection) -> ResponsesAPIConfiguration? {
+        let prefix = "responses.config."
+        guard selection.variantID.rawValue.hasPrefix(prefix) else { return nil }
+        let configurationID = String(selection.variantID.rawValue.dropFirst(prefix.count))
+        return lock.withLock {
+            guard let entry = entries[configurationID],
+                  let key = try? credentials.loadAPIKey(serviceID: entry.serviceID),
                   !key.isEmpty
             else { return nil }
             return ResponsesAPIConfiguration(
-                serviceID: serviceID,
-                baseURL: baseURL,
+                serviceID: entry.serviceID,
+                baseURL: entry.baseURL,
                 apiKey: key,
-                reasoningEffort: reasoningEffort,
-                maximumOutputTokens: maximumOutputTokens
+                reasoningEffort: entry.reasoningEffort,
+                maximumOutputTokens: entry.maximumOutputTokens
                     .flatMap { $0 > 0 ? UInt64($0) : nil }
             )
         }
@@ -1160,7 +1227,7 @@ public final class AgentRuntimeAssembly {
         locationProvider: (any LocationProviding)? = nil,
         mcpDiscovery: MCPDiscoveryCache = MCPDiscoveryCache(),
         session: URLSession = .shared,
-        onlineConfiguration: @escaping @Sendable () -> ResponsesAPIConfiguration? = { nil }
+        onlineConfiguration: @escaping @Sendable (AgentModelSelection) -> ResponsesAPIConfiguration? = { _ in nil }
     ) throws {
         let fileManager = FileManager.default
         let support = conversationDirectory.appending(component: "agent")
@@ -1226,7 +1293,7 @@ public final class AgentRuntimeAssembly {
         // Registered unconditionally so a recovered online run still resolves its provider even if the
         // user turned the toggle off before relaunch; generation then fails closed with a clear message.
         providers.append(try ResponsesAPIModelProvider(
-            configurationProvider: onlineConfiguration,
+            selectionConfigurationProvider: onlineConfiguration,
             capabilityVersion: capabilityVersion
         ))
         let providerCatalog = try StaticAgentModelProviderCatalog(providers: providers)
@@ -1248,19 +1315,19 @@ public final class AgentRuntimeAssembly {
             attachmentResolver: attachmentResolver,
             attachmentDirectory: attachmentDirectory
         )
-        let lastSubmission = LastSubmissionBox()
+        let pendingSubmissions = PendingSubmissionCache()
         let builder = AppAgentRunRequestBuilder(
             frozenBuilder: frozenBuilder,
             snapshot: snapshot,
             artifacts: artifactResolver,
-            lastSubmission: lastSubmission
+            pendingSubmissions: pendingSubmissions
         )
         requestBuilder = builder
         let freezer = AppAgentRunInputFreezer(
             frozenBuilder: frozenBuilder,
             snapshot: snapshot,
             artifacts: artifactResolver,
-            lastSubmission: lastSubmission
+            pendingSubmissions: pendingSubmissions
         )
         inputFreezer = freezer
         self.payloadStore = payloadStore

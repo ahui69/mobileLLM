@@ -38,6 +38,14 @@ public protocol AgentRunRecoveryListing: Sendable {
     func recoverableRuns() async throws -> [RecoverableAgentRun]
 }
 
+/// One UI-owned start whose execution-defining inputs were captured at the accepted-send boundary.
+/// The asynchronous start path carries this value rather than looking the conversation up again.
+struct PreparedAgentRunStart: Sendable {
+    let conversationID: UUID
+    let assistantMessageID: UUID
+    let submission: AgentRunSubmissionPreparation
+}
+
 /// Main-actor UI projection and command surface for durable agent runs.
 ///
 /// This store owns no model, tool, or persistence implementation. It submits immutable requests,
@@ -90,39 +98,52 @@ public final class AgentRunStore {
 
     // MARK: - Submitting
 
-    /// Starts one durable root run for a user turn. The caller (ChatStore) has already appended the
-    /// user message and an empty assistant placeholder; `assistantMessageID` is where the committed
-    /// answer is projected.
-    @discardableResult
-    public func start(
+    /// Captures one root run synchronously. The caller has already appended the user message and
+    /// assistant placeholder, so the captured conversation contains the exact accepted turn.
+    func prepareStart(
         conversationID: UUID,
         userMessageID: UUID,
         assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
-    ) async throws -> AgentRunID {
-        let submission = try await requestBuilder.buildSubmission(
+    ) throws -> PreparedAgentRunStart {
+        let submission = try requestBuilder.prepareSubmission(
             conversationID: conversationID,
             userTurnID: userMessageID,
             assistantMessageID: assistantMessageID,
             text: text,
             imageRefs: imageRefs
         )
+        return PreparedAgentRunStart(
+            conversationID: conversationID,
+            assistantMessageID: assistantMessageID,
+            submission: submission
+        )
+    }
+
+    /// Starts a previously captured durable root run after attachment/residency preparation.
+    @discardableResult
+    func start(_ prepared: PreparedAgentRunStart) async throws -> AgentRunID {
+        let submission = try await prepared.submission.build()
         let handleID = try await executor.submit(
             submission.request,
             commandID: AgentCommandID(rawValue: UUID())
         )
         let handle = try await executor.attach(to: handleID)
         handles[submission.request.runID] = handle
-        assistantMessageIDs[conversationID] = assistantMessageID
-        runs[conversationID] = AgentRunPresentation(
-            conversationID: conversationID,
+        assistantMessageIDs[prepared.conversationID] = prepared.assistantMessageID
+        runs[prepared.conversationID] = AgentRunPresentation(
+            conversationID: prepared.conversationID,
             runID: submission.request.runID,
             handleID: handleID,
             state: .created
         )
-        onRunStarted?(conversationID, assistantMessageID)
-        subscribe(runID: submission.request.runID, conversationID: conversationID, handle: handle)
+        onRunStarted?(prepared.conversationID, prepared.assistantMessageID)
+        subscribe(
+            runID: submission.request.runID,
+            conversationID: prepared.conversationID,
+            handle: handle
+        )
         return submission.request.runID
     }
 

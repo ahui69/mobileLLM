@@ -68,7 +68,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
     public let descriptor: AgentModelProviderDescriptor
     /// Resolved on every generation so settings/Keychain changes apply without an app restart. The
     /// provider never retains the key in memory beyond one request; returning nil fails closed.
-    private let configurationProvider: @Sendable () -> ResponsesAPIConfiguration?
+    private let configurationProvider: @Sendable (AgentModelSelection) -> ResponsesAPIConfiguration?
     private let session: URLSession
     /// Per-run attempt timeout derived from the prepared plan (the run budget), so the URLSession
     /// deadline is never a second hardcoded guess. Keyed by request id; cleared after each generate.
@@ -80,18 +80,33 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         capabilityVersion: SemanticVersion = SemanticVersion("1.0.0")!
     ) throws {
         try self.init(
-            configurationProvider: { configuration },
+            selectionConfigurationProvider: { _ in configuration },
             session: session,
             capabilityVersion: capabilityVersion
         )
     }
 
-    public init(
+    /// Backward-compatible dynamic configuration seam for one-service clients.
+    public convenience init(
         configurationProvider: @escaping @Sendable () -> ResponsesAPIConfiguration?,
         session: URLSession = .shared,
         capabilityVersion: SemanticVersion = SemanticVersion("1.0.0")!
     ) throws {
-        self.configurationProvider = configurationProvider
+        try self.init(
+            selectionConfigurationProvider: { _ in configurationProvider() },
+            session: session,
+            capabilityVersion: capabilityVersion
+        )
+    }
+
+    /// Selection-scoped configuration keeps concurrent/recovered runs bound to the endpoint and
+    /// credential account represented by their immutable model selection.
+    public init(
+        selectionConfigurationProvider: @escaping @Sendable (AgentModelSelection) -> ResponsesAPIConfiguration?,
+        session: URLSession = .shared,
+        capabilityVersion: SemanticVersion = SemanticVersion("1.0.0")!
+    ) throws {
+        configurationProvider = selectionConfigurationProvider
         self.session = session
         descriptor = AgentModelProviderDescriptor(
             id: try AgentModelProviderID(Self.providerID),
@@ -105,7 +120,8 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         // Per-service metadata wins when the user configured the model's real max output; otherwise
         // the provider stays permissive (up to the same ceiling it advertises for context) so auto
         // mode can never be rejected because our fallback was too small.
-        let outputCeiling = configurationProvider()?.maximumOutputTokens ?? Self.maximumContextTokens
+        let outputCeiling = configurationProvider(selection)?.maximumOutputTokens
+            ?? Self.maximumContextTokens
         return try AgentModelCapabilities(
             maximumContextTokens: Self.maximumContextTokens,
             maximumOutputTokens: outputCeiling,
@@ -128,7 +144,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         _ request: AgentModelRequest,
         context: ModelPreparationContext
     ) async throws -> PreparedModelRequest {
-        guard let configuration = configurationProvider() else {
+        guard let configuration = configurationProvider(request.selection) else {
             throw AgentModelProviderFailure(try Self.configurationMissingFailure())
         }
         let modelName = request.selection.modelID.rawValue
@@ -174,7 +190,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
     ) async throws -> AgentModelBoundaryCompletion {
         try Task.checkCancellation()
         let parameters = request.generationParameters
-        guard let configuration = configurationProvider() else {
+        guard let configuration = configurationProvider(request.selection) else {
             throw AgentModelProviderFailure(try Self.configurationMissingFailure())
         }
         guard let baseURL = URL(string: configuration.baseURL),

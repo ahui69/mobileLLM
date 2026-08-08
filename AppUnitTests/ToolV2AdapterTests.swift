@@ -35,6 +35,153 @@ final class ToolV2AdapterTests: XCTestCase {
     }
 
     @MainActor
+    func testSnapshotUsesRequestedConversationInsteadOfVisibleConversationState() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(component: "agent-snapshot-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let defaults = UserDefaults(suiteName: "agent-snapshot-test-\(UUID().uuidString)")!
+        let settings = AppSettings(defaults: defaults)
+        settings.temperature = 0.91
+        settings.topP = 0.92
+        settings.maxTokens = 999
+        settings.contextLength = 4_096
+        let credentials = EphemeralOpenAICredentialStore()
+        let container = AppContainer(
+            engine: MockLLMEngine(script: .init()),
+            downloadBase: directory,
+            downloader: { _, _, _, _ in },
+            settings: settings,
+            conversationStore: ConversationStore(directory: directory),
+            openAICredentials: credentials
+        )
+        let targetModel = LLMCatalog.bonsai8b
+        let targetVariant = targetModel.defaultVariantValue
+        let visibleModel = LLMCatalog.gemma4E2B
+        let visibleVariant = visibleModel.defaultVariantValue
+        let calculator = try AgentToolLogicalID(providerID: "builtin", name: "calculator")
+        let target = Conversation(
+            modelID: targetModel.id,
+            variantID: targetVariant.id,
+            messages: [Message(role: .user, answer: "target")],
+            toolPolicy: try ConversationToolPolicy(
+                masterEnabled: true,
+                allowedToolIDs: [calculator],
+                pinnedToolIDs: [],
+                selectionPolicyVersion: 1,
+                materializedFromGlobalTemplate: false
+            ),
+            contextLength: 12_345,
+            sampling: ConversationSampling(temperature: 0.12, topP: 0.34, maxTokens: 222),
+            approvalMode: .fullAccess,
+            reasoningEffort: .high
+        )
+        let visible = Conversation(
+            modelID: visibleModel.id,
+            variantID: visibleVariant.id,
+            messages: [Message(role: .user, answer: "visible")],
+            contextLength: 65_536,
+            sampling: ConversationSampling(temperature: 0.8, topP: 0.9, maxTokens: 888),
+            approvalMode: .ask,
+            reasoningEffort: .low
+        )
+        container.chat.conversations = [target, visible]
+        container.chat.activeID = visible.id
+        container.chat.synchronizeActiveModel(
+            LoadedModel(model: visibleModel, variant: visibleVariant),
+            reseedEmptyConversation: false
+        )
+        let config = OpenAIOnlineConfigurationBox(
+            baseURL: "https://example.com/v1",
+            modelID: nil,
+            credentials: credentials
+        )
+
+        let snapshot = try XCTUnwrap(makeAgentSnapshot(
+            container: container,
+            conversationID: target.id,
+            userTurnID: target.messages[0].id,
+            text: "target",
+            imageRefs: [],
+            downloadBase: directory,
+            onlineConfigBox: config
+        ))
+
+        XCTAssertEqual(snapshot.model.id, targetModel.id)
+        XCTAssertEqual(snapshot.variant.id, targetVariant.id)
+        XCTAssertEqual(snapshot.messages.map(\.answer), ["target"])
+        XCTAssertEqual(snapshot.contextLength, 12_345)
+        XCTAssertEqual(snapshot.maxTokens, 222)
+        XCTAssertEqual(snapshot.temperature, 0.12)
+        XCTAssertEqual(snapshot.topP, 0.34)
+        XCTAssertEqual(snapshot.localToolNames, ["calculator"])
+        XCTAssertEqual(snapshot.approvalMode, .fullAccess)
+        XCTAssertEqual(snapshot.onlineReasoningEffort, .high)
+    }
+
+    func testOnlineConfigurationRemainsBoundToAcceptedSelectionAfterSettingsEdit() throws {
+        let credentials = EphemeralOpenAICredentialStore()
+        try credentials.saveAPIKey("secret", serviceID: "service-a")
+        let box = OpenAIOnlineConfigurationBox(
+            baseURL: "https://unused.example/v1",
+            modelID: nil,
+            credentials: credentials
+        )
+        let firstID = box.update(
+            serviceID: "service-a",
+            baseURL: "https://first.example/v1",
+            modelID: "model-a",
+            reasoningEffort: .low,
+            maximumOutputTokens: 4_096
+        )
+        let secondID = box.update(
+            serviceID: "service-a",
+            baseURL: "https://second.example/v1",
+            modelID: "model-a",
+            reasoningEffort: .high,
+            maximumOutputTokens: 8_192
+        )
+        let version = SemanticVersion("1.0.0")!
+        func selection(_ configurationID: String) throws -> AgentModelSelection {
+            try AgentModelSelection(
+                providerID: AgentModelProviderID(AppFrozenInputBuilder.onlineProviderID),
+                modelID: AgentModelID("model-a"),
+                variantID: AgentModelVariantID(
+                    AppFrozenInputBuilder.onlineVariantID(configurationID: configurationID)
+                ),
+                capabilityVersion: version
+            )
+        }
+
+        let first = try XCTUnwrap(box.configuration(for: selection(firstID)))
+        let second = try XCTUnwrap(box.configuration(for: selection(secondID)))
+        XCTAssertNotEqual(firstID, secondID)
+        XCTAssertEqual(first.baseURL, "https://first.example/v1")
+        XCTAssertEqual(first.reasoningEffort, .low)
+        XCTAssertEqual(first.maximumOutputTokens, 4_096)
+        XCTAssertEqual(second.baseURL, "https://second.example/v1")
+        XCTAssertEqual(second.reasoningEffort, .high)
+        XCTAssertEqual(second.maximumOutputTokens, 8_192)
+
+        let relaunched = OpenAIOnlineConfigurationBox(
+            baseURL: "https://unused.example/v1",
+            modelID: nil,
+            credentials: credentials
+        )
+        let rehydratedID = relaunched.update(
+            serviceID: "service-a",
+            baseURL: "https://first.example/v1",
+            modelID: "model-a",
+            reasoningEffort: .low,
+            maximumOutputTokens: 4_096
+        )
+        XCTAssertEqual(rehydratedID, firstID)
+        XCTAssertEqual(
+            try XCTUnwrap(relaunched.configuration(for: selection(firstID))).baseURL,
+            "https://first.example/v1"
+        )
+    }
+
+    @MainActor
     func testLocalFrozenInputAdvertisesOnlyTheRelevantBoundedToolSubset() throws {
         let snapshot = makeSnapshot(userMessageID: UUID())
         let builder = AppFrozenInputBuilder(capabilityVersion: SemanticVersion("1.0.0")!)
@@ -109,6 +256,7 @@ final class ToolV2AdapterTests: XCTestCase {
             onlineModelEnabled: false,
             onlineModelID: nil,
             onlineServiceID: nil,
+            onlineConfigurationID: nil,
             onlineReasoningEnabled: false,
             onlineContextLength: 128_000,
             onlineOutputBudgetAuto: true,
