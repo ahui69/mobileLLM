@@ -20,6 +20,7 @@
     {
       "parallelizable" : false,
       "selectedTests" : [
+        "SimulatorCISmokeUITests/testApprovalIsCompleteAtMaximumDynamicTypeAndAcceptsOneDecision",
         "SimulatorCISmokeUITests/testNeutralLaunchAndPrimaryNavigationAreInteractive"
       ],
       "target" : {

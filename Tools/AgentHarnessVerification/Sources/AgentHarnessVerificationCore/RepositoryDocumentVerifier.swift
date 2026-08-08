@@ -43,6 +43,11 @@ enum RepositoryDocumentVerifier {
                 instances: repositoryFiles(root: root, directory: "Verification/AgentHarness/Coverage",
                                            extension: "json")
             ),
+            DocumentFamily(
+                schema: "Verification/AgentHarness/Schemas/mutation-suite.schema.json",
+                instances: repositoryFiles(root: root, directory: "Verification/AgentHarness/Mutations",
+                                           extension: "json")
+            ),
         ]
 
         for family in families {
@@ -71,6 +76,7 @@ enum RepositoryDocumentVerifier {
         validateFixtureSemantics(root: root, diagnostics: &diagnostics)
         validateRegistrySemantics(root: root, diagnostics: &diagnostics)
         validateCoverageDocuments(root: root, diagnostics: &diagnostics)
+        validateMutationSuite(root: root, diagnostics: &diagnostics)
     }
 
     private static func validateDeclaredSchema(
@@ -225,6 +231,50 @@ enum RepositoryDocumentVerifier {
             where collection[key] as? Bool != true {
             add(&diagnostics, "AHV-COVERAGE-COLLECTION", policyPath,
                 "collection.\(key) must be true")
+        }
+    }
+
+    private static func validateMutationSuite(root: URL,
+                                              diagnostics: inout [VerificationDiagnostic]) {
+        let path = "Verification/AgentHarness/Mutations/mutations.v1.json"
+        let policyPath = "Verification/AgentHarness/Coverage/policy.v1.json"
+        guard let suite = loadJSON(path: path, root: root,
+                                   diagnostics: &diagnostics) as? [String: Any],
+              let mutations = suite["mutations"] as? [[String: Any]],
+              let policy = loadJSON(path: policyPath, root: root,
+                                    diagnostics: &diagnostics) as? [String: Any],
+              let policyMutations = policy["mutationGates"] as? [[String: Any]] else { return }
+        let expectedIDs = Set(policyMutations.compactMap { $0["id"] as? String })
+        let actualIDs = Set(mutations.compactMap { $0["id"] as? String })
+        if actualIDs != expectedIDs || actualIDs.count != mutations.count {
+            add(&diagnostics, "AHV-MUTATION-INVENTORY", path,
+                "mutation suite IDs must exactly match the unique coverage-policy mutation IDs")
+        }
+        var filters: Set<String> = []
+        for mutation in mutations {
+            guard let id = mutation["id"] as? String,
+                  let file = mutation["file"] as? String,
+                  let original = mutation["original"] as? String,
+                  let replacement = mutation["replacement"] as? String,
+                  let filter = mutation["testFilter"] as? String else { continue }
+            if original == replacement {
+                add(&diagnostics, "AHV-MUTATION-NOOP", id, "replacement must change production source")
+            }
+            if !filters.insert(filter).inserted {
+                add(&diagnostics, "AHV-MUTATION-SENTINEL", id,
+                    "each curated mutation requires a distinct sentinel test")
+            }
+            let sourceURL = root.appending(path: file).standardizedFileURL
+            guard isConfined(sourceURL, to: root),
+                  let source = try? String(contentsOf: sourceURL, encoding: .utf8) else {
+                add(&diagnostics, "AHV-MUTATION-SOURCE", id, "source file is unreadable")
+                continue
+            }
+            let occurrences = source.components(separatedBy: original).count - 1
+            if occurrences != 1 {
+                add(&diagnostics, "AHV-MUTATION-SOURCE", id,
+                    "original source token must occur exactly once; found \(occurrences)")
+            }
         }
     }
 

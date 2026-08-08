@@ -36,8 +36,11 @@
     "inputs": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sourceRoot", "policyPath", "baselinePath", "reportSchemaPath", "criticalSources"],
+      "required": ["sourceCommit", "specSHA256", "sourceTreeStatus", "sourceRoot", "policyPath", "baselinePath", "reportSchemaPath", "criticalSources"],
       "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "specSHA256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "sourceTreeStatus": { "enum": ["clean", "dirty"] },
         "llvmCoverageType": { "const": "llvm.coverage.json.export" },
         "llvmCoverageVersion": { "type": "string", "minLength": 1 },
         "xunitSHA256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },

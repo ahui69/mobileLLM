@@ -1550,13 +1550,18 @@
     {
       "id": "AHT-UI-002",
       "title": "Verify accessible approval presentation and activation",
-      "status": "planned",
+      "status": "active",
       "kind": "ui",
       "riskTier": "P0",
       "requirementIDs": [
         "AH-UI-002"
       ],
-      "selectors": [],
+      "selectors": [
+        {
+          "kind": "ui-test",
+          "value": "SimulatorCISmokeUITests/testApprovalIsCompleteAtMaximumDynamicTypeAndAcceptsOneDecision"
+        }
+      ],
       "platforms": [
         "ios-simulator",
         "ios-device"
@@ -2015,13 +2020,26 @@
     {
       "id": "AHT-TEST-001",
       "title": "Enforce unit, property, fault, fuzz, and semantic completeness gates",
-      "status": "planned",
+      "status": "active",
       "kind": "manifest",
       "riskTier": "P0",
       "requirementIDs": [
         "AH-TEST-001"
       ],
-      "selectors": [],
+      "selectors": [
+        {
+          "kind": "swift-test",
+          "value": "AgentRuntimeTests.RegistryOracleTests/testCompiledReducerMatchesAllSixThousandThreeHundredTwentyEightRegistryCells"
+        },
+        {
+          "kind": "swift-test",
+          "value": "AgentHarnessVerificationTests.CoverageRunnerContractTests/testCuratedMutationRunnerRequiresExecutedFailingTestsNotCompileFailures"
+        },
+        {
+          "kind": "script",
+          "value": "scripts/verification/run-agent-mutation-gates.sh"
+        }
+      ],
       "platforms": [
         "swiftpm"
       ],
@@ -2031,7 +2049,7 @@
         "nightly"
       ],
       "requiredEvidence": [
-        "Test inventory, fixed/rotating seeds, registry rows, and fault points"
+        "Test inventory, fixed/rotating seeds, all 6,328 registry cells, fault points, and six killed source mutants"
       ],
       "determinism": {
         "fixedSeedRequired": true,

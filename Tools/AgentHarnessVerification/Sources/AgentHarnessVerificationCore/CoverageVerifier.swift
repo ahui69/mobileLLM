@@ -19,6 +19,13 @@ public struct CoverageVerificationConfiguration: Sendable {
     public let reportSchemaURL: URL
     public let changedDiffURL: URL
     public let criticalSources: [String]
+    /// Exact checked-out commit whose source was instrumented.
+    public let sourceCommit: String
+    /// Exact specification digest from that source tree.
+    public let specSHA256: String
+    /// `clean` is required when reports are assembled into CI/release evidence; local dirty reports
+    /// remain useful diagnostics but can never satisfy the freshness gate.
+    public let sourceTreeStatus: String
     public let generatedAt: Date
 
     public init(
@@ -32,6 +39,9 @@ public struct CoverageVerificationConfiguration: Sendable {
         reportSchemaURL: URL? = nil,
         changedDiffURL: URL,
         criticalSources: [String],
+        sourceCommit: String,
+        specSHA256: String,
+        sourceTreeStatus: String,
         generatedAt: Date = Date()
     ) {
         let root = repositoryRoot.standardizedFileURL
@@ -51,6 +61,9 @@ public struct CoverageVerificationConfiguration: Sendable {
             .standardizedFileURL
         self.changedDiffURL = changedDiffURL.standardizedFileURL
         self.criticalSources = criticalSources
+        self.sourceCommit = sourceCommit
+        self.specSHA256 = specSHA256
+        self.sourceTreeStatus = sourceTreeStatus
         self.generatedAt = generatedAt
     }
 }
@@ -68,6 +81,9 @@ public struct CoverageVerificationReport: Codable, Sendable {
 }
 
 public struct CoverageReportInputs: Codable, Sendable {
+    public let sourceCommit: String
+    public let specSHA256: String
+    public let sourceTreeStatus: String
     public let llvmCoverageType: String?
     public let llvmCoverageVersion: String?
     public let xunitSHA256: String?
@@ -183,6 +199,18 @@ public enum AgentHarnessCoverageVerifier {
     ) -> CoverageVerificationReport {
         var diagnostics: [CoverageReportDiagnostic] = []
         let root = configuration.repositoryRoot.standardizedFileURL
+        if configuration.sourceCommit.range(of: "^[a-f0-9]{40}$", options: .regularExpression) == nil {
+            add(&diagnostics, "AHV-EVIDENCE-SOURCE-COMMIT", "sourceCommit",
+                "source commit must be 40 lowercase hexadecimal characters")
+        }
+        if configuration.specSHA256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) == nil {
+            add(&diagnostics, "AHV-EVIDENCE-SPEC-DIGEST", "specSHA256",
+                "spec digest must be 64 lowercase hexadecimal characters")
+        }
+        if configuration.sourceTreeStatus != "clean" && configuration.sourceTreeStatus != "dirty" {
+            add(&diagnostics, "AHV-EVIDENCE-TREE-STATUS", "sourceTreeStatus",
+                "source tree status must be clean or dirty")
+        }
         let sourceRoot = confinedRepositoryPath(
             configuration.sourceRoot, root: root, location: "sourceRoot", diagnostics: &diagnostics
         )
@@ -309,6 +337,9 @@ public enum AgentHarnessCoverageVerifier {
                 succeeded: reportDiagnostics.isEmpty,
                 generatedAtUTC: iso8601(configuration.generatedAt),
                 inputs: CoverageReportInputs(
+                    sourceCommit: configuration.sourceCommit,
+                    specSHA256: configuration.specSHA256,
+                    sourceTreeStatus: configuration.sourceTreeStatus,
                     llvmCoverageType: export.type,
                     llvmCoverageVersion: export.version,
                     xunitSHA256: testEvidence.sha256,

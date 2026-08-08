@@ -34,7 +34,19 @@ public struct RootView: View {
         _section = State(initialValue: initialSection)
     }
 
-    public var body: some View {
+    @ViewBuilder public var body: some View {
+        #if DEBUG && !os(macOS)
+        if ProcessInfo.processInfo.environment["MOBILELLM_APPROVAL_ACCESSIBILITY_FIXTURE"] == "1" {
+            ApprovalAccessibilityFixtureView()
+        } else {
+            standardBody
+        }
+        #else
+        standardBody
+        #endif
+    }
+
+    private var standardBody: some View {
         shell
             .tint(Theme.accent)
             .background(Theme.bg)

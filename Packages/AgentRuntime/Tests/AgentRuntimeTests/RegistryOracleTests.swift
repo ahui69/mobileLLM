@@ -6,6 +6,7 @@ import Foundation
 import XCTest
 
 final class RegistryOracleTests: XCTestCase {
+    // TEST-ID: AHT-TEST-001
     func testCompiledReducerMatchesAllSixThousandThreeHundredTwentyEightRegistryCells() throws {
         let registry: DecisionRegistry = try loadRegistry(named: "run-transitions.v1.json")
         XCTAssertEqual(registry.completeness, "complete")

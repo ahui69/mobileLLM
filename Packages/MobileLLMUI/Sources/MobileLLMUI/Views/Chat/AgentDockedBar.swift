@@ -42,6 +42,25 @@ struct AgentDockedBar: View {
     // MARK: Approval
 
     private func approvalBar(_ approval: AgentApprovalCard) -> some View {
+        AgentApprovalDecisionBar(approval: approval) { approved in
+            await store.decideApproval(
+                conversationID: conversationID,
+                approvalID: approval.approvalID,
+                approved: approved
+            )
+        }
+    }
+}
+
+/// The production approval surface, isolated so deterministic UI tests exercise the exact same view
+/// that a durable run presents. The synchronous latch closes before either async command starts, so
+/// two taps cannot enqueue two decisions from one projection.
+struct AgentApprovalDecisionBar: View {
+    let approval: AgentApprovalCard
+    let decide: @MainActor @Sendable (Bool) async -> Void
+    @State private var decisionPending = false
+
+    var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.xs) {
             HStack(spacing: Theme.Space.xs) {
                 Image(systemName: approval.isExternalWrite
@@ -52,53 +71,75 @@ struct AgentDockedBar: View {
                 Text("Approve \(approval.toolName)?")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(Theme.textPrimary)
+                    .accessibilityIdentifier("approval.title")
+                    .accessibilitySortPriority(7)
                 Spacer(minLength: 0)
             }
-            if !approval.preview.isEmpty {
-                Text(approval.preview)
-                    .font(.caption)
-                    .foregroundStyle(Theme.textPrimary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-            }
-            if let destination = approval.destination {
-                Text(destination)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.textTertiary)
-                    .lineLimit(2)
-                    .textSelection(.enabled)
-            }
-            HStack(spacing: Theme.Space.sm) {
-                Button {
-                    Task { await store.decideApproval(
-                        conversationID: conversationID,
-                        approvalID: approval.approvalID,
-                        approved: false
-                    ) }
-                } label: {
-                    Text("Deny").frame(maxWidth: .infinity)
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    if !approval.preview.isEmpty {
+                        approvalDetail(
+                            label: "Action",
+                            value: approval.preview,
+                            identifier: "approval.preview",
+                            priority: 6
+                        )
+                    }
+                    if let destination = approval.destination {
+                        approvalDetail(
+                            label: "Destination",
+                            value: destination,
+                            identifier: "approval.destination",
+                            priority: 5
+                        )
+                    }
+                    if !approval.dataCategories.isEmpty {
+                        approvalDetail(
+                            label: "Data",
+                            value: approval.dataCategories.joined(separator: ", "),
+                            identifier: "approval.data",
+                            priority: 4
+                        )
+                    }
+                    if !approval.effects.isEmpty {
+                        approvalDetail(
+                            label: "Effects",
+                            value: approval.effects.joined(separator: ", "),
+                            identifier: "approval.effects",
+                            priority: 3
+                        )
+                    }
+                    if approval.isExternalWrite {
+                        Text("This may change data outside mobileLLM.")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Theme.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("approval.warning")
+                            .accessibilitySortPriority(2)
+                    }
                 }
-                .buttonStyle(StudioButtonStyle(.secondary))
-                .accessibilityLabel("Deny \(approval.toolName)")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 240)
 
-                Button {
-                    Task { await store.decideApproval(
-                        conversationID: conversationID,
-                        approvalID: approval.approvalID,
-                        approved: true
-                    ) }
-                } label: {
-                    Text(approval.isExternalWrite || approval.isConversationScoped
-                         ? "Approve once" : "Approve").frame(maxWidth: .infinity)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: Theme.Space.sm) {
+                    decisionButton(approved: false)
+                    decisionButton(approved: true)
                 }
-                .buttonStyle(StudioButtonStyle(.primary))
-                .accessibilityLabel("Approve \(approval.toolName)")
+                VStack(spacing: Theme.Space.xs) {
+                    decisionButton(approved: false)
+                    decisionButton(approved: true)
+                }
             }
             Text(approval.isConversationScoped
                  ? "Authorizes this model for the rest of this conversation."
                  : "Authorizes only this exact prepared operation.")
                 .font(.caption2)
                 .foregroundStyle(Theme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("approval.scope")
+                .accessibilitySortPriority(1)
         }
         .padding(.horizontal, Theme.Space.md)
         .padding(.vertical, Theme.Space.sm)
@@ -106,8 +147,53 @@ struct AgentDockedBar: View {
         .overlay(alignment: .top) { Divider().background(Theme.hairline) }
     }
 
-    // MARK: Question
+    private func approvalDetail(
+        label: String,
+        value: String,
+        identifier: String,
+        priority: Double
+    ) -> some View {
+        Text("\(label): \(value)")
+            .font(.caption)
+            .foregroundStyle(label == "Action" ? Theme.textPrimary : Theme.textSecondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+            .accessibilityLabel(label)
+            .accessibilityValue(value)
+            .accessibilityIdentifier(identifier)
+            .accessibilitySortPriority(priority)
+    }
 
+    private func decisionButton(approved: Bool) -> some View {
+        Button {
+            guard !decisionPending else { return }
+            decisionPending = true
+            Task { @MainActor in
+                await decide(approved)
+                decisionPending = false
+            }
+        } label: {
+            Text(buttonTitle(approved: approved))
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(StudioButtonStyle(approved ? .primary : .secondary))
+        .disabled(decisionPending)
+        .accessibilityLabel("\(approved ? "Approve" : "Deny") \(approval.toolName)")
+        .accessibilityHint(decisionPending ? "Decision in progress" : "Submits one decision")
+        .accessibilityIdentifier(approved ? "approval.approve" : "approval.deny")
+        .accessibilitySortPriority(approved ? 0.8 : 0.9)
+    }
+
+    private func buttonTitle(approved: Bool) -> String {
+        guard approved else { return "Deny" }
+        return approval.isExternalWrite || approval.isConversationScoped ? "Approve once" : "Approve"
+    }
+}
+
+// MARK: Question
+
+extension AgentDockedBar {
     private func userInputBar(_ request: UserInputRequest) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.xs) {
             HStack(spacing: Theme.Space.xs) {
@@ -197,3 +283,39 @@ struct AgentDockedBar: View {
         .overlay(alignment: .top) { Divider().background(Theme.hairline) }
     }
 }
+
+#if DEBUG && !os(macOS)
+/// Model-free simulator fixture for AHT-UI-002. It renders the production approval component with
+/// deliberately long authority text and exposes only a decision count, never an alternate approval path.
+struct ApprovalAccessibilityFixtureView: View {
+    @State private var decisionCount = 0
+
+    private let card = AgentApprovalCard(
+        approvalID: ApprovalID(rawValue: UUID(uuidString: "A11E0000-0000-4000-8000-000000000002")!),
+        toolName: "Calendar writer",
+        destination: "calendar://Personal/Events/Quarterly planning with the complete invited-attendee list",
+        preview: "Create an event titled Quarterly planning tomorrow at 09:30 and invite the selected attendees without changing any other event.",
+        dataCategories: ["calendar title", "start time", "attendee addresses"],
+        effects: ["creates one calendar event", "sends invitations"],
+        isExternalWrite: true,
+        isConversationScoped: false
+    )
+
+    var body: some View {
+        ScrollView {
+            AgentApprovalDecisionBar(approval: card) { _ in
+                decisionCount += 1
+                // Keep the command in flight long enough for XCUITest to prove that a second
+                // accessibility activation cannot enqueue another decision.
+                try? await Task.sleep(for: .seconds(3))
+            }
+            Text("\(decisionCount)")
+                .accessibilityLabel("Approval decision count")
+                .accessibilityValue("\(decisionCount)")
+                .accessibilityIdentifier("approval.fixture.decision-count")
+        }
+        .background(Theme.bg)
+        .dynamicTypeSize(.accessibility5)
+    }
+}
+#endif

@@ -4,8 +4,8 @@
   "documentID": "AH-REQUIREMENTS-V1",
   "sourceSpecification": {
     "path": "spec.md",
-    "sha256": "d9e29da8c1915e2238f58cddc0940bb5bda4114762ef188acc06b51e08422e4c",
-    "capturedAtUTC": "2026-08-08T22:00:00Z"
+    "sha256": "c3a192618a60997cb8fa08dacea89ea2a1a5b56b5ef11252276b8e33292afe46",
+    "capturedAtUTC": "2026-08-08T22:42:43Z"
   },
   "requirements": [
     {
@@ -1564,7 +1564,7 @@
       "area": "ui-accessibility",
       "title": "Approval UI is fully accessible",
       "statement": "VoiceOver and maximum Dynamic Type expose untruncated destination, data, scope, and warning text with stable focus, distinct actions, and double-activation protection.",
-      "status": "planned",
+      "status": "active",
       "riskTier": "P0",
       "specAnchors": [
         {
@@ -1959,7 +1959,7 @@
       "area": "testing",
       "title": "Deterministic unit and property coverage is exhaustive",
       "statement": "State, CAS, schema, approval, budgets, recovery, artifacts, deletion, lifecycle, attenuation, fuzz, and negative paths use deterministic clocks, IDs, fakes, and seeds.",
-      "status": "planned",
+      "status": "active",
       "riskTier": "P0",
       "specAnchors": [
         {
@@ -1981,7 +1981,7 @@
         "AHT-TEST-001"
       ],
       "requiredEvidence": [
-        "Unit/property test inventory and semantic registry coverage"
+        "Complete semantic registry oracle, fixed and rotating seeds, and a six-mutant curated source-mutation gate"
       ]
     },
     {
@@ -2085,8 +2085,8 @@
         {
           "section": "29.1",
           "heading": "Audit cadence and stop rule",
-          "lineStart": 1481,
-          "lineEnd": 1500
+          "lineStart": 1482,
+          "lineEnd": 1501
         }
       ],
       "platforms": [

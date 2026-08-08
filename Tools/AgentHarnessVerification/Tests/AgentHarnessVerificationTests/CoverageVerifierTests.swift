@@ -26,6 +26,9 @@ final class CoverageVerifierTests: XCTestCase {
         XCTAssertEqual(report.metrics.changedExecutableLines.functions.percent, 100)
         XCTAssertEqual(report.metrics.changedExecutableLines.matchedFunctions.count, 2)
         XCTAssertEqual(report.metrics.baseline.status, "compared")
+        XCTAssertEqual(report.inputs.sourceCommit, String(repeating: "a", count: 40))
+        XCTAssertEqual(report.inputs.specSHA256, String(repeating: "b", count: 64))
+        XCTAssertEqual(report.inputs.sourceTreeStatus, "clean")
         XCTAssertEqual(report.files.map(\.path), report.files.map(\.path).sorted())
 
         let encoded = try AgentHarnessCoverageVerifier.encodedReport(report)
@@ -205,7 +208,10 @@ final class CoverageVerifierTests: XCTestCase {
             baselineURL: fixture.baselineURL,
             reportSchemaURL: fixture.reportSchemaURL,
             changedDiffURL: fixture.diffURL,
-            criticalSources: [fixture.sourceRoot + "/Missing.swift"]
+            criticalSources: [fixture.sourceRoot + "/Missing.swift"],
+            sourceCommit: String(repeating: "a", count: 40),
+            specSHA256: String(repeating: "b", count: 64),
+            sourceTreeStatus: "clean"
         )
         let codes = Set(AgentHarnessCoverageVerifier.verify(configuration).diagnostics.map(\.code))
         XCTAssertTrue(codes.contains("AHV-COVERAGE-POLICY"))
@@ -379,6 +385,9 @@ private final class CoverageFixture {
             reportSchemaURL: reportSchemaURL,
             changedDiffURL: diffURL,
             criticalSources: [authorityPath],
+            sourceCommit: String(repeating: "a", count: 40),
+            specSHA256: String(repeating: "b", count: 64),
+            sourceTreeStatus: "clean",
             generatedAt: ISO8601DateFormatter().date(from: "2026-08-01T00:00:00Z")!
         )
     }

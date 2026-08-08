@@ -73,6 +73,9 @@ private struct CoverageArguments {
         var changedDiffPath: String?
         var outputPath: String?
         var criticalSources: [String] = []
+        var sourceCommit: String?
+        var specSHA256: String?
+        var sourceTreeStatus: String?
         var index = 1
         while index < values.count {
             let option = values[index]
@@ -93,6 +96,9 @@ private struct CoverageArguments {
             case "--changed-diff":
                 changedDiffPath = try Self.once(changedDiffPath, value: value, option: option)
             case "--critical-source": criticalSources.append(value)
+            case "--source-commit": sourceCommit = try Self.once(sourceCommit, value: value, option: option)
+            case "--spec-sha256": specSHA256 = try Self.once(specSHA256, value: value, option: option)
+            case "--source-tree-status": sourceTreeStatus = try Self.once(sourceTreeStatus, value: value, option: option)
             case "--output": outputPath = try Self.once(outputPath, value: value, option: option)
             default: throw UsageError("unknown coverage option: \(option)")
             }
@@ -106,6 +112,9 @@ private struct CoverageArguments {
         guard let xunitPath else { throw UsageError("coverage requires --xunit") }
         guard let changedDiffPath else { throw UsageError("coverage requires --changed-diff") }
         guard let outputPath else { throw UsageError("coverage requires --output") }
+        guard let sourceCommit else { throw UsageError("coverage requires --source-commit") }
+        guard let specSHA256 else { throw UsageError("coverage requires --spec-sha256") }
+        guard let sourceTreeStatus else { throw UsageError("coverage requires --source-tree-status") }
         let root = URL(fileURLWithPath: rootPath, isDirectory: true).standardizedFileURL
         func inputURL(_ path: String) -> URL {
             path.hasPrefix("/") ? URL(fileURLWithPath: path).standardizedFileURL
@@ -124,7 +133,10 @@ private struct CoverageArguments {
             baselineURL: baselinePath.map(inputURL),
             reportSchemaURL: reportSchemaPath.map(inputURL),
             changedDiffURL: inputURL(changedDiffPath),
-            criticalSources: criticalSources
+            criticalSources: criticalSources,
+            sourceCommit: sourceCommit,
+            specSHA256: specSHA256,
+            sourceTreeStatus: sourceTreeStatus
         )
         outputURL = resolvedOutput
     }
@@ -138,6 +150,42 @@ private struct CoverageArguments {
 private struct UsageError: Error, CustomStringConvertible {
     let description: String
     init(_ description: String) { self.description = description }
+}
+
+private struct FreshnessArguments {
+    let configuration: EvidenceFreshnessConfiguration
+
+    init(_ values: [String]) throws {
+        guard values.first == "freshness" else { throw UsageError("freshness command is missing") }
+        var commit: String?
+        var spec: String?
+        var reports: [URL] = []
+        var index = 1
+        while index < values.count {
+            let option = values[index]
+            guard index + 1 < values.count else { throw UsageError("missing value for \(option)") }
+            let value = values[index + 1]
+            switch option {
+            case "--expected-source-commit":
+                guard commit == nil else { throw UsageError("duplicate option: \(option)") }
+                commit = value
+            case "--expected-spec-sha256":
+                guard spec == nil else { throw UsageError("duplicate option: \(option)") }
+                spec = value
+            case "--report": reports.append(URL(fileURLWithPath: value))
+            default: throw UsageError("unknown freshness option: \(option)")
+            }
+            index += 2
+        }
+        guard let commit else { throw UsageError("freshness requires --expected-source-commit") }
+        guard let spec else { throw UsageError("freshness requires --expected-spec-sha256") }
+        guard !reports.isEmpty else { throw UsageError("freshness requires at least one --report") }
+        configuration = EvidenceFreshnessConfiguration(
+            expectedSourceCommit: commit,
+            expectedSpecSHA256: spec,
+            reportURLs: reports
+        )
+    }
 }
 
 private func usage() {
@@ -162,7 +210,15 @@ private func usage() {
       --report-schema PATH
       --changed-diff PATH
       --critical-source REPOSITORY_RELATIVE_PATH   (repeatable)
+      --source-commit 40_HEX_GIT_COMMIT
+      --spec-sha256 64_HEX_SPEC_DIGEST
+      --source-tree-status clean|dirty
       --output PATH
+
+    usage: agent-harness-verify freshness [options]
+      --expected-source-commit 40_HEX_GIT_COMMIT
+      --expected-spec-sha256 64_HEX_SPEC_DIGEST
+      --report PATH   (repeat exactly once per required scope)
     \n
     """.utf8))
 }
@@ -180,6 +236,20 @@ do {
         try data.write(to: arguments.outputURL, options: .atomic)
         if report.succeeded {
             print("Agent Harness coverage verification passed (\(report.scope)).")
+            exit(EXIT_SUCCESS)
+        }
+        for diagnostic in report.diagnostics {
+            FileHandle.standardError.write(Data(
+                "\(diagnostic.location): [\(diagnostic.code)] \(diagnostic.message)\n".utf8
+            ))
+        }
+        exit(EXIT_FAILURE)
+    }
+    if values.first == "freshness" {
+        let arguments = try FreshnessArguments(values)
+        let report = AgentHarnessEvidenceFreshnessVerifier.verify(arguments.configuration)
+        if report.succeeded {
+            print("Agent Harness evidence freshness verification passed.")
             exit(EXIT_SUCCESS)
         }
         for diagnostic in report.diagnostics {

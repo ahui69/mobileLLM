@@ -123,6 +123,12 @@ test_log="$output_dir/swift-test.log"
 raw_coverage="$output_dir/llvm-cov-export.json"
 changed_diff="$output_dir/changed-lines.diff"
 report_path="$output_dir/coverage-report.v1.json"
+source_commit="$(git -C "$repo_root" rev-parse HEAD)"
+spec_sha256="$(/usr/bin/shasum -a 256 "$repo_root/spec.md" | /usr/bin/awk '{print $1}')"
+source_tree_status="clean"
+if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=all)" ]]; then
+    source_tree_status="dirty"
+fi
 
 git -C "$repo_root" -c core.quotePath=false diff \
     --unified=0 --no-color --no-ext-diff "$comparison_base" -- "$source_root" \
@@ -136,6 +142,9 @@ coverage_arguments=(
     --llvm-cov "$raw_coverage"
     --xunit "$xunit_path"
     --changed-diff "$changed_diff"
+    --source-commit "$source_commit"
+    --spec-sha256 "$spec_sha256"
+    --source-tree-status "$source_tree_status"
     --report-schema "$repo_root/Verification/AgentHarness/Schemas/coverage-report.schema.json"
     --output "$report_path"
 )

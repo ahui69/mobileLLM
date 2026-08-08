@@ -246,8 +246,11 @@ package's macros can't build under plain SwiftPM), and `-scheme UITests` drives 
 (keyboard/composer geometry, agent-run UI, workflow E2E). The checked-in test plans live in
 `Verification/AgentHarness/TestPlans` (`SimulatorUI.xctestplan`, `DeviceE2E.xctestplan`); online-model
 scenarios read `~/.mobilellm/openai.json` through launch-environment variables (see below).
-The plans are checked in and runnable, but the current CI workflow only validates that Xcode can discover them;
-executing the full simulator plan in CI remains an open release gate.
+CI also executes the model-free `SimulatorCI` plan, including maximum-Dynamic-Type approval content and
+single-activation coverage. Agent verification checks all 6,328 reducer registry cells with fixed and rotating
+seeds, kills six curated production-source mutants, and rejects package coverage reports unless all required
+reports are clean and bound to the same source commit and exact `spec.md` digest. Rich online-model and local-weight
+physical-device scenarios remain release-candidate gates.
 
 See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full development setup and package map.
 

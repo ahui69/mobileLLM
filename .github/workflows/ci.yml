@@ -37,6 +37,7 @@ jobs:
             | xargs -0 -n1 jq empty
           bash -n scripts/verification/reset-agent-test-container.sh
           bash -n scripts/verification/run-agent-package-coverage.sh
+          bash -n scripts/verification/run-agent-mutation-gates.sh
 
       - name: Test the verification gate
         run: swift test --package-path Tools/AgentHarnessVerification
@@ -106,6 +107,32 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  agent-evidence-freshness:
+    name: coherent agent evidence
+    needs: agent-package-coverage
+    runs-on: macos-15
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+
+      - name: Download all coverage evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-coverage-${{ github.run_id }}-${{ github.run_attempt }}"
+          path: ${{ runner.temp }}/agent-evidence
+
+      - name: Require one clean report from the same commit and specification
+        run: |
+          reports=()
+          while IFS= read -r report; do reports+=(--report "$report"); done < <(
+            find "$RUNNER_TEMP/agent-evidence" -name coverage-report.v1.json -type f | sort
+          )
+          spec_sha="$(shasum -a 256 spec.md | awk '{print $1}')"
+          swift run --package-path Tools/AgentHarnessVerification agent-harness-verify freshness \
+            --expected-source-commit "$GITHUB_SHA" \
+            --expected-spec-sha256 "$spec_sha" \
+            "${reports[@]}"
+
   test:
     name: swift test (${{ matrix.package }})
     needs: agent-harness-verification
@@ -134,9 +161,28 @@ jobs:
       - name: Test package
         run: swift test --package-path "Packages/${{ matrix.package }}"
 
+  agent-harness-mutations:
+    name: curated agent mutation gates
+    needs: agent-harness-verification
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          swift --version
+
+      - name: Kill all six security mutations
+        env:
+          AGENT_HARNESS_ROTATING_SEED: ${{ github.run_id }}
+        run: bash scripts/verification/run-agent-mutation-gates.sh
+
   build-app-and-engines:
     name: xcodebuild (app + engines)
-    needs: [test, agent-package-coverage]
+    needs: [test, agent-package-coverage, agent-evidence-freshness, agent-harness-mutations]
     runs-on: macos-15
     timeout-minutes: 90
     steps:

@@ -1456,12 +1456,13 @@ The first release is complete only when all of the following are true:
 
 Implementation is one dependency-ordered program, followed by one consolidated independent audit:
 
-**Status (2026-08-08):** the runtime, SQLite journal and idempotent conversation outbox projection, Tool V2/MCP/
+**Status (2026-08-09):** the runtime, SQLite journal and idempotent conversation outbox projection, Tool V2/MCP/
 online adapters, approvals, budgets, subagents, bounded parallel tool batches, staged workflow orchestrator,
 explicit workflow recovery, progressive UI, static traceability gate, and a deterministic model-free simulator CI
-gate are implemented. The implementation is not release-green: quantitative
-accessibility/performance evidence, the complete physical-device matrix, and consolidated release evidence remain
-open. Step 6 is in progress; steps 7-8 remain pending.
+gate are implemented. Maximum-Dynamic-Type approval coverage, complete semantic-registry evaluation, a curated
+six-mutant source gate, and commit/spec-bound coverage freshness enforcement are also implemented. The implementation
+is not release-green: matched device performance evidence, the complete physical-device matrix, and consolidated
+release evidence remain open. Step 6 is in progress; steps 7-8 remain pending.
 
 1. Establish stable requirement/test IDs, risk tiers, semantic registries, coverage collection, deterministic fixtures,
    and CI discovery gates; then freeze value types, IDs, state machine, event envelope, Tool V2, model-provider,
@@ -1600,20 +1601,23 @@ Open conformance gaps:
    `AgentRuntimeAssembly` attempt. Failure records the diagnostic, disables sending, and presents a visible
    restart-required composer state; it never silently executes the legacy `ToolLoop`. Tests/previews may still
    construct an intentionally unwired `ChatStore` to cover legacy compatibility in isolation.
-5. **Verification enforcement:** the checked-in pull-request simulator gate now executes a deterministic,
-   model-free neutral-launch/navigation XCUITest. Rich online-model tests and the physical-device plan remain
-   credentialed release gates. Accessibility, exhaustive semantic/fault gates, performance baselines, the
-   complete physical-device matrix, and the consolidated audit remain planned. Accessibility hardening landed
-   (2026-08-07): approval previews/destinations no longer visually truncate and keep VoiceOver-accessible labels;
-   `AHT-PERF-001` (matched latency/resource baselines) still requires a device + recorded baseline and remains
-   planned. The static semantic gate is now green (2026-08-07): the verifier's frozen axes include `approvalCommandRouting.operationKind` and
+5. **Verification enforcement:** the checked-in pull-request simulator gate executes deterministic, model-free
+   neutral-launch/navigation and maximum-Dynamic-Type approval XCUITests. The approval test asserts full action,
+   destination, data, effects, warning, distinct decisions, and one-shot activation. The complete registry oracle
+   evaluates all 6,328 cells with fixed and rotating seeds, while the curated mutation runner requires six real
+   production-source mutants to be killed by six distinct executed tests; compile/setup failures cannot count as kills.
+   Rich online-model tests and the physical-device plan remain credentialed release gates. `AHT-PERF-001` (matched
+   latency/resource baselines) still requires a device + recorded baseline and remains planned. The static semantic
+   gate is green (2026-08-07): the verifier's frozen axes include `approvalCommandRouting.operationKind` and
    `trustedProgressRouting.modelNeedsApproval`, and its expected routes match `AgentRunReducer` /
    `ApprovalDecisionTables` — model-provider approval resumes the model path (`waitingForModel`), denial
    terminates (`failed`/`permissionDenied`), `modelNeedsApproval` parks the run in `waitingForApproval`, and
    `AH-APPROVAL-AUTHORITY-022` recognizes conversation-scoped online-model consent
    (`authorizeMatchingReceipt`/`boundedConversationRead`). `agent-harness-verify static` exits 0.
-6. **Evidence freshness:** verification manifests, semantic registries, spec digest, coverage evidence, and device
-   results must be regenerated from one source commit. Conflicting `passed`/`pending` claims are not release evidence.
+6. **Evidence freshness:** CLOSED for automated package coverage (2026-08-09). Every report records its source commit,
+   exact `spec.md` digest, source-tree cleanliness, structured test-result digest, and diff digest; CI downloads all package
+   reports and fails closed unless the required set is successful, clean, and bound to the same expected commit/spec.
+   Physical-device results must still be regenerated from that release-candidate commit before the consolidated audit.
 7. **Accepted-send execution snapshot:** CLOSED (2026-08-08). `ChatStore` now asks `AgentRunStore` to capture an
    immutable submission recipe synchronously after appending the accepted user/assistant identities and before the
    first attachment write or model-residency await. Deferred artifact resolution builds only from that captured value.

@@ -29,6 +29,9 @@ final class CoverageRunnerContractTests: XCTestCase {
         XCTAssertTrue(script.contains("\"$comparison_base\" -- \"$source_root\""))
         XCTAssertFalse(script.contains("\"$base_ref\"...HEAD"))
         XCTAssertFalse(script.contains("\"$base_ref\" -- \"$source_root\""))
+        XCTAssertTrue(script.contains("--source-commit \"$source_commit\""))
+        XCTAssertTrue(script.contains("--spec-sha256 \"$spec_sha256\""))
+        XCTAssertTrue(script.contains("--source-tree-status \"$source_tree_status\""))
     }
 
     func testAgentContractsCriticalSelectorsCoverUntrustedBoundaryDecisions() throws {
@@ -43,11 +46,25 @@ final class CoverageRunnerContractTests: XCTestCase {
         }
     }
 
+    // TEST-ID: AHT-TEST-001
+    func testCuratedMutationRunnerRequiresExecutedFailingTestsNotCompileFailures() throws {
+        let script = try verificationScript(named: "run-agent-mutation-gates.sh")
+        XCTAssertTrue(script.contains("mutation original must occur exactly once"))
+        XCTAssertTrue(script.contains("Test Case .*${test_filter#*/}.* failed"))
+        XCTAssertTrue(script.contains("compile/setup failures do not count"))
+        XCTAssertTrue(script.contains("survived $test_filter"))
+        XCTAssertTrue(script.contains("$mutation_count/6 killed"))
+    }
+
     private func coverageRunnerSource() throws -> String {
+        try verificationScript(named: "run-agent-package-coverage.sh")
+    }
+
+    private func verificationScript(named name: String) throws -> String {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<5 { root.deleteLastPathComponent() }
         return try String(
-            contentsOf: root.appending(path: "scripts/verification/run-agent-package-coverage.sh"),
+            contentsOf: root.appending(path: "scripts/verification/\(name)"),
             encoding: .utf8
         )
     }

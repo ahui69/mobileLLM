@@ -119,7 +119,7 @@
     {
       "id": "OPEN-004",
       "severity": "P3",
-      "summary": "Independent human sign-off (AH-AUDIT-001), performance gates (AH-PERF-001), and exhaustive-coverage audit (AH-TEST-001) remain planned.",
+      "summary": "Independent human sign-off (AH-AUDIT-001) and matched device performance gates (AH-PERF-001) remain planned. AH-TEST-001 now has deterministic complete-registry and curated six-mutant CI enforcement.",
       "blockedBy": "Release-candidate phase"
     }
   ],

@@ -23,7 +23,7 @@
     { "id": "AH-MUTATION-003", "mutation": "allow an authorized destination or effect to widen", "mustBeKilled": true },
     { "id": "AH-MUTATION-004", "mutation": "ignore a start, command, or write idempotency key", "mustBeKilled": true },
     { "id": "AH-MUTATION-005", "mutation": "permit multiple terminal events for one run", "mustBeKilled": true },
-    { "id": "AH-MUTATION-006", "mutation": "weaken a hard budget comparison from greater-than-or-equal to greater-than", "mustBeKilled": true }
+    { "id": "AH-MUTATION-006", "mutation": "permit one unit above a hard budget limit", "mustBeKilled": true }
   ],
   "collection": {
     "swiftPM": "swift test --enable-code-coverage",
