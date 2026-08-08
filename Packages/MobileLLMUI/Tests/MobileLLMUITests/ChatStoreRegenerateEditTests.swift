@@ -238,6 +238,7 @@ private struct RecordingAgentRunRequestBuilder: AgentRunRequestBuilding {
     func buildSubmission(
         conversationID: UUID,
         userTurnID: UUID,
+        assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
     ) async throws -> AgentRunSubmission {

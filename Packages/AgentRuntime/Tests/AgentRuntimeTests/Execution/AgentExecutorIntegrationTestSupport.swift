@@ -162,6 +162,7 @@ struct ExecutorTestHarness {
         explicitlyRequestedToolIDs: [AgentToolLogicalID] = [],
         outputRequirement: AgentOutputRequirement = .text,
         instruction: String = "Answer the user's request.",
+        provenance suppliedProvenance: AgentRequestProvenance? = nil,
         clock: any AgentExecutionClock = FixedExecutorClock(),
         budget suppliedBudget: AgentBudget? = nil,
         policyEngine suppliedPolicyEngine: (any ApprovalPolicyEngine)? = nil,
@@ -193,7 +194,7 @@ struct ExecutorTestHarness {
             ),
             capabilityCeiling: capabilityCeiling,
             budget: budget,
-            provenance: AgentRequestProvenance(source: .user),
+            provenance: suppliedProvenance ?? AgentRequestProvenance(source: .user),
             parallelToolBatchLimit: parallelToolBatchLimit
         )
         let logicalIDs = toolDescriptors.map(\.id.logicalID)

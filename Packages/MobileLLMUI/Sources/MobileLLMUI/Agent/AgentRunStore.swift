@@ -104,6 +104,7 @@ public final class AgentRunStore {
         let submission = try await requestBuilder.buildSubmission(
             conversationID: conversationID,
             userTurnID: userMessageID,
+            assistantMessageID: assistantMessageID,
             text: text,
             imageRefs: imageRefs
         )

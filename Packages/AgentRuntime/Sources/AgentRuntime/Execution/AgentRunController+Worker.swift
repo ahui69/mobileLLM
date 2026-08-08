@@ -1339,7 +1339,8 @@ extension AgentRunController {
     private func finalize(runID: AgentRunID, answer: AgentAnswer) async throws {
         let (facts, _) = try await loadRun(runID)
         let data = try ExecutionEncoding.encode(answer)
-        let messageID = ExecutionStableID.message(runID: runID, role: .assistant)
+        let messageID = facts.submission?.request.payload.provenance.responseMessageID
+            ?? ExecutionStableID.message(runID: runID, role: .assistant)
         let artifact = try await payloadStore.commit(
             data: data,
             mimeType: "application/json",

@@ -121,6 +121,13 @@ struct WorkflowSummaryPage: View {
                 )
             } else {
                 List {
+                    if let error = store?.lastError {
+                        Section {
+                            Label(error, systemImage: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Theme.danger)
+                                .accessibilityIdentifier("workflow.error")
+                        }
+                    }
                     ForEach(workflows) { workflow in
                         Section {
                             workflowHeader(workflow)
@@ -152,17 +159,38 @@ struct WorkflowSummaryPage: View {
     }
 
     private func workflowHeader(_ workflow: WorkflowSummary) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(workflow.title)
-                .font(.headline)
-                .foregroundStyle(Theme.textPrimary)
-            Text("\(workflow.status.label) · "
-                 + "\(workflow.completedSubagentCount)/\(workflow.totalSubagentCount) subagents · "
-                 + Format.shortCount(
-                    workflow.aggregated.inputTokens + workflow.aggregated.outputTokens
-                 ) + " tokens · \(workflow.aggregated.toolInvocationCount) tool calls")
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
+        HStack(alignment: .center, spacing: Theme.Space.md) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(workflow.title)
+                    .font(.headline)
+                    .foregroundStyle(Theme.textPrimary)
+                Text("\(workflow.status.label) · "
+                     + "\(workflow.completedSubagentCount)/\(workflow.totalSubagentCount) subagents · "
+                     + Format.shortCount(
+                        workflow.aggregated.inputTokens + workflow.aggregated.outputTokens
+                     ) + " tokens · \(workflow.aggregated.toolInvocationCount) tool calls")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            Spacer(minLength: 0)
+            if workflow.status == .running
+                && store?.executingWorkflowIDs.contains(workflow.id) != true
+            {
+                Button {
+                    Task { await store?.resume(workflowID: workflow.id) }
+                } label: {
+                    if store?.resumingWorkflowIDs.contains(workflow.id) == true {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Label("Resume", systemImage: "play.fill")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(store?.resumeHandler == nil
+                    || store?.resumingWorkflowIDs.contains(workflow.id) == true)
+                .accessibilityIdentifier("workflow.resume")
+            }
         }
         .padding(.vertical, 2)
     }

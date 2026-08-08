@@ -307,8 +307,9 @@ struct AppFrozenInputBuilder: Sendable {
             // Tool schemas are charged to this budget during context compilation; with the default
             // 1_024 tokens only ~4-5 built-ins fit and silently drop user-selected tools from the
             // model's actual tools array. Online services have large contexts and receive rich
-            // schemas, so give them a generous schema budget; small local models keep the tight cap.
-            maximumToolSchemaTokens: online ? 16_384 : 1_024
+            // schemas, so give them a generous schema budget. Local runs receive a bounded 4K
+            // schema budget so a selected first-release built-in is not silently discarded.
+            maximumToolSchemaTokens: online ? 16_384 : 4_096
         )
         // Online reasoning is an explicit per-service setting: `.enabled` lets the service run its own
         // thinking phase (the provider then omits the reasoning field), `.disabled` asks the service
@@ -380,14 +381,13 @@ struct AppFrozenInputBuilder: Sendable {
         let policy = try snapshot.toolPolicy ?? ConversationToolPolicy(
             masterEnabled: snapshot.toolsEnabled,
             allowedToolIDs: toolCatalog.descriptors.map(\.id.logicalID),
-            pinnedToolIDs: toolCatalog.descriptors.map(\.id.logicalID),
+            pinnedToolIDs: [],
             selectionPolicyVersion: 1,
             materializedFromGlobalTemplate: false
         )
-        // Online services have large contexts and strong tool callers: advertise every enabled tool
-        // (protocol cap 64) so a user-selected tool is never silently truncated out of the prompt.
-        // Small local models keep the conservative 8-tool ceiling to protect their context window.
-        // (`online` is already bound above for the context budget.)
+        // Allowed tools are the conversation's user-selected authority ceiling, not a command to
+        // advertise all of them on every pass. Keep local prompts compact and let the deterministic
+        // selector rank relevance; online models get a wider, still-bounded relevant subset.
         return try FrozenAgentRunInputs(
             modelSelection: try selection(snapshot: snapshot),
             generationParameters: generationParameters,
@@ -405,8 +405,8 @@ struct AppFrozenInputBuilder: Sendable {
                 .networkRead, .localRead, .localWrite, .unknownExternal,
             ]),
             activeSkillToolHints: [],
-            explicitlyRequestedToolIDs: toolCatalog.descriptors.map(\.id.logicalID),
-            maximumAdvertisedTools: online ? 64 : 8,
+            explicitlyRequestedToolIDs: [],
+            maximumAdvertisedTools: online ? 16 : 8,
             contextPolicyVersion: 1,
             approvalPolicyVersion: 1
         )
@@ -414,7 +414,8 @@ struct AppFrozenInputBuilder: Sendable {
 
     func request(
         snapshot: AgentRunRequestSnapshot,
-        artifactReferences: [ArtifactReference]
+        artifactReferences: [ArtifactReference],
+        responseMessageID: UUID? = nil
     ) throws -> AgentRequest {
         let selection = try selection(snapshot: snapshot)
         let online = Self.isOnline(snapshot: snapshot)
@@ -535,7 +536,11 @@ struct AppFrozenInputBuilder: Sendable {
             capabilityCeiling: RunCapabilityCeiling(authority: ceilingAuthority),
             budget: budget,
             artifactReferences: artifactReferences,
-            provenance: AgentRequestProvenance(source: .user),
+            provenance: AgentRequestProvenance(
+                source: .user,
+                sourceMessageID: MessageID(rawValue: snapshot.userTurnID),
+                responseMessageID: responseMessageID.map(MessageID.init(rawValue:))
+            ),
             approvalMode: snapshot.approvalMode
         )
     }
@@ -964,6 +969,7 @@ struct AppAgentRunRequestBuilder: AgentRunRequestBuilding {
     func buildSubmission(
         conversationID: UUID,
         userTurnID: UUID,
+        assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
     ) async throws -> AgentRunSubmission {
@@ -977,7 +983,8 @@ struct AppAgentRunRequestBuilder: AgentRunRequestBuilding {
         )
         let request = try frozenBuilder.request(
             snapshot: snapshot,
-            artifactReferences: artifactReferences
+            artifactReferences: artifactReferences,
+            responseMessageID: assistantMessageID
         )
         let frozen = try frozenBuilder.frozenInputs(
             snapshot: snapshot,

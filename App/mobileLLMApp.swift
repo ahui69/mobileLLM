@@ -266,16 +266,6 @@ struct MobileLLMApp: App {
                 container.settings.openAIOnlineEnabled = true
             }
         }
-        // DEBUG-only convenience for simulator/device E2E: arm the workflow research toolset
-        // (web search + webpage reader) exactly like the user enabling them in Settings → Tools.
-        // Production builds never contain this block; a normal DEBUG launch without the flag keeps
-        // the default off state and exercises the workflow tool gate.
-        if ProcessInfo.processInfo.environment["MOBILELLM_DEBUG_ENABLE_WORKFLOW_TOOLS"] == "1" {
-            container.settings.toolsEnabled = true
-            container.settings.disabledBuiltInTools.subtract(
-                WorkflowToolPolicyGate.requiredToolIDs.map(\.rawValue)
-            )
-        }
         #endif
         // Attach the durable agent runtime (spec §6 / §20): SQLite journal, artifact store, local
         // model providers over the same routing engine, and the run store the UI projects. A failure
@@ -351,11 +341,14 @@ struct MobileLLMApp: App {
                     payloads: PayloadOutboxProvider(payloadStore: assembly.payloadStore),
                     store: container.conversationStore,
                     shouldProject: { item in
-                        guard item.kind == .finalAnswer, let runID = item.runID else { return true }
+                        guard let runID = item.runID else { return true }
                         guard let facts = try? await assembly.repository.loadRunFacts(for: runID) else {
                             return true
                         }
-                        return facts.submission?.request.payload.provenance.source != .workflow
+                        let source = facts.submission?.request.payload.provenance.source
+                        // Workflow roots and children project through their message-anchored summary;
+                        // their synthetic user messages and raw answers never belong in chat.
+                        return source != .workflow && source != .parentAgent
                     }
                 )
                 container.outboxProjector = projector
@@ -397,21 +390,11 @@ struct MobileLLMApp: App {
                         workflowID: workflowID
                     )
                 }
-                // Relaunch resume (spec §23 recovery / §33 gap 3): reconstruct and advance any
-                // workflow that was still running when the app quit. Children keep stable journal
-                // identities, so this only spawns missing work and re-collects completed children.
-                for workflowID in container.workflowStore.workflows.keys
-                    where container.workflowStore.summary(workflowID: workflowID)?.status == .running
-                {
-                    Task { @MainActor in
-                        do {
-                            try await launcher.resume(workflowID: workflowID)
-                        } catch {
-                            AgentRuntimeAssembly.logger(
-                                "workflow resume failed: \(error.localizedDescription)"
-                            )
-                        }
-                    }
+                // Neutral launch: interrupted workflows remain visible but never execute until the
+                // user presses Resume. The handler reconstructs the journaled root and stable child
+                // identities only after that explicit action.
+                container.workflowStore.resumeHandler = { [launcher] workflowID in
+                    try await launcher.resume(workflowID: workflowID)
                 }
             } else {
                 // Diagnose the exact assembly failure instead of silently falling back, so device
@@ -548,6 +531,7 @@ func makeAgentSnapshot(
     downloadBase: URL,
     onlineConfigBox: OpenAIOnlineConfigurationBox
 ) -> AgentRunRequestSnapshot? {
+    guard let conversation = container.chat.conversation(id: conversationID) else { return nil }
     // Keep the provider's config box in step with Settings before the snapshot freezes the selection.
     if let service = container.settings.onlineActiveService {
         onlineConfigBox.update(
@@ -597,7 +581,7 @@ func makeAgentSnapshot(
         userTurnID: userTurnID,
         text: text,
         imageRefs: imageRefs,
-        messages: container.chat.activeConversation?.messages ?? [],
+        messages: conversation.messages,
         systemPrompt: container.settings.systemPrompt,
         memoryFacts: container.chat.memoryBook?.facts ?? [],
         activeSkill: container.chat.activeSkill,
@@ -611,20 +595,20 @@ func makeAgentSnapshot(
         topP: container.chat.conversationTopP,
         topK: container.settings.topK,
         repetitionPenalty: container.settings.repetitionPenalty,
-        toolsEnabled: container.settings.toolsEnabled,
+        toolsEnabled: conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled,
         localToolNames: container.settings.builtInToolConfig.enabled.map(\.rawValue),
         memorySeamAvailable: container.chat.memoryBook != nil,
         eventSeamAvailable: container.toolEventStore != nil,
         locationSeamAvailable: container.toolLocationProvider != nil,
-        mcpToolDescriptors: container.settings.toolsEnabled
+        mcpToolDescriptors: (conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled)
             ? container.mcpDiscovery.descriptors(for: container.settings.mcpServers)
             : [],
-        webSearchDestinations: container.settings.toolsEnabled
+        webSearchDestinations: (conversation.toolPolicy?.masterEnabled ?? container.settings.toolsEnabled)
             ? (try? container.settings.builtInToolConfig.searchEngines.map {
                 try AppWebSearchToolAdapter.destination(engine: $0)
             }) ?? []
             : [],
-        toolPolicy: container.chat.activeConversation?.toolPolicy,
+        toolPolicy: conversation.toolPolicy,
         onlineModelEnabled: container.settings.openAIOnlineEnabled,
         onlineModelID: onlineModelID,
         onlineServiceID: container.chat.onlineServiceID,

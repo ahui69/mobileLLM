@@ -59,4 +59,50 @@ final class WorkflowStoreTests: XCTestCase {
         XCTAssertFalse(store.hasRunningWorkflow)
         XCTAssertEqual(store.messageRecord(workflowID: workflowID)?.status, .completed)
     }
+
+    func testLoadingRunningWorkflowNeverResumesUntilExplicitAction() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-resume-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let writer = WorkflowStore(directory: directory)
+        try await writer.save(WorkflowSummary(id: workflowID, title: "Interrupted", status: .running))
+
+        let reloaded = WorkflowStore(directory: directory)
+        var resumeCount = 0
+        reloaded.resumeHandler = { id in
+            XCTAssertEqual(id, workflowID)
+            resumeCount += 1
+        }
+        reloaded.load()
+
+        XCTAssertEqual(resumeCount, 0, "neutral launch must not restart durable work")
+        XCTAssertFalse(reloaded.executingWorkflowIDs.contains(workflowID))
+        await reloaded.resume(workflowID: workflowID)
+        XCTAssertEqual(resumeCount, 1)
+        XCTAssertTrue(reloaded.executingWorkflowIDs.contains(workflowID))
+        XCTAssertTrue(reloaded.resumingWorkflowIDs.isEmpty)
+    }
+
+    func testResumeFailureIsVisibleAndDoesNotChangeDurableRunningState() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-resume-error-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let writer = WorkflowStore(directory: directory)
+        try await writer.save(WorkflowSummary(id: workflowID, title: "Interrupted", status: .running))
+        let store = WorkflowStore(directory: directory)
+        store.load()
+        struct ResumeFailure: LocalizedError {
+            var errorDescription: String? { "fixture failed" }
+        }
+        store.resumeHandler = { _ in throw ResumeFailure() }
+
+        await store.resume(workflowID: workflowID)
+
+        XCTAssertEqual(store.summary(workflowID: workflowID)?.status, .running)
+        XCTAssertEqual(store.lastError, "Workflow could not resume: fixture failed")
+        XCTAssertFalse(store.executingWorkflowIDs.contains(workflowID))
+        XCTAssertTrue(store.resumingWorkflowIDs.isEmpty)
+    }
 }

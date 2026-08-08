@@ -401,6 +401,9 @@ public struct AgentRequestProvenance: Hashable, Codable, Sendable {
     public let source: Source
     /// Accepted user message that originated the request, when applicable.
     public let sourceMessageID: MessageID?
+    /// Existing assistant placeholder that owns the eventual committed answer, when the caller
+    /// already created one. This lets the durable outbox reconcile the optimistic chat projection.
+    public let responseMessageID: MessageID?
     /// Optional parent request identity.
     public let parentRequestID: AgentRequestID?
     /// Stable evidence references required by a future verifier.
@@ -410,11 +413,13 @@ public struct AgentRequestProvenance: Hashable, Codable, Sendable {
     public init(
         source: Source,
         sourceMessageID: MessageID? = nil,
+        responseMessageID: MessageID? = nil,
         parentRequestID: AgentRequestID? = nil,
         evidenceDigests: some Sequence<StableDigest> = []
     ) {
         self.source = source
         self.sourceMessageID = sourceMessageID
+        self.responseMessageID = responseMessageID
         self.parentRequestID = parentRequestID
         self.evidenceDigests = Array(Set(evidenceDigests)).sorted { $0.rawValue < $1.rawValue }
     }
@@ -426,6 +431,7 @@ public struct AgentRequestProvenance: Hashable, Codable, Sendable {
         self.init(
             source: try container.decode(Source.self, forKey: .source),
             sourceMessageID: try container.decodeIfPresent(MessageID.self, forKey: .sourceMessageID),
+            responseMessageID: try container.decodeIfPresent(MessageID.self, forKey: .responseMessageID),
             parentRequestID: try container.decodeIfPresent(AgentRequestID.self, forKey: .parentRequestID),
             evidenceDigests: evidence
         )
@@ -437,7 +443,7 @@ public struct AgentRequestProvenance: Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case source, sourceMessageID, parentRequestID, evidenceDigests
+        case source, sourceMessageID, responseMessageID, parentRequestID, evidenceDigests
     }
 }
 

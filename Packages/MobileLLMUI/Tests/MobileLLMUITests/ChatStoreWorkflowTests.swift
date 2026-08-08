@@ -14,6 +14,7 @@ final class ChatStoreWorkflowTests: XCTestCase {
         let workflowDirectory = dir.appendingPathComponent("workflows", isDirectory: true)
         let workflowStore = WorkflowStore(directory: workflowDirectory)
         let settings = AppSettings(defaults: UserDefaults(suiteName: "workflow-\(UUID().uuidString)")!)
+        XCTAssertFalse(settings.toolsEnabled, "a workflow without external work must not require tools")
         let chat = ChatStore(
             engine: MockLLMEngine(script: .init(answer: "unused")),
             store: store,

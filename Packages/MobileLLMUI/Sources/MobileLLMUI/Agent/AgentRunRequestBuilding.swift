@@ -24,6 +24,7 @@ public protocol AgentRunRequestBuilding: Sendable {
     func buildSubmission(
         conversationID: UUID,
         userTurnID: UUID,
+        assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
     ) async throws -> AgentRunSubmission

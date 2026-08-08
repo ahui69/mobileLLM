@@ -63,20 +63,10 @@ final class WorkflowLauncher {
                 + "fallback=\(fallback)"
             )
         }
-        // Tool-selection gate (spec §2/§14/§33): the workflow only inherits what the conversation
-        // already allows. Missing research tools are an explicit user-input/enable state, never
-        // force-enabled here; approval mode does not substitute for tool selection.
-        let missingTools = WorkflowToolPolicyGate.missingTools(
-            policy: snapshot.toolPolicy,
-            catalogToolNames: snapshot.localToolNames,
-            toolsEnabled: snapshot.toolsEnabled
-        )
-        guard missingTools.isEmpty else {
-            throw WorkflowToolPolicyGateError.toolsRequired(missingTools)
-        }
-        // Root and children carry the conversation's exact tool policy; SubagentSpawner further
-        // attenuates every child's ceiling. Registering the template lets the input freezer rebuild
-        // every child anchored to this message from the same inherited snapshot.
+        // Root and children carry the conversation's exact tool policy; a workflow never widens it
+        // and does not require web access for unrelated goals. SubagentSpawner further attenuates
+        // every child's ceiling. Registering the template lets the input freezer rebuild every child
+        // anchored to this message from the same inherited snapshot.
         let workflowSnapshot = snapshot
         AppWorkflowSnapshotRegistry.shared.register(
             conversationID: conversationID,
@@ -183,19 +173,6 @@ final class WorkflowLauncher {
                 "activeModel=\(container.chat.activeModel != nil) "
                     + "online=\(container.chat.onlineModelID ?? "nil")"
             )
-        }
-        let missingTools = WorkflowToolPolicyGate.missingTools(
-            policy: snapshot.toolPolicy,
-            catalogToolNames: snapshot.localToolNames,
-            toolsEnabled: snapshot.toolsEnabled
-        )
-        guard missingTools.isEmpty else {
-            // The user disabled a required tool while the workflow was suspended: keep the workflow
-            // running and resumable instead of force-enabling anything (spec §2/§14).
-            AgentRuntimeAssembly.logger(
-                "workflow resume deferred: missing tools \(missingTools.map(\.rawValue).joined(separator: ","))"
-            )
-            return
         }
         AppWorkflowSnapshotRegistry.shared.register(
             conversationID: conversationID,

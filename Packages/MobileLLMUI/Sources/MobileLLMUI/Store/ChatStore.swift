@@ -36,31 +36,6 @@ private struct AttachmentSendRollback: Sendable {
     }
 }
 
-/// Pending workflow-launch gate (spec §33 gap 1). The launcher refused because the conversation has
-/// not explicitly enabled a required research tool; the dialog is the user-input/enable state.
-/// Approval mode never substitutes for tool selection.
-public struct WorkflowToolGateState: Equatable {
-    public let goal: String
-    public let conversationID: UUID
-    public let userMessageID: UUID
-    public let workflowID: UUID
-    public let missingTools: [ToolID]
-
-    public init(
-        goal: String,
-        conversationID: UUID,
-        userMessageID: UUID,
-        workflowID: UUID,
-        missingTools: [ToolID]
-    ) {
-        self.goal = goal
-        self.conversationID = conversationID
-        self.userMessageID = userMessageID
-        self.workflowID = workflowID
-        self.missingTools = missingTools
-    }
-}
-
 /// The @MainActor UI state owner (DESIGN §2.3). Holds the conversation mirror + the live streaming
 /// state, talks to the `LLMEngine` actor over an `AsyncThrowingStream`, and autosaves through
 /// `ConversationStore`. Only the small streaming strings mutate per token, so the message list never
@@ -134,9 +109,6 @@ public final class ChatStore {
     public private(set) var agentLastSendError: String?
     /// Durable workflow summaries (spec §23); nil keeps legacy behavior in tests/previews.
     public let workflowStore: WorkflowStore?
-    /// Non-nil while a `/workflow` launch is waiting for the user to explicitly enable required
-    /// research tools (spec §33 gap 1). Setting it is a tool-selection decision, not an approval.
-    public private(set) var workflowToolGate: WorkflowToolGateState?
     /// App-assembled workflow launcher: (goal, conversationID, userMessageID, workflowID). The app
     /// creates the reserved parent run, persists the running message record, and drives the
     /// orchestrator to completion.
@@ -362,6 +334,12 @@ public final class ChatStore {
     public var activeConversation: Conversation? {
         guard let activeID else { return nil }
         return conversations.first { $0.id == activeID }
+    }
+
+    /// Exact persisted conversation lookup for app-assembly snapshots and recovery. Runtime work is
+    /// bound to its recorded conversation id, never whichever thread happens to be visible.
+    public func conversation(id: UUID) -> Conversation? {
+        conversations.first { $0.id == id }
     }
 
     /// The online service model when the user selected it AND a model id is configured. The API key is
@@ -650,7 +628,9 @@ public final class ChatStore {
         return try? ConversationToolPolicy(
             masterEnabled: settings.toolsEnabled,
             allowedToolIDs: deduped,
-            pinnedToolIDs: deduped,
+            // A visible switch grants availability. Pinning is a separate selector override and the
+            // current UI has no pin control, so selected tools must remain eligible for smart ranking.
+            pinnedToolIDs: [],
             selectionPolicyVersion: 1,
             materializedFromGlobalTemplate: materializedFromGlobalTemplate
         )
@@ -1182,11 +1162,11 @@ public final class ChatStore {
 
     /// Starts a message-anchored workflow. The app-assembled launcher creates the reserved parent
     /// run, persists the initial running record, and drives the orchestrator; the store's change
-    /// callback keeps the message row live until completion. If the launcher reports a missing
-    /// required research tool, the send pauses in `workflowToolGate` for the user to explicitly
-    /// enable it (spec §33 gap 1).
+    /// callback keeps the message row live until completion. The workflow inherits the exact
+    /// per-conversation tool selection; it can complete without web tools when the goal does not
+    /// need them and can never widen the user's selection.
     private func startWorkflow(goal: String) {
-        guard let workflowLaunch,
+        guard workflowLaunch != nil,
               let convo = activeConversation ?? newConversation(),
               let idx = conversations.firstIndex(where: { $0.id == convo.id })
         else { return }
@@ -1217,14 +1197,6 @@ public final class ChatStore {
         guard let workflowLaunch else { return }
         do {
             try await workflowLaunch(goal, conversationID, userMessageID, workflowID)
-        } catch WorkflowToolPolicyGateError.toolsRequired(let missingTools) {
-            workflowToolGate = WorkflowToolGateState(
-                goal: goal,
-                conversationID: conversationID,
-                userMessageID: userMessageID,
-                workflowID: workflowID,
-                missingTools: missingTools
-            )
         } catch {
             showToast(Toast(
                 "Workflow couldn't start: \(error.localizedDescription)",
@@ -1232,57 +1204,6 @@ public final class ChatStore {
                 autoDismiss: 5
             ))
         }
-    }
-
-    /// User chose "Enable & Start": an explicit tool-selection decision, never an approval-mode
-    /// shortcut. The required tools join the global selection and THIS conversation's materialized
-    /// policy, then the same workflow relaunches with the same stable ids.
-    public func confirmWorkflowToolGate() {
-        guard let gate = workflowToolGate else { return }
-        workflowToolGate = nil
-        settings.toolsEnabled = true
-        var disabled = settings.disabledBuiltInTools
-        disabled.subtract(gate.missingTools.map(\.rawValue))
-        settings.disabledBuiltInTools = disabled
-        applyToolSelection(to: gate.conversationID)
-        Task { @MainActor in
-            await performWorkflowLaunch(
-                goal: gate.goal,
-                conversationID: gate.conversationID,
-                userMessageID: gate.userMessageID,
-                workflowID: gate.workflowID
-            )
-        }
-    }
-
-    /// User declined the workflow tools gate: roll back the initiating message (nothing ran) unless
-    /// the user already moved past it, and leave the conversation's tool selection untouched.
-    public func cancelWorkflowToolGate() {
-        guard let gate = workflowToolGate else { return }
-        workflowToolGate = nil
-        if let ci = conversations.firstIndex(where: { $0.id == gate.conversationID }),
-           let mi = conversations[ci].messages.firstIndex(where: { $0.id == gate.userMessageID }),
-           mi == conversations[ci].messages.count - 1
-        {
-            conversations[ci].messages.remove(at: mi)
-            conversations[ci].updatedAt = Date()
-            persist(conversations[ci])
-        }
-        showToast(Toast(
-            "Workflow cancelled — enable the missing tools in Settings → Tools and try again.",
-            kind: .warning,
-            autoDismiss: 5
-        ))
-    }
-
-    /// Explicit per-conversation policy edit for a specific conversation (the gate's conversation,
-    /// not necessarily the currently active one).
-    private func applyToolSelection(to conversationID: UUID) {
-        guard let idx = conversations.firstIndex(where: { $0.id == conversationID }),
-              let policy = currentToolPolicy(materializedFromGlobalTemplate: false)
-        else { return }
-        conversations[idx].toolPolicy = policy
-        persist(conversations[idx])
     }
 
     /// Attaches the workflow's running record to its initiating message (called by the app launcher).

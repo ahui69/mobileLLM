@@ -113,10 +113,11 @@ models; at most one is active.
   each phase's acceptance criteria and every child's task/status. This is not the future Dynamic Workflows
   language/graph system: there is no branching DAG, saved definition, or parallel child scheduler.
 
-Both workflow integration gaps are closed (2026-08-07): workflows inherit only the conversation's allowed tools
-behind a preflight gate (`WorkflowToolPolicyGate`) that pauses for explicit user enablement, and
-`WorkflowLauncher.resume` reconstructs unfinished workflows at bootstrap from the durable summary/plan plus the
-journaled root request, advancing remaining phases with idempotent child re-collection (`WorkflowOrchestrator.resume`).
+Both workflow integration gaps are closed (2026-08-08): workflows inherit the initiating conversation's exact tool
+policy without force-enabling tools or imposing a web requirement, and child ceilings remain strictly attenuated.
+Interrupted workflows stay visible after relaunch but remain inert until the user presses **Resume**; only then does
+`WorkflowLauncher.resume` reconstruct the workflow from its durable summary/plan and journaled root request and
+advance remaining phases with idempotent child re-collection (`WorkflowOrchestrator.resume`).
 
 ## iOS lifecycle and continued processing
 

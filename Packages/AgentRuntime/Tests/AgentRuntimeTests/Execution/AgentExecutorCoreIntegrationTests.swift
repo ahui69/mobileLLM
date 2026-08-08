@@ -7,7 +7,52 @@ import XCTest
 
 // TEST-ID: AHT-RUN-002
 // TEST-ID: AHT-CHAT-001
+// TEST-ID: AHT-OUTBOX-001
 final class AgentExecutorCoreIntegrationTests: XCTestCase {
+    func testCallerOwnedMessageIdentitiesFlowThroughBothJournalOutboxRows() async throws {
+        let model = try ExecutorTestModelDefinition(offset: 91)
+        let userMessageID = MessageID(rawValue: ExecutorTestID.uuid(91_001))
+        let assistantMessageID = MessageID(rawValue: ExecutorTestID.uuid(91_002))
+        let harness = try ExecutorTestHarness(
+            offset: 91,
+            provider: try FixedCompletionModelProvider(model: model, answer: "Bound answer"),
+            model: model,
+            provenance: AgentRequestProvenance(
+                source: .user,
+                sourceMessageID: userMessageID,
+                responseMessageID: assistantMessageID
+            )
+        )
+
+        let handleID = try await harness.executor.submit(
+            harness.request,
+            commandID: ExecutorTestID.command(91)
+        )
+        let handle = try await harness.executor.attach(to: handleID)
+        _ = try await collectTerminalEvents(from: handle)
+
+        let database = try SQLiteConnection(url: harness.databaseURL, create: false, readOnly: true)
+        let storedUserID = try XCTUnwrap(database.scalarText(
+            "SELECT message_id FROM messages WHERE run_id = ? AND role = 'user'",
+            [.text(harness.request.runID.description)]
+        ))
+        let storedAssistantID = try XCTUnwrap(database.scalarText(
+            "SELECT message_id FROM messages WHERE run_id = ? AND role = 'assistant'",
+            [.text(harness.request.runID.description)]
+        ))
+        XCTAssertEqual(storedUserID, userMessageID.description)
+        XCTAssertEqual(storedAssistantID, assistantMessageID.description)
+
+        let pendingOutbox = try database.rows(
+            "SELECT kind, message_id FROM projection_outbox WHERE run_id = ? ORDER BY kind",
+            [.text(harness.request.runID.description)]
+        )
+        XCTAssertEqual(pendingOutbox.count, 2)
+        XCTAssertEqual(Set(pendingOutbox.compactMap { $0.dropFirst().first?.text }), [
+            userMessageID.description, assistantMessageID.description,
+        ])
+    }
+
     func testCompletedExecutionReattachesAfterRepositoryReopenWithoutRestartingWork() async throws {
         let model = try ExecutorTestModelDefinition(offset: 0)
         let counter = ScriptedInvocationCounter()

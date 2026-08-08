@@ -108,7 +108,8 @@ final class ChatStoreTests: XCTestCase {
         }.sorted()
         XCTAssertEqual(fresh.toolPolicy?.allowedToolIDs, expected,
                        "the materialized policy mirrors the user's current tool selection")
-        XCTAssertEqual(fresh.toolPolicy?.pinnedToolIDs, expected)
+        XCTAssertEqual(fresh.toolPolicy?.pinnedToolIDs, [],
+                       "selected tools are allowed, while relevance selection stays automatic")
         XCTAssertEqual(fresh.toolPolicy?.masterEnabled, settings.toolsEnabled)
         XCTAssertTrue(fresh.toolPolicy?.materializedFromGlobalTemplate == true)
     }
@@ -135,7 +136,8 @@ final class ChatStoreTests: XCTestCase {
         let updated = try XCTUnwrap(chat.activeConversation?.toolPolicy)
         XCTAssertTrue(updated.allowedToolIDs.contains { $0.name == "web_search" },
                       "the explicit menu edit must update the active conversation's policy")
-        XCTAssertTrue(updated.pinnedToolIDs.contains { $0.name == "web_search" })
+        XCTAssertTrue(updated.pinnedToolIDs.isEmpty,
+                      "a visible tool switch grants access but must not force every prompt to advertise it")
         XCTAssertFalse(updated.materializedFromGlobalTemplate,
                        "a menu edit is an explicit per-conversation policy, not the global template")
     }
@@ -524,6 +526,7 @@ private struct UnavailableAgentRunRequestBuilder: AgentRunRequestBuilding {
     func buildSubmission(
         conversationID: UUID,
         userTurnID: UUID,
+        assistantMessageID: UUID,
         text: String,
         imageRefs: [ImageRef]
     ) async throws -> AgentRunSubmission {

@@ -566,6 +566,14 @@
         {
           "kind": "xctest",
           "value": "AgentRuntimeTests.SQLiteRunJournalTests/testOutboxLeaseCrashRetryAndDeliveryAreIdempotent"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.AgentExecutorCoreIntegrationTests/testCallerOwnedMessageIdentitiesFlowThroughBothJournalOutboxRows"
+        },
+        {
+          "kind": "xctest",
+          "value": "mobileLLMUnitTests.ToolV2AdapterTests/testAppRequestBindsExistingChatMessageIdentitiesForOutboxReconciliation"
         }
       ],
       "platforms": [
@@ -1427,6 +1435,10 @@
         {
           "kind": "xctest",
           "value": "MobileLLMUITests.AppContainerBootstrapTests/testNothingInstalledSelectsNothing"
+        },
+        {
+          "kind": "xctest",
+          "value": "mobileLLMUITests.SimulatorCISmokeUITests/testNeutralLaunchAndPrimaryNavigationAreInteractive"
         }
       ],
       "platforms": [
@@ -1798,6 +1810,14 @@
         {
           "kind": "xctest",
           "value": "MobileLLMUITests.WorkflowStoreTests/testSaveLoadRoundTripAndRunningFlag"
+        },
+        {
+          "kind": "xctest",
+          "value": "MobileLLMUITests.WorkflowStoreTests/testLoadingRunningWorkflowNeverResumesUntilExplicitAction"
+        },
+        {
+          "kind": "xctest",
+          "value": "MobileLLMUITests.WorkflowStoreTests/testResumeFailureIsVisibleAndDoesNotChangeDurableRunningState"
         },
         {
           "kind": "xctest",

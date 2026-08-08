@@ -4,16 +4,119 @@
 @_spi(AgentRuntime) @testable import AgentRuntime
 @testable import mobileLLM
 @testable import LLMCore
+@testable import MobileLLMUI
 import AppRuntime
 import Foundation
 import XCTest
 
 // TEST-ID: AHT-TOOL-005
+// TEST-ID: AHT-OUTBOX-001
 final class ToolV2AdapterTests: XCTestCase {
     private let attestor = try! LocalSanitizationAttestor(
         key: Data(repeating: 0x3d, count: 32),
         policyRevision: 1
     )
+
+    @MainActor
+    func testAppRequestBindsExistingChatMessageIdentitiesForOutboxReconciliation() throws {
+        let userMessageID = UUID()
+        let assistantMessageID = UUID()
+        let snapshot = makeSnapshot(userMessageID: userMessageID)
+        let builder = AppFrozenInputBuilder(capabilityVersion: SemanticVersion("1.0.0")!)
+
+        let request = try builder.request(
+            snapshot: snapshot,
+            artifactReferences: [],
+            responseMessageID: assistantMessageID
+        )
+
+        XCTAssertEqual(request.provenance.sourceMessageID?.rawValue, userMessageID)
+        XCTAssertEqual(request.provenance.responseMessageID?.rawValue, assistantMessageID)
+    }
+
+    @MainActor
+    func testLocalFrozenInputAdvertisesOnlyTheRelevantBoundedToolSubset() throws {
+        let snapshot = makeSnapshot(userMessageID: UUID())
+        let builder = AppFrozenInputBuilder(capabilityVersion: SemanticVersion("1.0.0")!)
+
+        let frozen = try builder.frozenInputs(snapshot: snapshot, artifactReferences: [])
+        let selected = try frozen.selectedTools(latestUserRequest: snapshot.text)
+        let compiled = try ContextCompiler().compile(
+            FrozenContextSnapshot(
+                runID: AgentRunID(rawValue: UUID()),
+                requestID: AgentRequestID(rawValue: UUID()),
+                stepID: AgentStepID(rawValue: UUID()),
+                baseSystem: frozen.baseSystem,
+                skills: frozen.skills,
+                memories: frozen.memories,
+                conversation: frozen.conversation,
+                currentUser: frozen.currentUser,
+                advertisedTools: selected.descriptors,
+                selectorID: selected.snapshot.selectorID,
+                selectorPolicyVersion: selected.snapshot.policyVersion,
+                contextPolicyVersion: frozen.contextPolicyVersion,
+                approvalPolicyVersion: frozen.approvalPolicyVersion
+            ),
+            budget: frozen.contextBudget
+        )
+
+        XCTAssertEqual(frozen.maximumAdvertisedTools, 8)
+        XCTAssertEqual(frozen.contextBudget.maximumToolSchemaTokens, 4_096)
+        XCTAssertGreaterThan(frozen.toolCatalog.descriptors.count, 8)
+        XCTAssertLessThan(selected.descriptors.count, frozen.toolCatalog.descriptors.count)
+        XCTAssertLessThanOrEqual(selected.descriptors.count, 8)
+        XCTAssertFalse(selected.descriptors.contains { $0.id.logicalID.name == "web_search" })
+        XCTAssertEqual(compiled.advertisedTools.count, selected.descriptors.count)
+
+        let explicitSearch = try frozen.selectedTools(
+            latestUserRequest: "Search the web for the current Swift release notes."
+        )
+        XCTAssertTrue(explicitSearch.descriptors.contains { $0.id.logicalID.name == "web_search" })
+        XCTAssertLessThanOrEqual(explicitSearch.descriptors.count, 8)
+    }
+
+    @MainActor
+    private func makeSnapshot(userMessageID: UUID) -> AgentRunRequestSnapshot {
+        let model = LLMCatalog.bonsai8b
+        let variant = model.defaultVariantValue
+        return AgentRunRequestSnapshot(
+            conversationID: UUID(),
+            userTurnID: userMessageID,
+            text: "What's this?",
+            imageRefs: [],
+            messages: [Message(id: userMessageID, role: .user, answer: "What's this?")],
+            systemPrompt: "You are helpful.",
+            memoryFacts: [],
+            activeSkill: nil,
+            model: model,
+            variant: variant,
+            weightsDirectory: FileManager.default.temporaryDirectory,
+            thinkingEnabled: false,
+            contextLength: 8_192,
+            maxTokens: 512,
+            temperature: 0.2,
+            topP: 0.9,
+            topK: 40,
+            repetitionPenalty: 1.0,
+            toolsEnabled: true,
+            localToolNames: AppLocalToolIDs.names,
+            memorySeamAvailable: true,
+            eventSeamAvailable: true,
+            locationSeamAvailable: true,
+            mcpToolDescriptors: [],
+            webSearchDestinations: [],
+            toolPolicy: nil,
+            onlineModelEnabled: false,
+            onlineModelID: nil,
+            onlineServiceID: nil,
+            onlineReasoningEnabled: false,
+            onlineContextLength: 128_000,
+            onlineOutputBudgetAuto: true,
+            onlineMaximumOutputTokens: nil,
+            approvalMode: .safePreset,
+            onlineReasoningEffort: nil
+        )
+    }
 
     // MARK: - Web search
 

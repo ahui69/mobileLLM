@@ -59,6 +59,7 @@ final class FullSurfaceContractTests: XCTestCase {
         let provenance = AgentRequestProvenance(
             source: .user,
             sourceMessageID: TestValues.id(MessageIDDomain.self, 510),
+            responseMessageID: TestValues.id(MessageIDDomain.self, 509),
             evidenceDigests: [TestValues.digest("c"), TestValues.digest("b")]
         )
         try assertContractRoundTrip(provenance)
