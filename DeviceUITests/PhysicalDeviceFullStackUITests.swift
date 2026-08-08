@@ -428,11 +428,24 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
     func test24ChangingWebSelectionDuringColdLoadDoesNotAffectCurrentTurn() throws {
         let app = try launchApp()
         try configureTools(master: true, enabled: [], in: app)
+        // Gemma 4 E2B has no reasoning capability; the global thinking default (restored to ON by the
+        // cleanup case) would make the cold run fail with missingCapabilities(reasoning). This scenario
+        // races tool policy, not thinking, so the thread must start with thinking off.
+        try setThinkingDefault(false, in: app)
         try openNewChat(in: app)
         try activate(.gemma, in: app)
         try goToChatList(in: app)     // suspends the model
         try relaunch(app)             // restores Gemma identity only, resident=false
-        try openNewChat(in: app)
+        // Reopen the SAME empty thread instead of New Chat: once an online service is configured,
+        // `newConversation()` re-seeds an empty thread to the online default, which would silently
+        // change the cold Gemma turn this scenario is racing. Tapping the persisted thread preserves
+        // its Gemma identity and resident=false cold state.
+        try reopenConversation(titled: "New Chat", in: app)
+        // DEBUG launches re-arm the embedded online service, and `currentGenerationModel()` prefers it,
+        // which would re-stamp this turn as Online at send time. Disarm it through Settings (no weight
+        // load) so the cold Gemma turn really runs on Gemma.
+        try disableOnlineService(in: app)
+        try reopenConversation(titled: "New Chat", in: app)
         XCTAssertTrue(waitForRuntime("model=gemma-4-e2b", in: app, timeout: 20))
         XCTAssertTrue(waitForRuntime("resident=false", in: app, timeout: 20))
 
@@ -1450,6 +1463,320 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
                       "\(model.displayName) background lifecycle had \(failures.count) independent "
                           + "failure(s):\n- " + failures.joined(separator: "\n- "))
     }
+    // TEST-ID: AHT-TOOLS-005-DEVICE
+    /// Matrix test29: every Tool V2 adapter that crosses a real system/network boundary executes on
+    /// the physical device. The online model drives the calls so adapter coverage is never coupled to
+    /// local-model tool-calling quality; TCC prompts are granted by the shared system-alert firewall.
+    @MainActor
+    func test29ToolV2AdaptersOnDevice() throws {
+        let app = try launchApp()
+        try goToSettings(in: app)
+        let choose = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Choose tools")
+        ).firstMatch
+        guard scrollToHittable(choose, in: app.scrollViews.firstMatch) else {
+            throw DeviceE2EHarnessError.precondition("Choose tools row is unreachable")
+        }
+        choose.tap()
+        guard app.navigationBars["Tools"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Tools settings did not open")
+        }
+        let scroll = firstHittableScrollView(in: app)
+        for title in ["Web search", "Webpage reader", "Wikipedia", "Calculator", "Clock", "Memory",
+                      "Calendar", "Reminders", "Location"] {
+            let toggle = switchStarting(with: title, in: app)
+            guard scrollToHittable(toggle, in: scroll) else {
+                attachDiagnostics(app, name: "tool-toggle-missing-\(title)")
+                throw DeviceE2EHarnessError.precondition("Tool toggle is unreachable: \(title)")
+            }
+            try setSwitch(toggle, on: true)
+        }
+        let masterToggle = switchStarting(with: "Allow selected tools", in: app)
+        guard scrollToHittable(masterToggle, in: scroll, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Tool master switch is unreachable")
+        }
+        try setSwitch(masterToggle, on: true)
+        app.navigationBars["Tools"].buttons["Done"].tap()
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Tools settings did not close")
+        }
+        try goToChatList(in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let marker = uniqueMarker("TOOLV2")
+        let prompt = marker
+            + "\nCall each of these tools exactly once, in this order: "
+            + "1) wikipedia with query \"Machine learning\"; "
+            + "2) fetch_webpage with url \"https://example.com\"; "
+            + "3) list_calendar_events with daysAhead 7; "
+            + "4) create_reminder with title \"E2E \(marker) reminder\" and no due time; "
+            + "5) current_location with no arguments. "
+            + "After the calls, answer with one short line per result."
+        var evidence = try send(prompt, model: .bonsai, in: app, timeout: 600, assertEvidence: false)
+        let expectedTools = ["wikipedia", "fetch_webpage", "list_calendar_events",
+                             "create_reminder", "current_location"]
+        func missingTools(from activities: [String]) -> [String] {
+            expectedTools.filter { tool in
+                !activities.contains { $0.localizedCaseInsensitiveContains(tool) }
+            }
+        }
+        var missing = missingTools(from: evidence.toolActivities)
+        if !missing.isEmpty {
+            evidence = try send(
+                "\(uniqueMarker("TOOLV2_RETRY"))\nYou must call the still-missing tools "
+                    + "\(missing.joined(separator: ", ")) now, then reply briefly.",
+                model: .bonsai, in: app, timeout: 600, assertEvidence: false)
+            missing = missingTools(from: evidence.toolActivities)
+        }
+
+        let summary = XCTAttachment(string: """
+        marker=\(marker)
+        tool_activities=\(evidence.toolActivities.joined(separator: " | "))
+        missing=\(missing.isEmpty ? "none" : missing.joined(separator: ", "))
+        answer=\(evidence.answer)
+        diagnostics=\(diagnosticValue("device-e2e.agent", in: app))
+        """)
+        summary.name = "tool-v2-adapters-device"
+        summary.lifetime = .keepAlways
+        add(summary)
+        XCTAssertTrue(
+            missing.isEmpty,
+            "Tool V2 adapters missing on device: \(missing.joined(separator: ", "))"
+        )
+    }
+
+    // TEST-ID: AH-IOS-003-DEVICE
+    /// Matrix test30: iOS 26 continued processing submits/rejects on the real phone through the
+    /// production BGTaskScheduler seam. Expiration/cancellation are covered deterministically by the
+    /// coordinator unit matrix; this scenario proves the device path: the setting, the run-start
+    /// submission, and a clean foreground outcome (resumable pause when the system rejects).
+    @MainActor
+    func test30ContinuedProcessingOnDevice() throws {
+        let app = try launchApp()
+        try goToSettings(in: app)
+        let toggle = switchStarting(with: "Continue work in background", in: app)
+        guard scrollToHittable(toggle, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Continued-processing toggle is unreachable")
+        }
+        try setSwitch(toggle, on: true)
+        try goToChatList(in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        guard field.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Composer missing before continued-processing send")
+        }
+        field.tap()
+        field.typeText("Write a 200-word essay about background processing on iOS, then stop.")
+        let send = app.buttons["Send"]
+        guard waitForEnabled(send, timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Send did not enable")
+        }
+        send.tap()
+
+        // Submission happens at run start. A rejection quiesces the run to a resumable foreground
+        // wait; acceptance keeps it streaming. Either outcome must never fail the run.
+        let submissionDeadline = Date().addingTimeInterval(120)
+        var sawPause = false
+        var sawTerminal = false
+        while Date() < submissionDeadline {
+            let agent = diagnosticValue("device-e2e.agent", in: app)
+            if agent.contains("run=paused") || agent.contains("run=waitingForForeground") {
+                sawPause = true
+                break
+            }
+            if agent.contains("run=completed") || agent.contains("run=failed")
+                || agent.contains("run=cancelled")
+            {
+                sawTerminal = true
+                break
+            }
+            if app.buttons.matching(identifier: "Copy answer").count > 0 {
+                sawTerminal = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+
+        // Read the coordinator's status surface before navigating away.
+        try goToSettings(in: app)
+        let status = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Not started")
+        ).firstMatch
+        let waiting = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Waiting for the system")
+        ).firstMatch
+        let running = app.staticTexts.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "A run is continuing")
+        ).firstMatch
+        let statusText = [status, waiting, running]
+            .compactMap { $0.exists ? $0.label : nil }
+            .first
+        let agent = diagnosticValue("device-e2e.agent", in: app)
+
+        // Restore the fresh-install default before leaving so later serial tests never inherit the
+        // background-continuation path.
+        try setSwitch(toggle, on: false)
+
+        if let statusText,
+           statusText.hasPrefix("Not started"),
+           statusText.localizedCaseInsensitiveContains("not permitted")
+        {
+            throw XCTSkip(
+                "iOS 26 continued processing needs the Background Processing capability on the App ID "
+                    + "(com.apple.developer.background-tasks.continued-processing); the current device "
+                    + "profile lacks it. Coordinator reported: \(statusText)"
+            )
+        }
+
+        let summary = XCTAttachment(string: """
+        saw_pause=\(sawPause)
+        saw_terminal=\(sawTerminal)
+        status=\(statusText ?? "<none>")
+        diagnostics=\(agent)
+        """)
+        summary.name = "continued-processing-device"
+        summary.lifetime = .keepAlways
+        add(summary)
+        XCTAssertTrue(
+            sawPause || sawTerminal || statusText != nil,
+            "continued-processing scenario produced no observable outcome; diagnostics: \(agent)"
+        )
+    }
+
+    // TEST-ID: AHT-WORKFLOW-002-DEVICE
+    /// Matrix test31: the full message-anchored workflow (auto-plan → research children → staged
+    /// phases → audit/revise/verify → delivered plan) runs to completion on the physical device with
+    /// the online model, then projects the final plan into the chat and opens its summary page.
+    @MainActor
+    func test31WorkflowCompletesOnDevice() throws {
+        let app = try launchApp()
+        try configureTools(master: true, enabled: ["Web search", "Webpage reader", "Wikipedia"], in: app)
+        try openNewChat(in: app)
+        try selectOnlineModel(in: app)
+
+        let field = app.textFields["composer.field"]
+        guard field.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Composer missing before workflow send")
+        }
+        field.tap()
+        field.typeText("/workflow research how sleep affects memory and produce a short three-section action plan")
+        let send = app.buttons["Send"]
+        guard waitForEnabled(send, timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Send did not enable for /workflow")
+        }
+        send.tap()
+
+        let composerDeadline = Date().addingTimeInterval(8)
+        while Date() < composerDeadline {
+            if !((field.value as? String) ?? "").contains("/workflow") { break }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTAssertFalse(
+            ((field.value as? String) ?? "").contains("/workflow"),
+            "the composer must clear after a /workflow send"
+        )
+
+        let row = app.descendants(matching: .any).matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Workflow:")
+        ).firstMatch
+        guard row.waitForExistence(timeout: 45) else {
+            attachDiagnostics(app, name: "workflow-row-missing")
+            throw DeviceE2EHarnessError.precondition("The message-anchored workflow record did not appear")
+        }
+
+        var lastValue = readWorkflowValue(row) ?? ""
+        var sawMultiPhase = false
+        var sawLiveStats = false
+        var sawCompleted = false
+        let deadline = Date().addingTimeInterval(3_300)
+        while Date() < deadline {
+            approvePendingAgentApprovalIfNeeded(in: app)
+            lastValue = readWorkflowValue(row) ?? lastValue
+            if lastValue.contains("Completed") {
+                sawCompleted = true
+                break
+            }
+            if lastValue.contains("Failed") || lastValue.contains("Cancelled") { break }
+            if lastValue.contains("phase 3/") || lastValue.contains("phase 4/")
+                || lastValue.contains("phase 5/") || lastValue.contains("phase 6/")
+                || lastValue.contains("phase 7/") || lastValue.contains("phase 8/")
+            {
+                sawMultiPhase = true
+            }
+            if lastValue.contains("tokens") && !lastValue.contains("0 tokens")
+                && lastValue.contains("tool calls")
+            {
+                sawLiveStats = true
+            }
+            if app.state != .runningForeground {
+                attachDiagnostics(app, name: "workflow-left-foreground")
+                throw DeviceE2EHarnessError.precondition("App left foreground during workflow execution")
+            }
+            Thread.sleep(forTimeInterval: 2)
+        }
+
+        var failures: [String] = []
+        if !sawCompleted {
+            failures.append("workflow did not reach Completed; last status: \(lastValue)")
+        }
+        if sawCompleted, !sawMultiPhase {
+            failures.append("workflow completed with fewer than 3 phases: \(lastValue)")
+        }
+        if !sawLiveStats {
+            failures.append("workflow never showed non-zero token/tool-call statistics: \(lastValue)")
+        }
+        if sawCompleted {
+            let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
+            if answers.count == 0 {
+                failures.append("workflow completed without projecting a final plan into the chat")
+            }
+            let completedRow = app.descendants(matching: .any).matching(
+                NSPredicate(format: "label BEGINSWITH %@", "Workflow:")
+            ).firstMatch
+            if completedRow.waitForExistence(timeout: 10) {
+                completedRow.tap()
+                if app.navigationBars["Workflow"].waitForExistence(timeout: 10) {
+                    let hierarchy = XCTAttachment(string: app.debugDescription)
+                    hierarchy.name = "workflow-summary-page"
+                    hierarchy.lifetime = .keepAlways
+                    add(hierarchy)
+                } else {
+                    failures.append("completed workflow row did not open the summary page")
+                }
+            } else {
+                failures.append("completed workflow row disappeared from the thread")
+            }
+        }
+
+        let summary = XCTAttachment(string: """
+        last_status=\(lastValue)
+        saw_multiphase=\(sawMultiPhase)
+        saw_live_stats=\(sawLiveStats)
+        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
+        """)
+        summary.name = "workflow-completion-device"
+        summary.lifetime = .keepAlways
+        add(summary)
+        attachDiagnostics(app, name: "workflow-completion-final")
+
+        XCTAssertTrue(
+            failures.isEmpty,
+            "Device workflow run had \(failures.count) failure(s):\n- "
+                + failures.joined(separator: "\n- ")
+        )
+    }
+
+    @MainActor
+    private func readWorkflowValue(_ element: XCUIElement) -> String? {
+        for _ in 0..<10 {
+            if element.exists, let value = element.value as? String { return value }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return nil
+    }
 }
 
 /// Simulator-first online-model matrix (iPhone Simulator focus). Requires the test runner to inject
@@ -2212,320 +2539,6 @@ final class SimulatorOnlineE2EUITests: DeviceE2ETestCase {
         XCTAssertTrue(menu.waitForExistence(timeout: 10))
     }
 
-    // TEST-ID: AHT-TOOLS-005-DEVICE
-    /// Matrix test29: every Tool V2 adapter that crosses a real system/network boundary executes on
-    /// the physical device. The online model drives the calls so adapter coverage is never coupled to
-    /// local-model tool-calling quality; TCC prompts are granted by the shared system-alert firewall.
-    @MainActor
-    func test29ToolV2AdaptersOnDevice() throws {
-        let app = try launchApp()
-        try goToSettings(in: app)
-        let choose = app.buttons.matching(
-            NSPredicate(format: "label BEGINSWITH %@", "Choose tools")
-        ).firstMatch
-        guard scrollToHittable(choose, in: app.scrollViews.firstMatch) else {
-            throw DeviceE2EHarnessError.precondition("Choose tools row is unreachable")
-        }
-        choose.tap()
-        guard app.navigationBars["Tools"].waitForExistence(timeout: 15) else {
-            throw DeviceE2EHarnessError.precondition("Tools settings did not open")
-        }
-        let scroll = firstHittableScrollView(in: app)
-        for title in ["Web search", "Webpage reader", "Wikipedia", "Calculator", "Clock", "Memory",
-                      "Calendar", "Reminders", "Location"] {
-            let toggle = switchStarting(with: title, in: app)
-            guard scrollToHittable(toggle, in: scroll) else {
-                attachDiagnostics(app, name: "tool-toggle-missing-\(title)")
-                throw DeviceE2EHarnessError.precondition("Tool toggle is unreachable: \(title)")
-            }
-            try setSwitch(toggle, on: true)
-        }
-        let masterToggle = switchStarting(with: "Allow selected tools", in: app)
-        guard scrollToHittable(masterToggle, in: scroll, swipingUp: false) else {
-            throw DeviceE2EHarnessError.precondition("Tool master switch is unreachable")
-        }
-        try setSwitch(masterToggle, on: true)
-        app.navigationBars["Tools"].buttons["Done"].tap()
-        guard app.navigationBars["Settings"].waitForExistence(timeout: 15) else {
-            throw DeviceE2EHarnessError.precondition("Tools settings did not close")
-        }
-        try goToChatList(in: app)
-        try openNewChat(in: app)
-        try selectOnlineModel(in: app)
-
-        let marker = uniqueMarker("TOOLV2")
-        let prompt = marker
-            + "\nCall each of these tools exactly once, in this order: "
-            + "1) wikipedia with query \"Machine learning\"; "
-            + "2) fetch_webpage with url \"https://example.com\"; "
-            + "3) list_calendar_events with daysAhead 7; "
-            + "4) create_reminder with title \"E2E \(marker) reminder\" and no due time; "
-            + "5) current_location with no arguments. "
-            + "After the calls, answer with one short line per result."
-        var evidence = try send(prompt, model: .bonsai, in: app, timeout: 600, assertEvidence: false)
-        let expectedTools = ["wikipedia", "fetch_webpage", "list_calendar_events",
-                             "create_reminder", "current_location"]
-        func missingTools(from activities: [String]) -> [String] {
-            expectedTools.filter { tool in
-                !activities.contains { $0.localizedCaseInsensitiveContains(tool) }
-            }
-        }
-        var missing = missingTools(from: evidence.toolActivities)
-        if !missing.isEmpty {
-            evidence = try send(
-                "\(uniqueMarker("TOOLV2_RETRY"))\nYou must call the still-missing tools "
-                    + "\(missing.joined(separator: ", ")) now, then reply briefly.",
-                model: .bonsai, in: app, timeout: 600, assertEvidence: false)
-            missing = missingTools(from: evidence.toolActivities)
-        }
-
-        let summary = XCTAttachment(string: """
-        marker=\(marker)
-        tool_activities=\(evidence.toolActivities.joined(separator: " | "))
-        missing=\(missing.isEmpty ? "none" : missing.joined(separator: ", "))
-        answer=\(evidence.answer)
-        diagnostics=\(diagnosticValue("device-e2e.agent", in: app))
-        """)
-        summary.name = "tool-v2-adapters-device"
-        summary.lifetime = .keepAlways
-        add(summary)
-        XCTAssertTrue(
-            missing.isEmpty,
-            "Tool V2 adapters missing on device: \(missing.joined(separator: ", "))"
-        )
-    }
-
-    // TEST-ID: AH-IOS-003-DEVICE
-    /// Matrix test30: iOS 26 continued processing submits/rejects on the real phone through the
-    /// production BGTaskScheduler seam. Expiration/cancellation are covered deterministically by the
-    /// coordinator unit matrix; this scenario proves the device path: the setting, the run-start
-    /// submission, and a clean foreground outcome (resumable pause when the system rejects).
-    @MainActor
-    func test30ContinuedProcessingOnDevice() throws {
-        let app = try launchApp()
-        try goToSettings(in: app)
-        let toggle = switchStarting(with: "Continue work in background", in: app)
-        guard scrollToHittable(toggle, in: app.scrollViews.firstMatch, swipingUp: false) else {
-            throw DeviceE2EHarnessError.precondition("Continued-processing toggle is unreachable")
-        }
-        try setSwitch(toggle, on: true)
-        try goToChatList(in: app)
-        try openNewChat(in: app)
-        try selectOnlineModel(in: app)
-
-        let field = app.textFields["composer.field"]
-        guard field.waitForExistence(timeout: 20) else {
-            throw DeviceE2EHarnessError.precondition("Composer missing before continued-processing send")
-        }
-        field.tap()
-        field.typeText("Write a 200-word essay about background processing on iOS, then stop.")
-        let send = app.buttons["Send"]
-        guard waitForEnabled(send, timeout: 20) else {
-            throw DeviceE2EHarnessError.precondition("Send did not enable")
-        }
-        send.tap()
-
-        // Submission happens at run start. A rejection quiesces the run to a resumable foreground
-        // wait; acceptance keeps it streaming. Either outcome must never fail the run.
-        let submissionDeadline = Date().addingTimeInterval(120)
-        var sawPause = false
-        var sawTerminal = false
-        while Date() < submissionDeadline {
-            let agent = diagnosticValue("device-e2e.agent", in: app)
-            if agent.contains("run=paused") || agent.contains("run=waitingForForeground") {
-                sawPause = true
-                break
-            }
-            if agent.contains("run=completed") || agent.contains("run=failed")
-                || agent.contains("run=cancelled")
-            {
-                sawTerminal = true
-                break
-            }
-            if app.buttons.matching(identifier: "Copy answer").count > 0 {
-                sawTerminal = true
-                break
-            }
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-
-        // Read the coordinator's status surface before navigating away.
-        try goToSettings(in: app)
-        let status = app.staticTexts.matching(
-            NSPredicate(format: "label BEGINSWITH %@", "Not started")
-        ).firstMatch
-        let waiting = app.staticTexts.matching(
-            NSPredicate(format: "label BEGINSWITH %@", "Waiting for the system")
-        ).firstMatch
-        let running = app.staticTexts.matching(
-            NSPredicate(format: "label BEGINSWITH %@", "A run is continuing")
-        ).firstMatch
-        let statusText = [status, waiting, running]
-            .compactMap { $0.exists ? $0.label : nil }
-            .first
-        let agent = diagnosticValue("device-e2e.agent", in: app)
-
-        // Restore the fresh-install default before leaving so later serial tests never inherit the
-        // background-continuation path.
-        try setSwitch(toggle, on: false)
-
-        if let statusText,
-           statusText.hasPrefix("Not started"),
-           statusText.localizedCaseInsensitiveContains("not permitted")
-        {
-            throw XCTSkip(
-                "iOS 26 continued processing needs the Background Processing capability on the App ID "
-                    + "(com.apple.developer.background-tasks.continued-processing); the current device "
-                    + "profile lacks it. Coordinator reported: \(statusText)"
-            )
-        }
-
-        let summary = XCTAttachment(string: """
-        saw_pause=\(sawPause)
-        saw_terminal=\(sawTerminal)
-        status=\(statusText ?? "<none>")
-        diagnostics=\(agent)
-        """)
-        summary.name = "continued-processing-device"
-        summary.lifetime = .keepAlways
-        add(summary)
-        XCTAssertTrue(
-            sawPause || sawTerminal || statusText != nil,
-            "continued-processing scenario produced no observable outcome; diagnostics: \(agent)"
-        )
-    }
-
-    // TEST-ID: AHT-WORKFLOW-002-DEVICE
-    /// Matrix test31: the full message-anchored workflow (auto-plan → research children → staged
-    /// phases → audit/revise/verify → delivered plan) runs to completion on the physical device with
-    /// the online model, then projects the final plan into the chat and opens its summary page.
-    @MainActor
-    func test31WorkflowCompletesOnDevice() throws {
-        let app = try launchApp()
-        try configureTools(master: true, enabled: ["Web search", "Webpage reader", "Wikipedia"], in: app)
-        try openNewChat(in: app)
-        try selectOnlineModel(in: app)
-
-        let field = app.textFields["composer.field"]
-        guard field.waitForExistence(timeout: 20) else {
-            throw DeviceE2EHarnessError.precondition("Composer missing before workflow send")
-        }
-        field.tap()
-        field.typeText("/workflow research how sleep affects memory and produce a short three-section action plan")
-        let send = app.buttons["Send"]
-        guard waitForEnabled(send, timeout: 20) else {
-            throw DeviceE2EHarnessError.precondition("Send did not enable for /workflow")
-        }
-        send.tap()
-
-        let composerDeadline = Date().addingTimeInterval(8)
-        while Date() < composerDeadline {
-            if !((field.value as? String) ?? "").contains("/workflow") { break }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        XCTAssertFalse(
-            ((field.value as? String) ?? "").contains("/workflow"),
-            "the composer must clear after a /workflow send"
-        )
-
-        let row = app.descendants(matching: .any).matching(
-            NSPredicate(format: "label BEGINSWITH %@", "Workflow:")
-        ).firstMatch
-        guard row.waitForExistence(timeout: 45) else {
-            attachDiagnostics(app, name: "workflow-row-missing")
-            throw DeviceE2EHarnessError.precondition("The message-anchored workflow record did not appear")
-        }
-
-        var lastValue = readWorkflowValue(row) ?? ""
-        var sawMultiPhase = false
-        var sawLiveStats = false
-        var sawCompleted = false
-        let deadline = Date().addingTimeInterval(3_300)
-        while Date() < deadline {
-            approvePendingAgentApprovalIfNeeded(in: app)
-            lastValue = readWorkflowValue(row) ?? lastValue
-            if lastValue.contains("Completed") {
-                sawCompleted = true
-                break
-            }
-            if lastValue.contains("Failed") || lastValue.contains("Cancelled") { break }
-            if lastValue.contains("phase 3/") || lastValue.contains("phase 4/")
-                || lastValue.contains("phase 5/") || lastValue.contains("phase 6/")
-                || lastValue.contains("phase 7/") || lastValue.contains("phase 8/")
-            {
-                sawMultiPhase = true
-            }
-            if lastValue.contains("tokens") && !lastValue.contains("0 tokens")
-                && lastValue.contains("tool calls")
-            {
-                sawLiveStats = true
-            }
-            if app.state != .runningForeground {
-                attachDiagnostics(app, name: "workflow-left-foreground")
-                throw DeviceE2EHarnessError.precondition("App left foreground during workflow execution")
-            }
-            Thread.sleep(forTimeInterval: 2)
-        }
-
-        var failures: [String] = []
-        if !sawCompleted {
-            failures.append("workflow did not reach Completed; last status: \(lastValue)")
-        }
-        if sawCompleted, !sawMultiPhase {
-            failures.append("workflow completed with fewer than 3 phases: \(lastValue)")
-        }
-        if !sawLiveStats {
-            failures.append("workflow never showed non-zero token/tool-call statistics: \(lastValue)")
-        }
-        if sawCompleted {
-            let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
-            if answers.count == 0 {
-                failures.append("workflow completed without projecting a final plan into the chat")
-            }
-            let completedRow = app.descendants(matching: .any).matching(
-                NSPredicate(format: "label BEGINSWITH %@", "Workflow:")
-            ).firstMatch
-            if completedRow.waitForExistence(timeout: 10) {
-                completedRow.tap()
-                if app.navigationBars["Workflow"].waitForExistence(timeout: 10) {
-                    let hierarchy = XCTAttachment(string: app.debugDescription)
-                    hierarchy.name = "workflow-summary-page"
-                    hierarchy.lifetime = .keepAlways
-                    add(hierarchy)
-                } else {
-                    failures.append("completed workflow row did not open the summary page")
-                }
-            } else {
-                failures.append("completed workflow row disappeared from the thread")
-            }
-        }
-
-        let summary = XCTAttachment(string: """
-        last_status=\(lastValue)
-        saw_multiphase=\(sawMultiPhase)
-        saw_live_stats=\(sawLiveStats)
-        failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
-        """)
-        summary.name = "workflow-completion-device"
-        summary.lifetime = .keepAlways
-        add(summary)
-        attachDiagnostics(app, name: "workflow-completion-final")
-
-        XCTAssertTrue(
-            failures.isEmpty,
-            "Device workflow run had \(failures.count) failure(s):\n- "
-                + failures.joined(separator: "\n- ")
-        )
-    }
-
-    @MainActor
-    private func readWorkflowValue(_ element: XCUIElement) -> String? {
-        for _ in 0..<10 {
-            if element.exists, let value = element.value as? String { return value }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-        return nil
-    }
 }
 
 private extension XCUIElementQuery {

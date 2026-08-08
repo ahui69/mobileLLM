@@ -128,7 +128,7 @@ public final class AppWebSearchToolAdapter: ToolV2, @unchecked Sendable {
         version: SemanticVersion = SemanticVersion("1.0.0")!,
         trustRevision: String,
         timeoutMilliseconds: UInt64 = 30_000,
-        maximumResponseBytes: UInt64 = 2 * 1_024 * 1_024
+        maximumResponseBytes: UInt64 = 1 * 1_024 * 1_024
     ) throws {
         let schema = tool.schema
         let inputSchema = try AppToolV2Support.inputSchema(for: schema)

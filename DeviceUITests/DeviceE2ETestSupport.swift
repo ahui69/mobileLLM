@@ -920,6 +920,54 @@ class DeviceE2ETestCase: XCTestCase {
         try setSwitch(toggle, on: enabled)
     }
 
+    /// Turns the armed online service off through Settings WITHOUT loading any local weights. DEBUG
+    /// builds re-arm the embedded online service at every launch, so tests that need a cold local
+    /// turn must explicitly disarm it after a relaunch; doing it here (not in the model switcher)
+    /// keeps the engine resident=false so cold-load scenarios stay cold.
+    @MainActor
+    func disableOnlineService(in app: XCUIApplication) throws {
+        try goToSettings(in: app)
+        let services = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Online services")
+        ).firstMatch
+        guard scrollToHittable(services, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Online services row is unreachable")
+        }
+        services.tap()
+        guard app.navigationBars["Online models"].waitForExistence(timeout: 15) else {
+            throw DeviceE2EHarnessError.precondition("Online models page did not open")
+        }
+        let serviceRow = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS %@", "OpenAI")
+        ).firstMatch
+        guard serviceRow.waitForExistence(timeout: 10), serviceRow.isHittable else {
+            attachDiagnostics(app, name: "online-service-row-missing")
+            throw DeviceE2EHarnessError.precondition("Online service row is missing")
+        }
+        serviceRow.tap()
+        guard app.navigationBars["Edit service"].waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Online service editor did not open")
+        }
+        let activeToggle = switchStarting(with: "Active online model", in: app)
+        guard scrollToHittable(activeToggle, in: app.scrollViews.firstMatch, swipingUp: false) else {
+            throw DeviceE2EHarnessError.precondition("Active-online-model toggle is unreachable")
+        }
+        try setSwitch(activeToggle, on: false)
+        let save = app.buttons["Save"]
+        guard save.waitForExistence(timeout: 10), save.isHittable else {
+            throw DeviceE2EHarnessError.precondition("Online service Save is not actionable")
+        }
+        save.tap()
+        guard app.navigationBars["Online models"].waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Online models page did not return after Save")
+        }
+        let done = app.navigationBars["Online models"].buttons["Done"]
+        if done.exists, done.isHittable { done.tap() }
+        guard app.navigationBars["Settings"].waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Settings did not return after disabling online")
+        }
+    }
+
     @MainActor
     func goToSettings(in app: XCUIApplication) throws {
         try goToChatList(in: app)
@@ -941,6 +989,12 @@ class DeviceE2ETestCase: XCTestCase {
             throw DeviceE2EHarnessError.precondition("Chat search is unavailable")
         }
         search.tap()
+        // The search field retains its previous text across helper calls. Clear it first, otherwise a
+        // second reopen concatenates the old needle onto the new one and matches nothing.
+        let current = (search.value as? String) ?? ""
+        if !current.isEmpty, current != "Search chats" {
+            search.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count))
+        }
         search.typeText(title)
         let row = app.buttons[title]
         guard row.waitForExistence(timeout: 15) else {

@@ -56,6 +56,44 @@ final class ToolV2AdapterTests: XCTestCase {
         XCTAssertTrue(text.value.contains("Example Result"))
     }
 
+    /// Regression for the device matrix (test24): the default five-engine web_search plan reserves
+    /// `maximumResponseBytes × (1 + fallbacks)`. With the old 2 MiB per-hop cap that worst case was
+    /// 10 MiB, which blew the default 8 MiB `networkResponseBytesTotal` run budget before any network
+    /// hop. The adapter must clamp its per-hop cap so the full default fallback itinerary fits.
+    func testWebSearchDefaultPlanFitsRunNetworkBudget() async throws {
+        let tool = WebSearchTool(
+            engines: SearchEngine.allCases,
+            session: URLSession(configuration: .ephemeral)
+        )
+        let adapter = try AppWebSearchToolAdapter(tool: tool, trustRevision: "builtin.v1")
+        let request = try makeRequest(descriptor: adapter.descriptor, arguments: [
+            "query": .string("mobileLLM"),
+        ])
+        let destinations = try SearchEngine.allCases.map {
+            try AppWebSearchToolAdapter.destination(engine: $0)
+        }
+        let preparation = try makePreparationContext(
+            destinations: destinations,
+            dataCategories: [try AgentDataCategory(rawValue: "web.search")],
+            capabilities: AgentCapabilitySet([.networkRead])
+        )
+
+        let prepared = try await adapter.prepare(request: request, context: preparation)
+        let hops = 1 + prepared.externalOperation.plan.allowedFallbacks.count
+        let worstCase = prepared.externalOperation.plan.maximumResponseBytes * UInt64(hops)
+        XCTAssertEqual(
+            prepared.externalOperation.plan.maximumResponseBytes,
+            1 * 1_024 * 1_024,
+            "web_search per-hop cap must stay at 1 MiB so the default itinerary fits the run budget"
+        )
+        XCTAssertLessThanOrEqual(
+            worstCase,
+            8 * 1_024 * 1_024,
+            "default five-engine web_search worst-case reservation \(worstCase) "
+                + "must fit networkResponseBytesTotal"
+        )
+    }
+
     // MARK: - Wikipedia
 
     func testWikipediaAdapterPreparesLanguageHostAndExecutes() async throws {

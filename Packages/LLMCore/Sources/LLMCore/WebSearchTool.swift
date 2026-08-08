@@ -40,7 +40,7 @@ public struct WebSearchTool: Tool {
 
     public init(engines: [SearchEngine] = [.duckduckgo, .bing, .brave, .yahoo, .marginalia],
                 session: URLSession = .shared, maxResults: Int = 6,
-                maxBytes: Int = 2 * 1024 * 1024) {
+                maxBytes: Int = 1 * 1024 * 1024) {
         self.engines = engines.isEmpty ? [.duckduckgo, .bing, .brave, .yahoo, .marginalia] : engines
         self.httpClient = WebHTTPClient(session: session)
         self.maxResults = max(1, maxResults)
@@ -48,7 +48,7 @@ public struct WebSearchTool: Tool {
     }
 
     init(engines: [SearchEngine] = [.duckduckgo, .bing, .brave, .yahoo, .marginalia],
-         session: URLSession, maxResults: Int = 6, maxBytes: Int = 2 * 1024 * 1024,
+         session: URLSession, maxResults: Int = 6, maxBytes: Int = 1 * 1024 * 1024,
          dnsResolver: @escaping WebDNSResolver) {
         self.engines = engines.isEmpty ? [.duckduckgo, .bing, .brave, .yahoo, .marginalia] : engines
         self.httpClient = WebHTTPClient(session: session, resolver: dnsResolver)
