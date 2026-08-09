@@ -1011,13 +1011,12 @@ public final class ChatStore {
               hasModel,
               streaming == nil
         else { return }
-        // Deterministic workflow trigger (spec §22): `/workflow <goal>` starts a message-anchored
-        // multi-agent workflow instead of a normal chat turn.
-        if text.hasPrefix("/workflow") {
-            let goal = String(text.dropFirst("/workflow".count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Deterministic workflow trigger (spec §22): a standalone `/workflow` marker may appear
+        // before, inside, or after the goal. URL path components and longer slash commands do not
+        // match, so ordinary prose is never silently re-routed to the workflow runtime.
+        if let goal = Self.workflowGoal(in: text) {
             guard !goal.isEmpty else {
-                showToast(Toast("Describe the goal after /workflow, e.g. /workflow research the topic",
+                showToast(Toast("Add a goal with /workflow, e.g. /workflow research the topic",
                                 kind: .warning, autoDismiss: 5))
                 return
             }
@@ -1102,6 +1101,37 @@ public final class ChatStore {
                             attachmentRollback: finalRollback)
         }
     }
+
+    /// Extracts a position-independent workflow marker without treating URL paths or longer command
+    /// names as commands. Internal visibility keeps the command grammar directly unit-testable.
+    static func workflowGoal(in text: String) -> String? {
+        let fullRange = NSRange(text.startIndex ..< text.endIndex, in: text)
+        let matches = workflowCommandExpression.matches(in: text, range: fullRange)
+        guard !matches.isEmpty else { return nil }
+
+        let result = NSMutableString(string: text)
+        for match in matches.reversed() {
+            var removal = match.range
+            if removal.location > 0 {
+                let previous = result.substring(with: NSRange(location: removal.location - 1, length: 1))
+                if previous.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+                    removal.location -= 1
+                    removal.length += 1
+                }
+            } else if NSMaxRange(removal) < result.length {
+                let next = result.substring(with: NSRange(location: NSMaxRange(removal), length: 1))
+                if next.rangeOfCharacter(from: .whitespacesAndNewlines) != nil {
+                    removal.length += 1
+                }
+            }
+            result.deleteCharacters(in: removal)
+        }
+        return String(result).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static let workflowCommandExpression = try! NSRegularExpression(
+        pattern: #"(?i)(?<![\p{L}\p{N}_/])/workflow(?![\p{L}\p{N}_/-])"#
+    )
 
     /// Routes one turn through the durable agent runtime (spec §9.1 send order): attachment bytes
     /// reach disk first, then the run is submitted; the committed answer is projected back into the

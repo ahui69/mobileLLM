@@ -8,6 +8,28 @@ import AgentContracts
 // TEST-ID: AHT-WORKFLOW-001
 @MainActor
 final class ChatStoreWorkflowTests: XCTestCase {
+    func testWorkflowMarkerIsPositionIndependentAndTokenBounded() {
+        XCTAssertEqual(
+            ChatStore.workflowGoal(in: "/workflow deploy Kimi K3 on iPhone"),
+            "deploy Kimi K3 on iPhone"
+        )
+        XCTAssertEqual(
+            ChatStore.workflowGoal(in: "deploy Kimi K3 /workflow on iPhone"),
+            "deploy Kimi K3 on iPhone"
+        )
+        XCTAssertEqual(
+            ChatStore.workflowGoal(in: "deploy Kimi K3 on iPhone /WORKFLOW"),
+            "deploy Kimi K3 on iPhone"
+        )
+        XCTAssertEqual(ChatStore.workflowGoal(in: "Please run (/workflow) now"), "Please run () now")
+        XCTAssertEqual(ChatStore.workflowGoal(in: "/workflow"), "")
+
+        XCTAssertNil(ChatStore.workflowGoal(in: "https://example.com/workflow"))
+        XCTAssertNil(ChatStore.workflowGoal(in: "use /workflow-v2 instead"))
+        XCTAssertNil(ChatStore.workflowGoal(in: "use /workflowHelper instead"))
+        XCTAssertNil(ChatStore.workflowGoal(in: "folder/workflow result"))
+    }
+
     func testWorkflowCommandStartsMessageAnchoredWorkflow() async throws {
         let (store, dir) = tempStore()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -79,6 +101,32 @@ final class ChatStoreWorkflowTests: XCTestCase {
         XCTAssertFalse(launched)
         XCTAssertNil(chat.activeConversation, "an empty /workflow goal must not create a turn")
         XCTAssertNotNil(chat.banner)
+    }
+
+    func testWorkflowCommandAtEndStartsWorkflowWithMarkerRemoved() async throws {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let workflowStore = WorkflowStore(directory: dir.appendingPathComponent("wf", isDirectory: true))
+        let settings = AppSettings(defaults: UserDefaults(suiteName: "workflow-\(UUID().uuidString)")!)
+        let chat = ChatStore(
+            engine: MockLLMEngine(script: .init(answer: "unused")),
+            store: store,
+            settings: settings,
+            activeModel: LoadedModel(
+                model: LLMCatalog.bonsai8b,
+                variant: LLMCatalog.bonsai8b.defaultVariantValue
+            ),
+            workflowStore: workflowStore
+        )
+        var launchedGoal: String?
+        chat.workflowLaunch = { goal, _, _, _ in launchedGoal = goal }
+
+        chat.draft = "How to deploy Kimi K3 on iPhone 16 Pro /workflow"
+        chat.send()
+
+        try await waitUntil { launchedGoal != nil }
+        XCTAssertEqual(launchedGoal, "How to deploy Kimi K3 on iPhone 16 Pro")
+        XCTAssertEqual(chat.activeConversation?.messages.first?.answer, launchedGoal)
     }
 
     func testWorkflowCompletionProjectsFinalAnswerIntoChat() async throws {

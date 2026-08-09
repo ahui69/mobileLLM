@@ -1116,10 +1116,10 @@ non-model work may overlap. Every batch drains at a deterministic barrier before
 - remain visible as child runs in the journal.
 
 Workflow triggering is harness-supported: the harness starts a multi-subagent workflow when the user
-asks for multi-agent work in a message, and the `/workflow` slash command is the deterministic,
-guaranteed trigger. Every workflow is anchored to the message that initiated it, records that anchor
-durably, and spawns child runs under the reserved parent-run identity so the journal can reconstruct
-the full tree after relaunch.
+asks for multi-agent work in a message, and a standalone `/workflow` marker is the deterministic trigger
+whether it appears before, within, or after the goal. The marker is removed before generation; longer
+slash commands and URL path components do not match. Every workflow remains durably anchored to its
+initiating message so the journal can reconstruct the full child-run tree after relaunch.
 
 Implementation order (see §30): the subagent spawner landed first, then bounded parallel tool batches,
 then the staged orchestrator, and now bounded parallel child execution.
