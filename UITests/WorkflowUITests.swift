@@ -4,8 +4,8 @@ import XCTest
 
 // TEST-ID: AHT-DYNAMIC-UI-001
 /// Simulator E2E for the message-anchored Dynamic Workflow surface (spec §34): `/workflow <goal>`
-/// first creates an inert candidate, exposes the exact analyzed JavaScript, and requires separate
-/// approval and Start actions before any child work can run.
+/// records one exact analyzed JavaScript candidate, converts the explicit slash command into a
+/// one-run approval, and starts child work without exposing a redundant launch-permission prompt.
 final class WorkflowUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -48,22 +48,24 @@ final class WorkflowUITests: XCTestCase {
         }
         let value = readValue(row) ?? ""
         XCTAssertTrue(
-            value.contains("Generating candidate") || value.contains("Waiting for approval"),
-            "the workflow must begin as an inert candidate, got '\(value)'"
+            value.contains("Generating candidate") || value.contains("Running")
+                || value.contains("Completed"),
+            "the workflow must begin generating or running, got '\(value)'"
         )
 
         let candidateDeadline = Date().addingTimeInterval(180)
         var candidateState = readValue(row) ?? ""
         while Date() < candidateDeadline,
-              !candidateState.contains("Waiting for approval"),
+              !candidateState.contains("Running"),
+              !candidateState.contains("Completed"),
               !candidateState.contains("Failed")
         {
             Thread.sleep(forTimeInterval: 1)
             candidateState = readValue(row) ?? candidateState
         }
         XCTAssertTrue(
-            candidateState.contains("Waiting for approval"),
-            "candidate generation must finish without auto-execution, got '\(candidateState)'"
+            candidateState.contains("Running") || candidateState.contains("Completed"),
+            "the explicit /workflow command must auto-start after validation, got '\(candidateState)'"
         )
 
         row.tap()
@@ -71,24 +73,11 @@ final class WorkflowUITests: XCTestCase {
         XCTAssertTrue(sourceDisclosure.waitForExistence(timeout: 20), "source disclosure is missing")
         sourceDisclosure.tap()
         let source = app.descendants(matching: .any)["workflow.source"]
-        let approval = app.descendants(matching: .any)["workflow.approval"]
         XCTAssertTrue(source.waitForExistence(timeout: 5), "exact JavaScript source is not inspectable")
-        XCTAssertTrue(approval.exists, "candidate approval controls are missing")
-        XCTAssertFalse(app.descendants(matching: .any)["workflow.start"].exists)
-
-        let once = app.buttons["Once"]
-        XCTAssertTrue(once.exists)
-        once.tap()
-        let start = app.descendants(matching: .any)["workflow.start"]
-        XCTAssertTrue(start.waitForExistence(timeout: 20), "approval must queue, not auto-start")
-        XCTAssertEqual(app.descendants(matching: .any)["workflow.state"].label,
-                       "Approved — ready to start")
-
-        start.tap()
-        let state = app.descendants(matching: .any)["workflow.state"]
-        let started = NSPredicate(format: "label == 'Running' OR label == 'Completed'")
-        expectation(for: started, evaluatedWith: state)
-        waitForExpectations(timeout: 20)
+        XCTAssertFalse(app.buttons["Once"].exists)
+        XCTAssertFalse(app.buttons["Always"].exists)
+        XCTAssertFalse(app.buttons["Deny"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["workflow.approval"].exists)
     }
 
     /// Reading `.value` immediately after `waitForExistence` can race a list re-render; retry a few

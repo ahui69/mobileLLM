@@ -22,7 +22,7 @@ public final class WorkflowStore: WorkflowRecording {
     /// App-owned recovery seam. Loading the store never calls it; only an explicit Resume action
     /// from the workflow UI may restart durable work.
     public var resumeHandler: (@MainActor (UUID) async throws -> Void)?
-    public var dynamicApproveHandler: (@MainActor (UUID, WorkflowLaunchApprovalReuseScopeV1?) async throws -> Void)?
+    public var dynamicRunHandler: (@MainActor (UUID) async throws -> Void)?
     public var dynamicDenyHandler: (@MainActor (UUID) async throws -> Void)?
     public var dynamicStartHandler: (@MainActor (UUID) async throws -> Void)?
     public var dynamicPauseHandler: (@MainActor (UUID) async throws -> Void)?
@@ -81,13 +81,10 @@ public final class WorkflowStore: WorkflowRecording {
         }
     }
 
-    public func approveDynamic(
-        workflowID: UUID,
-        reuseScope: WorkflowLaunchApprovalReuseScopeV1?
-    ) async {
-        await performDynamicAction(workflowID: workflowID) { [dynamicApproveHandler] in
-            guard let dynamicApproveHandler else { throw WorkflowStoreActionError.unavailable }
-            try await dynamicApproveHandler(workflowID, reuseScope)
+    public func runDynamic(workflowID: UUID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicRunHandler] in
+            guard let dynamicRunHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicRunHandler(workflowID)
         }
     }
 

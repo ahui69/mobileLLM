@@ -1901,7 +1901,7 @@
     },
     {
       "id": "AHT-DYNAMIC-UI-001",
-      "title": "Dynamic Workflow unified preview, approval, neutral recovery, and child controls",
+      "title": "Dynamic Workflow unified preview, automatic launch, neutral recovery, and child controls",
       "status": "active",
       "kind": "integration",
       "riskTier": "P0",
@@ -1911,7 +1911,7 @@
       "selectors": [
         {
           "kind": "xctest",
-          "value": "MobileLLMUITests.WorkflowStoreTests/testDynamicApprovalAndStartAreSeparateExplicitActions"
+          "value": "MobileLLMUITests.WorkflowStoreTests/testDynamicRunUsesOneRecoveryActionWithoutReusableApprovalChoice"
         },
         {
           "kind": "xctest",
@@ -1941,7 +1941,7 @@
         "nightly"
       ],
       "requiredEvidence": [
-        "Exact source and phase preview, separate approval/start, interrupted relaunch projection, reconciliation, and safe child restart controls"
+        "Exact source and phase preview, automatic digest-bound one-run launch without reusable approval UI, interrupted relaunch projection, reconciliation, and safe child restart controls"
       ],
       "determinism": {
         "fixedSeedRequired": false,
@@ -2003,7 +2003,7 @@
         "release-candidate"
       ],
       "requiredEvidence": [
-        "test31 exact-source inspection, separate approval and Start, durable children, terminal result, logs, diagnostics, and xcresult"
+        "test31 exact-source inspection, automatic digest-bound one-run launch, no redundant launch-permission UI, durable children, terminal result, logs, diagnostics, and xcresult"
       ],
       "determinism": {
         "fixedSeedRequired": false,

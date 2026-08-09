@@ -1673,7 +1673,7 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
 
     // TEST-ID: AHT-DYNAMIC-DEVICE-001
     /// Matrix test31: the full message-anchored Dynamic Workflow lifecycle runs on the physical
-    /// device: inert candidate generation, exact-source inspection, separate approval and Start,
+    /// device: validated candidate generation, automatic one-run launch, exact-source inspection,
     /// durable child execution, and final-result projection back into the chat.
     @MainActor
     func test31WorkflowCompletesOnDevice() throws {
@@ -1715,17 +1715,18 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
         var rowState = readWorkflowValue(row) ?? ""
         let candidateDeadline = Date().addingTimeInterval(300)
         while Date() < candidateDeadline,
-              !rowState.contains("Waiting for approval"),
+              !rowState.contains("Running"),
+              !rowState.contains("Completed"),
               !rowState.contains("Failed")
         {
             approvePendingAgentApprovalIfNeeded(in: app)
             Thread.sleep(forTimeInterval: 1)
             rowState = readWorkflowValue(row) ?? rowState
         }
-        guard rowState.contains("Waiting for approval") else {
+        guard rowState.contains("Running") || rowState.contains("Completed") else {
             attachDiagnostics(app, name: "workflow-candidate-failed")
             throw DeviceE2EHarnessError.precondition(
-                "Dynamic Workflow candidate was not ready for approval: \(rowState)"
+                "Dynamic Workflow did not auto-start after validation: \(rowState)"
             )
         }
 
@@ -1739,23 +1740,10 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
         }
         sourceDisclosure.tap()
         XCTAssertTrue(app.descendants(matching: .any)["workflow.source"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.descendants(matching: .any)["workflow.approval"].exists)
-        XCTAssertFalse(app.descendants(matching: .any)["workflow.start"].exists,
-                       "an unapproved candidate must not expose Start")
-
-        let once = app.buttons["Once"]
-        guard once.waitForExistence(timeout: 5) else {
-            throw DeviceE2EHarnessError.precondition("Once approval is missing")
-        }
-        once.tap()
-        let start = app.descendants(matching: .any)["workflow.start"]
-        guard start.waitForExistence(timeout: 20) else {
-            throw DeviceE2EHarnessError.precondition("Approval did not queue the workflow")
-        }
-        XCTAssertEqual(app.descendants(matching: .any)["workflow.state"].label,
-                       "Approved — ready to start",
-                       "approval must not implicitly execute")
-        start.tap()
+        XCTAssertFalse(app.buttons["Once"].exists)
+        XCTAssertFalse(app.buttons["Always"].exists)
+        XCTAssertFalse(app.buttons["Deny"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["workflow.approval"].exists)
 
         let state = app.descendants(matching: .any)["workflow.state"]
         var lastState = state.label

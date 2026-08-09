@@ -78,6 +78,7 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
         var lexer = JavaScriptLexer(source: body)
         let tokens = try lexer.tokens()
         try Self.rejectForbiddenCapabilities(tokens)
+        try Self.validateAgentOptions(tokens)
         let savedWorkflowNames = try Self.savedWorkflowNames(in: tokens)
         let instrumentation = try Self.instrument(source: body, tokens: tokens)
         let callSites = tokens.reduce(into: UInt32(0)) { count, token in
@@ -109,6 +110,138 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
             if !names.contains(name) { names.append(name) }
         }
         return names.sorted()
+    }
+
+    /// `agent` options affect replay identity and host policy, so generated candidates must expose
+    /// their complete top-level shape to analysis. Values may still be ordinary bounded
+    /// expressions, but the options container and every key must be literal. This catches model-
+    /// invented fields before the candidate is saved and lets the app's single repair pass correct
+    /// them without ever dispatching a child.
+    private static func validateAgentOptions(_ tokens: [JSToken]) throws {
+        for callIndex in tokens.indices where tokens[callIndex].identifier == "agent" {
+            guard callIndex + 1 < tokens.count, tokens[callIndex + 1].symbol == "(" else {
+                continue
+            }
+            guard let close = matchingClose(
+                in: tokens,
+                openingAt: callIndex + 1,
+                open: "(",
+                close: ")"
+            ) else {
+                throw WorkflowScriptAnalysisError.invalidSyntax("unbalanced agent call")
+            }
+            guard let separator = topLevelArgumentSeparator(
+                in: tokens,
+                after: callIndex + 1,
+                before: close
+            ) else { continue }
+            let optionStart = separator + 1
+            guard optionStart < close, tokens[optionStart].symbol == "{" else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "agent options must be a direct object literal"
+                )
+            }
+            guard let optionEnd = matchingClose(
+                in: tokens,
+                openingAt: optionStart,
+                open: "{",
+                close: "}"
+            ), optionEnd < close else {
+                throw WorkflowScriptAnalysisError.invalidSyntax("unbalanced agent options")
+            }
+            let tail = tokens[(optionEnd + 1) ..< close]
+            guard tail.isEmpty || (tail.count == 1 && tail.first?.symbol == ",") else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "agent accepts only prompt and options"
+                )
+            }
+            try validateAgentOptionObject(tokens, openingAt: optionStart, closingAt: optionEnd)
+        }
+    }
+
+    private static func topLevelArgumentSeparator(
+        in tokens: [JSToken],
+        after opening: Int,
+        before closing: Int
+    ) -> Int? {
+        var parentheses = 0
+        var brackets = 0
+        var braces = 0
+        for index in (opening + 1) ..< closing {
+            switch tokens[index].symbol {
+            case "(": parentheses += 1
+            case ")": parentheses -= 1
+            case "[": brackets += 1
+            case "]": brackets -= 1
+            case "{": braces += 1
+            case "}": braces -= 1
+            case "," where parentheses == 0 && brackets == 0 && braces == 0: return index
+            default: break
+            }
+        }
+        return nil
+    }
+
+    private static func validateAgentOptionObject(
+        _ tokens: [JSToken],
+        openingAt opening: Int,
+        closingAt closing: Int
+    ) throws {
+        var index = opening + 1
+        var seen: Set<String> = []
+        while index < closing {
+            if tokens[index].symbol == "," { // A trailing comma is valid.
+                index += 1
+                continue
+            }
+            guard let key = tokens[index].identifier ?? tokens[index].stringValue else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "agent option keys must be direct literals"
+                )
+            }
+            guard WorkflowAgentOptionContract.allowedKeys.contains(key) else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "unknown agent option '\(key)'"
+                )
+            }
+            guard seen.insert(key).inserted else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "duplicate agent option '\(key)'"
+                )
+            }
+            index += 1
+            guard index < closing, tokens[index].symbol == ":" else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "agent options cannot use shorthand or computed properties"
+                )
+            }
+            index += 1
+            let valueStart = index
+            var parentheses = 0
+            var brackets = 0
+            var braces = 0
+            while index < closing {
+                let symbol = tokens[index].symbol
+                if symbol == ",", parentheses == 0, brackets == 0, braces == 0 { break }
+                switch symbol {
+                case "(": parentheses += 1
+                case ")": parentheses -= 1
+                case "[": brackets += 1
+                case "]": brackets -= 1
+                case "{": braces += 1
+                case "}": braces -= 1
+                default: break
+                }
+                guard parentheses >= 0, brackets >= 0, braces >= 0 else {
+                    throw WorkflowScriptAnalysisError.invalidSyntax("unbalanced agent option value")
+                }
+                index += 1
+            }
+            guard index > valueStart, parentheses == 0, brackets == 0, braces == 0 else {
+                throw WorkflowScriptAnalysisError.invalidSyntax("invalid agent option value")
+            }
+            if index < closing { index += 1 }
+        }
     }
 
     private static let forbiddenIdentifiers: Set<String> = [

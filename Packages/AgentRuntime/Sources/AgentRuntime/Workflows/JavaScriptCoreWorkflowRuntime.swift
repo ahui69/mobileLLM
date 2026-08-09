@@ -718,9 +718,11 @@ private final class JSCWorkflowExecution: @unchecked Sendable {
         guard case .object(let object) = value else {
             throw WorkflowScriptRuntimeError.invalidAgentOptions("options must be an object")
         }
-        let allowed = Set(["label", "phase", "schema", "model", "agentType", "isolation", "stallMs"])
-        guard Set(object.keys).isSubset(of: allowed) else {
-            throw WorkflowScriptRuntimeError.invalidAgentOptions("unknown option")
+        let unknown = Set(object.keys).subtracting(WorkflowAgentOptionContract.allowedKeys).sorted()
+        guard unknown.isEmpty else {
+            throw WorkflowScriptRuntimeError.invalidAgentOptions(
+                "unknown option: \(unknown.joined(separator: ", "))"
+            )
         }
         let schema: JSONSchemaDocument?
         if let root = object["schema"] {

@@ -1728,8 +1728,12 @@ public final class AgentRuntimeAssembly {
         args, and budget. It has no direct filesystem, shell, network, clock, random, module, eval,
         native-object, or secret access. Use agents for all effects. Keep independent work parallel,
         give every agent a bounded concrete instruction, and return one useful final JSON value.
+        The optional second argument to agent must be a direct object literal and may contain only
+        these exact keys: label, phase, schema, model, agentType, isolation, stallMs. Never add
+        tools, timeout, temperature, token limits, or other fields. Agents automatically inherit the
+        user's frozen tool policy; scripts cannot select or widen tools.
         Keep the complete source concise (under 8,000 output tokens) and use no more than 12 agent
-        calls, so a user can inspect it comfortably before approval.
+        calls, so its exact source remains comfortably inspectable in the workflow view.
         For structured child output, pass a literal JSON Schema in `agent` options and consume the
         returned object directly. Never parse or stringify JSON in the script. Do not use regular
         expressions or high-amplification synchronous APIs including repeat, padStart, padEnd, fill,
@@ -1770,6 +1774,9 @@ public final class AgentRuntimeAssembly {
         `{ title, detail?, model? }` objects (never strings). Only use agent(prompt, options),
         parallel(thunks), pipeline(items, ...stages), workflow(name, args), phase(title), log(value),
         args, budget, ordinary bounded object/array operations, and checkpointable braced loops.
+        The optional agent options value must be a direct object literal containing only label,
+        phase, schema, model, agentType, isolation, or stallMs. Remove tools, timeout, temperature,
+        token limits, and every other option; child agents inherit the frozen host tool policy.
         For structured child output, use a literal JSON Schema in `agent` options and consume the
         returned object directly. Never use JSON.parse or JSON.stringify, regular expressions,
         repeat, padStart, padEnd, fill, join, concat, flat, flatMap, copyWithin, Array.from,

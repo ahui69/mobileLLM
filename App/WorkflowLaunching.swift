@@ -60,27 +60,32 @@ final class WorkflowLauncher {
         )
         try await container.workflowStore.save(summary)
         container.chat.attachWorkflowRecord(WorkflowMessageRecord(summary: summary), to: userMessageID)
+        let candidate: AppDynamicWorkflowCandidatePreview
         do {
-            let candidate = try await prepareDynamicCandidate(
+            candidate = try await prepareDynamicCandidate(
                 goal: goal,
                 conversationID: conversationID,
                 userMessageID: userMessageID,
                 workflowID: workflowID
             )
-            summary.dynamic = DynamicWorkflowPresentation(
-                runID: dynamicRunID,
-                scriptReference: candidate.savedScript.script.reference,
-                metadata: candidate.savedScript.metadata,
-                source: candidate.savedScript.script.source,
-                state: candidate.launch.requiresApproval ? .waitingForLaunchApproval : .queued
-            )
-            try await container.workflowStore.save(summary)
         } catch {
             summary.status = .failed
             summary.endTime = Date()
             summary.dynamic?.state = .failed
             summary.dynamic?.failure = error.localizedDescription
             try? await container.workflowStore.save(summary)
+            throw error
+        }
+        do {
+            // `/workflow` is itself the user's launch intent. Journal a one-run, digest-bound
+            // approval and start immediately; child tools still cross their normal authorization
+            // boundary independently.
+            try await startPreparedDynamic(
+                workflowID: workflowID,
+                requiresApproval: candidate.launch.requiresApproval
+            )
+        } catch {
+            try? await refreshDynamicSummary(workflowID: workflowID)
             throw error
         }
     }
@@ -171,13 +176,35 @@ final class WorkflowLauncher {
         for id in ids { try? await refreshDynamicSummary(workflowID: id) }
     }
 
-    func approveDynamic(
+    func runDynamic(workflowID: UUID) async throws {
+        guard let state = container?.workflowStore.summary(workflowID: workflowID)?.dynamic?.state else {
+            throw WorkflowLaunchError.snapshotUnavailable("dynamic workflow state is missing")
+        }
+        switch state {
+        case .waitingForLaunchApproval:
+            try await startPreparedDynamic(workflowID: workflowID, requiresApproval: true)
+        case .queued:
+            try await startPreparedDynamic(workflowID: workflowID, requiresApproval: false)
+        default:
+            throw WorkflowLaunchError.planGenerationFailed(
+                "workflow is not ready to run from state \(state.rawValue)"
+            )
+        }
+    }
+
+    private func startPreparedDynamic(
         workflowID: UUID,
-        reuseScope: WorkflowLaunchApprovalReuseScopeV1?
+        requiresApproval: Bool
     ) async throws {
         let runID = try dynamicRunID(workflowID)
-        _ = try await assembly.dynamicWorkflows.approve(runID: runID, reuseScope: reuseScope)
+        if requiresApproval {
+            _ = try await assembly.dynamicWorkflows.approveAndStart(runID: runID, reuseScope: nil)
+        } else {
+            try await assembly.dynamicWorkflows.start(runID: runID)
+        }
         try await refreshDynamicSummary(workflowID: workflowID)
+        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
+        monitorDynamic(workflowID: workflowID)
     }
 
     func denyDynamic(workflowID: UUID) async throws {
@@ -189,8 +216,8 @@ final class WorkflowLauncher {
     func startDynamic(workflowID: UUID) async throws {
         let runID = try dynamicRunID(workflowID)
         try await assembly.dynamicWorkflows.start(runID: runID)
-        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         try await refreshDynamicSummary(workflowID: workflowID)
+        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         monitorDynamic(workflowID: workflowID)
     }
 
@@ -201,8 +228,8 @@ final class WorkflowLauncher {
 
     func resumeDynamic(workflowID: UUID) async throws {
         try await assembly.dynamicWorkflows.resume(runID: try dynamicRunID(workflowID))
-        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         try await refreshDynamicSummary(workflowID: workflowID)
+        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         monitorDynamic(workflowID: workflowID)
     }
 
@@ -219,8 +246,8 @@ final class WorkflowLauncher {
             callID: callID,
             decision: decision
         )
-        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         try await refreshDynamicSummary(workflowID: workflowID)
+        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         monitorDynamic(workflowID: workflowID)
     }
 
@@ -237,8 +264,8 @@ final class WorkflowLauncher {
             runID: try dynamicRunID(workflowID),
             callID: callID
         )
-        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         try await refreshDynamicSummary(workflowID: workflowID)
+        container?.workflowStore.markDynamicExecutionAttached(workflowID: workflowID)
         monitorDynamic(workflowID: workflowID)
     }
 

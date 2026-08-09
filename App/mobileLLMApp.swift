@@ -11,7 +11,7 @@ import AgentRuntime
 
 #if DEBUG
 /// Deterministic Responses API transport used only by the opt-in simulator UI test. It exercises
-/// the production provider parser, durable executor, analyzer, approval UI, and workflow engine
+/// the production provider parser, durable executor, analyzer, automatic one-run approval, and engine
 /// without making release-gating UI behavior depend on a live model's latency or output quality.
 private final class DynamicWorkflowUITestResponsesProtocol: URLProtocol, @unchecked Sendable {
     private static let environmentKey = "MOBILELLM_DYNAMIC_WORKFLOW_RESPONSES_FIXTURE"
@@ -36,7 +36,7 @@ private final class DynamicWorkflowUITestResponsesProtocol: URLProtocol, @unchec
             text = """
             export const meta = {
               name: "simulator-workflow",
-              description: "Exercises candidate approval and explicit start.",
+              description: "Exercises validated automatic workflow start.",
               whenToUse: "Simulator UI verification",
               phases: [{ title: "Delegate", detail: "Run one bounded child task." }]
             };
@@ -518,8 +518,8 @@ struct MobileLLMApp: App {
                 container.workflowStore.resumeHandler = { [launcher] workflowID in
                     try await launcher.resume(workflowID: workflowID)
                 }
-                container.workflowStore.dynamicApproveHandler = { [launcher] workflowID, scope in
-                    try await launcher.approveDynamic(workflowID: workflowID, reuseScope: scope)
+                container.workflowStore.dynamicRunHandler = { [launcher] workflowID in
+                    try await launcher.runDynamic(workflowID: workflowID)
                 }
                 container.workflowStore.dynamicDenyHandler = { [launcher] workflowID in
                     try await launcher.denyDynamic(workflowID: workflowID)

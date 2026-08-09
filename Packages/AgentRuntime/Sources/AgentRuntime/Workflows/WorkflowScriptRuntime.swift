@@ -3,6 +3,14 @@
 import AgentContracts
 import Foundation
 
+/// One shared option vocabulary for static analysis and the runtime bridge. Keeping this list in
+/// one place prevents a candidate from passing inspection and failing only after execution starts.
+enum WorkflowAgentOptionContract {
+    static let allowedKeys: Set<String> = [
+        "label", "phase", "schema", "model", "agentType", "isolation", "stallMs",
+    ]
+}
+
 public enum WorkflowAgentBridgeResult: Hashable, Sendable {
     case value(JSONValue)
     case unavailable(String)

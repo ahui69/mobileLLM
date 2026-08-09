@@ -107,7 +107,7 @@ struct WorkflowMessageRow: View {
 }
 
 /// The unified workflow page (spec §20/§34): legacy staged records retain their phase tree while
-/// Dynamic Workflows expose the inert candidate, exact source, runtime activity, and controls.
+/// Dynamic Workflows expose the exact source, runtime activity, and durable run controls.
 struct WorkflowSummaryPage: View {
     let store: WorkflowStore?
     let conversationID: UUID?
@@ -330,23 +330,16 @@ struct WorkflowSummaryPage: View {
         switch state {
         case .waitingForLaunchApproval:
             HStack {
-                Button("Once") {
-                    Task { await store?.approveDynamic(workflowID: workflowID, reuseScope: nil) }
+                Button("Run workflow", systemImage: "play.fill") {
+                    Task { await store?.runDynamic(workflowID: workflowID) }
                 }
-                Button("Always") {
-                    Task {
-                        await store?.approveDynamic(
-                            workflowID: workflowID,
-                            reuseScope: .conversation
-                        )
-                    }
-                }
-                Button("Deny", role: .destructive) {
+                .buttonStyle(.borderedProminent)
+                Button("Cancel", role: .destructive) {
                     Task { await store?.denyDynamic(workflowID: workflowID) }
                 }
             }
             .disabled(busy)
-            .accessibilityIdentifier("workflow.approval")
+            .accessibilityIdentifier("workflow.run")
         case .queued:
             Button("Start", systemImage: "play.fill") {
                 Task { await store?.startDynamic(workflowID: workflowID) }
@@ -551,7 +544,7 @@ private extension DynamicWorkflowPresentationState {
     func displayLabel(attached: Bool) -> String {
         switch self {
         case .generatingCandidate: "Generating candidate"
-        case .waitingForLaunchApproval: "Waiting for approval"
+        case .waitingForLaunchApproval: "Ready to run"
         case .queued: "Approved — ready to start"
         case .running: attached ? "Running" : "Interrupted — Resume to continue"
         case .pausing: "Pausing"

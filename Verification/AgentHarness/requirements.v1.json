@@ -4,8 +4,8 @@
   "documentID": "AH-REQUIREMENTS-V1",
   "sourceSpecification": {
     "path": "spec.md",
-    "sha256": "f27d837f0e59535d1dde91d93fbb35ad9250c3c9a3242812664edecded724158",
-    "capturedAtUTC": "2026-08-09T11:32:21Z"
+    "sha256": "3a3dcd141e905d3759418be844938e466e0910ea15dde3a100889402b6eade69",
+    "capturedAtUTC": "2026-08-09T12:37:37Z"
   },
   "requirements": [
     {
@@ -1748,8 +1748,8 @@
         {
           "section": "34.5",
           "heading": "Parallel subagent, authority, and lifecycle contract",
-          "lineStart": 1771,
-          "lineEnd": 1786
+          "lineStart": 1772,
+          "lineEnd": 1787
         }
       ],
       "platforms": [
@@ -1832,7 +1832,7 @@
       "id": "AH-DYNAMIC-001",
       "area": "subagents-workflows",
       "title": "Claude-style Dynamic Workflows runtime is durable and fail-closed",
-      "statement": "The harness implements content-addressed JavaScript workflow scripts, a fail-closed analyzer and replaceable runtime provider, explicit digest-bound launch approval, durable hash-chained event sourcing, bounded agent-dispatch scheduling, exact contiguous-prefix recovery, saved immutable versions, one-level nested workflows, strict authority and budget attenuation, reconciliation, and staged-workflow compatibility without granting scripts direct effect authority.",
+      "statement": "The harness implements content-addressed JavaScript workflow scripts, a fail-closed analyzer and replaceable runtime provider, explicit-command-derived digest-bound one-run launch approval, durable hash-chained event sourcing, bounded agent-dispatch scheduling, exact contiguous-prefix recovery, saved immutable versions, one-level nested workflows, strict authority and budget attenuation, reconciliation, and staged-workflow compatibility without granting scripts direct effect authority.",
       "status": "active",
       "riskTier": "P0",
       "specAnchors": [
@@ -1840,7 +1840,7 @@
           "section": "34",
           "heading": "P0 full Dynamic Workflows program",
           "lineStart": 1639,
-          "lineEnd": 1811
+          "lineEnd": 1812
         }
       ],
       "platforms": [

@@ -139,7 +139,7 @@ final class WorkflowStoreTests: XCTestCase {
         XCTAssertFalse(reloaded.executingWorkflowIDs.contains(workflowID))
     }
 
-    func testDynamicApprovalAndStartAreSeparateExplicitActions() async throws {
+    func testDynamicRunUsesOneRecoveryActionWithoutReusableApprovalChoice() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("workflow-dynamic-actions-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -153,23 +153,15 @@ final class WorkflowStoreTests: XCTestCase {
                 state: .waitingForLaunchApproval
             )
         ))
-        var approvals: [WorkflowLaunchApprovalReuseScopeV1?] = []
-        var startCount = 0
-        store.dynamicApproveHandler = { id, scope in
+        var runCount = 0
+        store.dynamicRunHandler = { id in
             XCTAssertEqual(id, workflowID)
-            approvals.append(scope)
-        }
-        store.dynamicStartHandler = { id in
-            XCTAssertEqual(id, workflowID)
-            startCount += 1
+            runCount += 1
         }
 
-        await store.approveDynamic(workflowID: workflowID, reuseScope: .conversation)
-        XCTAssertEqual(approvals, [.conversation])
-        XCTAssertEqual(startCount, 0, "approval must not implicitly execute the workflow")
-
-        await store.startDynamic(workflowID: workflowID)
-        XCTAssertEqual(startCount, 1)
+        await store.runDynamic(workflowID: workflowID)
+        XCTAssertEqual(runCount, 1)
+        XCTAssertTrue(store.actioningWorkflowIDs.isEmpty)
     }
 
     func testDynamicReconciliationForwardsExactDecisionWithoutGenericResume() async throws {

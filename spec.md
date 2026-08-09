@@ -1694,8 +1694,9 @@ The injected V1 surface is deliberately small:
 - a saved-workflow call primitive may be enabled only with one-level nesting and a registry-pinned script digest. It
   shares the root run's hard agent/concurrency/token ceilings and cannot widen permissions.
 
-`agent` options cover a display label, explicit phase, structured-output JSON Schema, model/agent-role routing, and a
-sandbox requirement. Unknown options fail before dispatch. Model substitution is policy-owned and observable. Schema
+`agent` options are a direct object literal whose only V1 keys are `label`, `phase`, `schema`, `model`, `agentType`,
+`isolation`, and `stallMs`. Unknown, computed, shorthand, duplicate, or indirect options fail static analysis before
+launch or dispatch. Model substitution is policy-owned and observable. Schema
 validation is host-side and receives at most two bounded corrective turns before the call settles to `null`; structural
 budget, cancellation, and policy failures remain fatal and are never converted to ordinary data.
 
@@ -1710,15 +1711,15 @@ workflow runs so recovery is unambiguous.
 ID, an exact conversation/personal owner, and append-only versions; every run pins one exact source digest, every direct
 saved-workflow dependency, immutable args, the initiating conversation's
 frozen policy/tool/model snapshot, the runtime ABI version, and all effective hard limits. A model-synthesized script is
-only a candidate: the host statically analyzes it, extracts metadata, shows phases and raw source, and requires the
-app's Once / Always / Deny launch decision before execution. Approval of the script never pre-approves its agents'
-external operations. “Always” is digest- and scope-bound and is invalidated by any change to source, owner-visible
-dependency pins, capabilities, budget, tool/policy/model snapshot, runtime requirement, limits, or approval mode.
+only a candidate: the host statically analyzes it, extracts metadata, and shows phases and raw source. The user's
+explicit `/workflow` command is converted into a non-reusable, digest-bound approval for that exact candidate and the
+app starts it immediately; it does not expose redundant Once / Always / Deny launch choices. A crash-recovered candidate
+that never reached launch remains inert until Run or Cancel. Script approval never pre-approves agents' external operations.
 
 If the first generated candidate alone fails static analysis, the app may request exactly one size-bounded repair from
 the same frozen model/policy context. The rejected source is quoted as untrusted data, the replacement crosses the
-entire analyzer and immutable preview/approval boundary again, and a second rejection ends candidate preparation.
-Repair never executes either source, never bypasses launch approval, and never widens authority or budgets.
+entire analyzer and immutable digest-bound launch boundary again, and a second rejection ends candidate preparation.
+Repair never executes either source, never manufactures approval, and never widens authority or budgets.
 
 ### 34.3 Runtime isolation and replaceable sandbox provider
 
@@ -1735,8 +1736,8 @@ supported loops with cooperative checkpoints, applies source/value/log/phase/ste
 outstanding child when evaluation settles. Scripts that cannot be safely analyzed or instrumented are rejected.
 
 JavaScriptCore on iOS exposes no public hard heap limit or reliable pre-emptive interruption for hostile synchronous or
-microtask code. Therefore the open-source provider is gated by explicit script launch approval and conservative static
-rejection. The provider seam must permit the future industrial Agent Sandbox Runtime to supply a truly isolated worker,
+microtask code. Therefore the open-source provider is gated by a journaled digest-bound approval (derived for one run
+from the explicit `/workflow` command) and conservative static rejection. The provider seam must permit the future industrial Agent Sandbox Runtime to supply a truly isolated worker,
 hard memory/CPU termination, checkpoint/restore, and richer execution without changing `WorkflowScriptV1`, journals,
 run controls, UI projections, or the subagent protocol.
 

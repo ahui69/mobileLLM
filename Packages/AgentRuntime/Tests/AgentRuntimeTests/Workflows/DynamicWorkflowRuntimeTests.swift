@@ -182,11 +182,17 @@ final class DynamicWorkflowRuntimeTests: XCTestCase {
         XCTAssertEqual(options.stallMilliseconds, 50)
         XCTAssertNotNil(options.schema)
 
-        let invalid = try analyze(wrapped("return await agent('bad', { scema: {} });"))
-        await XCTAssertThrowsErrorAsync {
-            _ = try await JavaScriptCoreWorkflowRuntime().execute(
-                invalid, args: nil, limits: try self.limits(), requirement: .init(), host: host
-            )
+        for invalid in [
+            "return await agent('bad', { scema: {} });",
+            "return await agent('bad', { tools: ['web'] });",
+            "const options = { label: 'hidden' }; return await agent('bad', options);",
+            "return await agent('bad', { ['label']: 'hidden' });",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(invalid))) { error in
+                guard case WorkflowScriptAnalysisError.unsupportedConstruct = error else {
+                    return XCTFail("Expected agent option rejection, got \(error)")
+                }
+            }
         }
         let finalSnapshot = await recorder.snapshot()
         XCTAssertEqual(finalSnapshot.prompts, ["structured"])
