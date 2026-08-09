@@ -1,0 +1,707 @@
+// SPDX-License-Identifier: MIT
+
+import AgentContracts
+import Foundation
+
+public enum WorkflowScriptAnalysisError: Error, Hashable, Sendable, CustomStringConvertible {
+    case missingMetadata
+    case malformedMetadata(String)
+    case invalidSyntax(String)
+    case forbiddenCapability(String)
+    case unsupportedConstruct(String)
+    case unsafeLoop(String)
+    case sourceLimitExceeded
+
+    public var description: String {
+        switch self {
+        case .missingMetadata: "The workflow must start with a pure-literal export const meta declaration."
+        case .malformedMetadata(let detail): "Invalid workflow metadata: \(detail)"
+        case .invalidSyntax(let detail): "Invalid workflow JavaScript: \(detail)"
+        case .forbiddenCapability(let name): "Workflow scripts cannot access \(name)."
+        case .unsupportedConstruct(let name): "Workflow construct is not supported safely: \(name)."
+        case .unsafeLoop(let detail): "Workflow loop cannot be checkpointed safely: \(detail)"
+        case .sourceLimitExceeded: "Workflow source exceeds its hard limit."
+        }
+    }
+}
+
+/// Trusted analysis result. Only this value may enter a script runtime provider.
+public struct AnalyzedWorkflowScriptV1: Hashable, Sendable {
+    public let script: WorkflowScriptV1
+    public let metadata: WorkflowScriptMetadataV1
+    public let executableSource: String
+    public let instrumentedSource: String
+    public let analysisDigest: StableDigest
+    public let staticAgentCallSites: UInt32
+    public let checkpointSites: UInt32
+    public let savedWorkflowNames: [String]
+
+    fileprivate init(
+        script: WorkflowScriptV1,
+        metadata: WorkflowScriptMetadataV1,
+        executableSource: String,
+        instrumentedSource: String,
+        staticAgentCallSites: UInt32,
+        checkpointSites: UInt32,
+        savedWorkflowNames: [String]
+    ) {
+        self.script = script
+        self.metadata = metadata
+        self.executableSource = executableSource
+        self.instrumentedSource = instrumentedSource
+        self.staticAgentCallSites = staticAgentCallSites
+        self.checkpointSites = checkpointSites
+        self.savedWorkflowNames = savedWorkflowNames
+        analysisDigest = StableDigest.fingerprint(
+            domain: "dynamic-workflow-analysis.v1",
+            components: [
+                Data(script.sourceDigest.rawValue.utf8),
+                Data(instrumentedSource.utf8),
+                Data(String(staticAgentCallSites).utf8),
+                Data(String(checkpointSites).utf8),
+                Data(savedWorkflowNames.joined(separator: "\u{1f}").utf8),
+            ]
+        )
+    }
+}
+
+/// Conservative source analyzer for the orchestration-only JavaScript subset.
+public struct DynamicWorkflowScriptAnalyzer: Sendable {
+    public init() {}
+
+    public func analyze(_ script: WorkflowScriptV1) throws -> AnalyzedWorkflowScriptV1 {
+        guard script.source.lengthOfBytes(using: .utf8) <= WorkflowScriptV1.maximumSourceBytes else {
+            throw WorkflowScriptAnalysisError.sourceLimitExceeded
+        }
+        let extraction = try MetadataExtractor(source: script.source).extract()
+        let body = extraction.body
+        var lexer = JavaScriptLexer(source: body)
+        let tokens = try lexer.tokens()
+        try Self.rejectForbiddenCapabilities(tokens)
+        let savedWorkflowNames = try Self.savedWorkflowNames(in: tokens)
+        let instrumentation = try Self.instrument(source: body, tokens: tokens)
+        let callSites = tokens.reduce(into: UInt32(0)) { count, token in
+            if token.identifier == "agent" { count &+= UInt32(1) }
+        }
+        return AnalyzedWorkflowScriptV1(
+            script: script,
+            metadata: extraction.metadata,
+            executableSource: body,
+            instrumentedSource: instrumentation.source,
+            staticAgentCallSites: callSites,
+            checkpointSites: UInt32(instrumentation.insertions.count),
+            savedWorkflowNames: savedWorkflowNames
+        )
+    }
+
+    private static func savedWorkflowNames(in tokens: [JSToken]) throws -> [String] {
+        var names: [String] = []
+        for index in tokens.indices where tokens[index].identifier == "workflow" {
+            guard index + 2 < tokens.count,
+                  tokens[index + 1].symbol == "(",
+                  let name = tokens[index + 2].stringValue,
+                  !name.isEmpty
+            else {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "saved workflow names must be direct string literals"
+                )
+            }
+            if !names.contains(name) { names.append(name) }
+        }
+        return names.sorted()
+    }
+
+    private static let forbiddenIdentifiers: Set<String> = [
+        "import", "require", "eval", "Function", "AsyncFunction", "GeneratorFunction",
+        "WebAssembly", "RegExp", "fetch", "XMLHttpRequest", "process", "Deno", "Bun", "globalThis",
+        "window", "document", "navigator", "location", "Worker", "SharedWorker", "Atomics",
+        "SharedArrayBuffer", "ArrayBuffer", "setTimeout", "setInterval", "setImmediate",
+        "queueMicrotask", "Date", "Temporal", "performance", "crypto", "Reflect", "Proxy",
+        "constructor", "prototype", "__proto__", "BigInt", "Symbol", "WeakRef", "FinalizationRegistry",
+        "class", "debugger", "with", "yield", "this", "get", "set",
+    ]
+
+    /// JavaScriptCore cannot preempt one native builtin. These operations can amplify a small,
+    /// analyzed program into unbounded CPU or memory work before the cooperative watchdog gets a
+    /// checkpoint. The logical-realm provider therefore rejects them rather than pretending its
+    /// wall-clock limit is a hard CPU limit.
+    private static let forbiddenSynchronousBuiltins: Set<String> = [
+        "repeat", "padStart", "padEnd",
+        "fill", "join", "concat", "flat", "flatMap", "copyWithin",
+        "stringify", "parse", "toJSON",
+        "exec", "test", "match", "matchAll", "search", "replace", "replaceAll", "split",
+    ]
+
+    private static func rejectForbiddenCapabilities(_ tokens: [JSToken]) throws {
+        let protectedIntrinsics: Set<String> = [
+            "Object", "Array", "Promise", "Map", "JSON", "Math",
+        ]
+        for (index, token) in tokens.enumerated() {
+            if case .regex = token.kind {
+                throw WorkflowScriptAnalysisError.forbiddenCapability("regular expressions")
+            }
+            if token.symbol == "\\" {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct("escaped identifier")
+            }
+            if let template = token.templateValue, template.contains("${") {
+                let start = template.range(of: "${")!.lowerBound
+                let end = template.index(before: template.endIndex)
+                let expressionTail = String(template[start ..< end])
+                guard !expressionTail.contains("\\") else {
+                    throw WorkflowScriptAnalysisError.unsupportedConstruct("template escape")
+                }
+                var embeddedLexer = JavaScriptLexer(source: expressionTail)
+                let embedded = try embeddedLexer.tokens().filter { $0.templateValue == nil }
+                for embeddedToken in embedded {
+                    if case .regex = embeddedToken.kind {
+                        throw WorkflowScriptAnalysisError.forbiddenCapability("regular expressions")
+                    }
+                    if let identifier = embeddedToken.identifier,
+                       forbiddenIdentifiers.contains(identifier)
+                            || forbiddenSynchronousBuiltins.contains(identifier)
+                            || identifier.hasPrefix("__")
+                            || identifier.hasPrefix("__mllm")
+                            || identifier.hasPrefix("__workflow")
+                            || identifier.hasPrefix("__mobileLLM")
+                    {
+                        throw WorkflowScriptAnalysisError.forbiddenCapability(identifier)
+                    }
+                    if let string = embeddedToken.stringValue,
+                       ["constructor", "prototype", "__proto__"].contains(string)
+                            || forbiddenSynchronousBuiltins.contains(string)
+                    {
+                        throw WorkflowScriptAnalysisError.forbiddenCapability(string)
+                    }
+                }
+                if embedded.contains(where: {
+                    ["for", "while", "do", "function"].contains($0.identifier ?? "")
+                        || $0.symbol == "=>"
+                }) {
+                    throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                        "control flow inside template expression"
+                    )
+                }
+            }
+            if let string = token.stringValue,
+               ["constructor", "prototype", "__proto__"].contains(string)
+                    || forbiddenSynchronousBuiltins.contains(string)
+            {
+                throw WorkflowScriptAnalysisError.forbiddenCapability(string)
+            }
+            guard let identifier = token.identifier else { continue }
+            if identifier.hasPrefix("__") {
+                throw WorkflowScriptAnalysisError.forbiddenCapability("reserved runtime binding")
+            }
+            if forbiddenSynchronousBuiltins.contains(identifier) {
+                throw WorkflowScriptAnalysisError.forbiddenCapability(identifier)
+            }
+            if identifier == "Array", index + 1 < tokens.count,
+               tokens[index + 1].symbol == "("
+            {
+                throw WorkflowScriptAnalysisError.forbiddenCapability("Array constructor")
+            }
+            if index + 2 < tokens.count, tokens[index + 1].symbol == ".",
+               let member = tokens[index + 2].identifier
+            {
+                let unsafe: Set<String>
+                switch identifier {
+                case "Array": unsafe = ["from"]
+                case "Object": unsafe = ["assign", "fromEntries"]
+                case "String": unsafe = ["raw", "fromCharCode", "fromCodePoint"]
+                default: unsafe = []
+                }
+                if unsafe.contains(member) {
+                    throw WorkflowScriptAnalysisError.forbiddenCapability("\(identifier).\(member)")
+                }
+            }
+            if protectedIntrinsics.contains(identifier), index + 1 < tokens.count,
+               tokens[index + 1].symbol == "["
+            {
+                throw WorkflowScriptAnalysisError.forbiddenCapability(
+                    "computed intrinsic property access"
+                )
+            }
+            if identifier.hasPrefix("__mllm") || identifier.hasPrefix("__workflow")
+                || identifier.hasPrefix("__mobileLLM")
+            {
+                throw WorkflowScriptAnalysisError.forbiddenCapability("reserved runtime binding")
+            }
+            if forbiddenIdentifiers.contains(identifier) {
+                throw WorkflowScriptAnalysisError.forbiddenCapability(identifier)
+            }
+            if identifier == "random",
+               index > 1,
+               tokens[index - 1].symbol == ".",
+               tokens[index - 2].identifier == "Math"
+            {
+                throw WorkflowScriptAnalysisError.forbiddenCapability("Math.random")
+            }
+        }
+    }
+
+    private struct Instrumentation {
+        let source: String
+        let insertions: Set<Int>
+    }
+
+    private static func instrument(source: String, tokens: [JSToken]) throws -> Instrumentation {
+        var insertions: Set<Int> = [0]
+        var index = 0
+        while index < tokens.count {
+            let token = tokens[index]
+            if token.identifier == "for" || token.identifier == "while" {
+                guard let open = tokens.indices.dropFirst(index + 1).first(where: {
+                    tokens[$0].symbol == "("
+                }), let close = matchingClose(in: tokens, openingAt: open, open: "(", close: ")")
+                else { throw WorkflowScriptAnalysisError.invalidSyntax("unbalanced \(token.identifier!) condition") }
+                let after = close + 1
+                if after >= tokens.count || tokens[after].symbol != "{" {
+                    // `do { ... } while (...)` is already checkpointed at its `do` body.
+                    if token.identifier == "while", index > 0, tokens[index - 1].symbol == "}" {
+                        index = close + 1
+                        continue
+                    }
+                    throw WorkflowScriptAnalysisError.unsafeLoop("\(token.identifier!) requires a braced body")
+                }
+                insertions.insert(tokens[after].end)
+                index = after + 1
+                continue
+            }
+            if token.identifier == "do" {
+                guard index + 1 < tokens.count, tokens[index + 1].symbol == "{" else {
+                    throw WorkflowScriptAnalysisError.unsafeLoop("do requires a braced body")
+                }
+                insertions.insert(tokens[index + 1].end)
+            } else if token.identifier == "function" {
+                guard let brace = tokens.indices.dropFirst(index + 1).first(where: {
+                    tokens[$0].symbol == "{" || tokens[$0].symbol == ";"
+                }), tokens[brace].symbol == "{"
+                else { throw WorkflowScriptAnalysisError.invalidSyntax("function body") }
+                insertions.insert(tokens[brace].end)
+            } else if token.symbol == "=>", index + 1 < tokens.count,
+                      tokens[index + 1].symbol == "{"
+            {
+                insertions.insert(tokens[index + 1].end)
+            }
+            index += 1
+        }
+
+        let scalars = Array(source.unicodeScalars)
+        var result = ""
+        result.reserveCapacity(source.utf8.count + insertions.count * 34)
+        for position in 0 ... scalars.count {
+            if insertions.contains(position) {
+                result += "\n__workflowCheckpoint();\n"
+            }
+            if position < scalars.count { result.unicodeScalars.append(scalars[position]) }
+        }
+        return Instrumentation(source: result, insertions: insertions)
+    }
+
+    private static func matchingClose(
+        in tokens: [JSToken], openingAt start: Int, open: String, close: String
+    ) -> Int? {
+        var depth = 0
+        for index in start ..< tokens.count {
+            if tokens[index].symbol == open { depth += 1 }
+            if tokens[index].symbol == close {
+                depth -= 1
+                if depth == 0 { return index }
+            }
+        }
+        return nil
+    }
+}
+
+// MARK: - Metadata extraction
+
+private struct MetadataExtraction {
+    let metadata: WorkflowScriptMetadataV1
+    let body: String
+}
+
+private struct MetadataExtractor {
+    let source: String
+
+    func extract() throws -> MetadataExtraction {
+        var lexer = JavaScriptLexer(source: source)
+        let tokens = try lexer.tokens()
+        guard tokens.count >= 5,
+              tokens[0].identifier == "export",
+              tokens[1].identifier == "const",
+              tokens[2].identifier == "meta",
+              tokens[3].symbol == "=",
+              tokens[4].symbol == "{"
+        else { throw WorkflowScriptAnalysisError.missingMetadata }
+
+        var parser = LiteralParser(tokens: tokens, index: 4)
+        let value = try parser.parseValue(depth: 0)
+        guard case .object(let object) = value else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("meta must be an object")
+        }
+        var end = parser.index
+        let hadSemicolon = end < tokens.count && tokens[end].symbol == ";"
+        if hadSemicolon { end += 1 }
+        if end < tokens.count,
+           tokens[end].line == tokens[parser.index - 1].line,
+           !hadSemicolon
+        {
+            throw WorkflowScriptAnalysisError.malformedMetadata("meta must end its first statement")
+        }
+        let allowed = Set(["name", "description", "whenToUse", "phases"])
+        guard Set(object.keys).isSubset(of: allowed) else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("unknown metadata field")
+        }
+        guard let rawName = object["name"], case .string(let name) = rawName,
+              let rawDescription = object["description"],
+              case .string(let description) = rawDescription
+        else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("name and description are required strings")
+        }
+        let whenToUse: String?
+        switch object["whenToUse"] {
+        case nil: whenToUse = nil
+        case .string(let value): whenToUse = value
+        default: throw WorkflowScriptAnalysisError.malformedMetadata("whenToUse must be a string")
+        }
+        var phases: [WorkflowPhaseMetadataV1] = []
+        if let rawPhases = object["phases"] {
+            guard case .array(let values) = rawPhases else {
+                throw WorkflowScriptAnalysisError.malformedMetadata("phases must be an array")
+            }
+            phases = try values.map { value in
+                guard case .object(let phase) = value,
+                      Set(phase.keys).isSubset(of: ["title", "detail", "model"]),
+                      case .string(let title)? = phase["title"]
+                else { throw WorkflowScriptAnalysisError.malformedMetadata("invalid phase entry") }
+                let detail = try optionalString(phase["detail"], field: "phase.detail")
+                let model = try optionalString(phase["model"], field: "phase.model")
+                return try WorkflowPhaseMetadataV1(
+                    title: title,
+                    detail: detail,
+                    requestedModel: model
+                )
+            }
+        }
+        let metadata: WorkflowScriptMetadataV1
+        do {
+            metadata = try WorkflowScriptMetadataV1(
+                name: name,
+                description: description,
+                whenToUse: whenToUse,
+                phases: phases
+            )
+        } catch {
+            throw WorkflowScriptAnalysisError.malformedMetadata(String(describing: error))
+        }
+
+        let scalars = Array(source.unicodeScalars)
+        let bodyStart = end < tokens.count ? tokens[end].start : scalars.count
+        let prefix = String(String.UnicodeScalarView(scalars[0 ..< tokens[0].start]))
+        let suffix = String(String.UnicodeScalarView(scalars[bodyStart ..< scalars.count]))
+        return MetadataExtraction(metadata: metadata, body: prefix + suffix)
+    }
+
+    private func optionalString(_ value: JSONValue?, field: String) throws -> String? {
+        switch value {
+        case nil: nil
+        case .string(let string): string
+        default: throw WorkflowScriptAnalysisError.malformedMetadata("\(field) must be a string")
+        }
+    }
+}
+
+private struct LiteralParser {
+    let tokens: [JSToken]
+    var index: Int
+    var nodes = 0
+
+    mutating func parseValue(depth: Int) throws -> JSONValue {
+        guard depth <= 16, index < tokens.count else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("literal nesting limit")
+        }
+        nodes += 1
+        guard nodes <= 1_024 else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("literal node limit")
+        }
+        let token = tokens[index]
+        if let string = token.stringValue { index += 1; return .string(string) }
+        if token.identifier == "true" { index += 1; return .bool(true) }
+        if token.identifier == "false" { index += 1; return .bool(false) }
+        if token.identifier == "null" { index += 1; return .null }
+        if token.symbol == "[" { return try parseArray(depth: depth + 1) }
+        if token.symbol == "{" { return try parseObject(depth: depth + 1) }
+        throw WorkflowScriptAnalysisError.malformedMetadata("values must be pure JSON-like literals")
+    }
+
+    private mutating func parseArray(depth: Int) throws -> JSONValue {
+        index += 1
+        var values: [JSONValue] = []
+        while index < tokens.count, tokens[index].symbol != "]" {
+            values.append(try parseValue(depth: depth))
+            if index < tokens.count, tokens[index].symbol == "," {
+                index += 1
+                continue
+            }
+            guard index < tokens.count, tokens[index].symbol == "]" else {
+                throw WorkflowScriptAnalysisError.malformedMetadata("array separator")
+            }
+        }
+        guard index < tokens.count else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("unterminated array")
+        }
+        index += 1
+        return .array(values)
+    }
+
+    private mutating func parseObject(depth: Int) throws -> JSONValue {
+        index += 1
+        var object: [String: JSONValue] = [:]
+        while index < tokens.count, tokens[index].symbol != "}" {
+            let key: String
+            if let identifier = tokens[index].identifier { key = identifier }
+            else if let string = tokens[index].stringValue { key = string }
+            else { throw WorkflowScriptAnalysisError.malformedMetadata("object key") }
+            guard key != "__proto__", key != "constructor", key != "prototype",
+                  object[key] == nil
+            else { throw WorkflowScriptAnalysisError.malformedMetadata("unsafe or duplicate object key") }
+            index += 1
+            guard index < tokens.count, tokens[index].symbol == ":" else {
+                throw WorkflowScriptAnalysisError.malformedMetadata("object colon")
+            }
+            index += 1
+            object[key] = try parseValue(depth: depth)
+            if index < tokens.count, tokens[index].symbol == "," {
+                index += 1
+                continue
+            }
+            guard index < tokens.count, tokens[index].symbol == "}" else {
+                throw WorkflowScriptAnalysisError.malformedMetadata("object separator")
+            }
+        }
+        guard index < tokens.count else {
+            throw WorkflowScriptAnalysisError.malformedMetadata("unterminated object")
+        }
+        index += 1
+        return .object(object)
+    }
+}
+
+// MARK: - Conservative lexer
+
+private struct JSToken: Hashable {
+    enum Kind: Hashable {
+        case identifier(String)
+        case string(String)
+        case symbol(String)
+        case number(String)
+        case template(String)
+        case regex
+    }
+
+    let kind: Kind
+    let start: Int
+    let end: Int
+    let line: Int
+
+    var identifier: String? { if case .identifier(let value) = kind { value } else { nil } }
+    var stringValue: String? { if case .string(let value) = kind { value } else { nil } }
+    var symbol: String? { if case .symbol(let value) = kind { value } else { nil } }
+    var templateValue: String? { if case .template(let value) = kind { value } else { nil } }
+}
+
+private struct JavaScriptLexer {
+    let scalars: [UnicodeScalar]
+    var index = 0
+    var line = 1
+    var result: [JSToken] = []
+
+    init(source: String) { scalars = Array(source.unicodeScalars) }
+
+    mutating func tokens() throws -> [JSToken] {
+        while index < scalars.count {
+            if isWhitespace(scalars[index]) { consumeWhitespace(); continue }
+            if peek("//") { consumeLineComment(); continue }
+            if peek("/*") { try consumeBlockComment(); continue }
+            let start = index
+            let tokenLine = line
+            let scalar = scalars[index]
+            if scalar == "\"" || scalar == "'" {
+                result.append(JSToken(
+                    kind: .string(try consumeString(quote: scalar)),
+                    start: start,
+                    end: index,
+                    line: tokenLine
+                ))
+                continue
+            }
+            if scalar == "`" {
+                try consumeTemplate()
+                let value = String(String.UnicodeScalarView(scalars[start ..< index]))
+                result.append(JSToken(kind: .template(value), start: start, end: index, line: tokenLine))
+                continue
+            }
+            if isIdentifierStart(scalar) {
+                index += 1
+                while index < scalars.count, isIdentifierContinue(scalars[index]) { index += 1 }
+                let value = String(String.UnicodeScalarView(scalars[start ..< index]))
+                result.append(JSToken(kind: .identifier(value), start: start, end: index, line: tokenLine))
+                continue
+            }
+            if isDigit(scalar) {
+                index += 1
+                while index < scalars.count,
+                      isDigit(scalars[index]) || [".", "e", "E", "+", "-"].contains(String(scalars[index]))
+                { index += 1 }
+                let value = String(String.UnicodeScalarView(scalars[start ..< index]))
+                result.append(JSToken(kind: .number(value), start: start, end: index, line: tokenLine))
+                continue
+            }
+            if scalar == "/", isRegexStart() {
+                try consumeRegex()
+                result.append(JSToken(kind: .regex, start: start, end: index, line: tokenLine))
+                continue
+            }
+            let two = index + 1 < scalars.count
+                ? String(String.UnicodeScalarView(scalars[index ... index + 1])) : ""
+            let three = index + 2 < scalars.count
+                ? String(String.UnicodeScalarView(scalars[index ... index + 2])) : ""
+            let multi = ["===", "!==", ">>>", "**=", "&&=", "||=", "??="].contains(three)
+                ? three
+                : (["=>", "==", "!=", "<=", ">=", "++", "--", "&&", "||", "??", "?.",
+                    "+=", "-=", "*=", "/=", "%=", "**", "<<", ">>"].contains(two) ? two : nil)
+            if let multi { index += multi.unicodeScalars.count }
+            else { index += 1 }
+            result.append(JSToken(
+                kind: .symbol(multi ?? String(scalar)),
+                start: start,
+                end: index,
+                line: tokenLine
+            ))
+        }
+        return result
+    }
+
+    private mutating func consumeWhitespace() {
+        while index < scalars.count, isWhitespace(scalars[index]) {
+            if scalars[index] == "\n" { line += 1 }
+            index += 1
+        }
+    }
+
+    private mutating func consumeLineComment() {
+        index += 2
+        while index < scalars.count, scalars[index] != "\n" { index += 1 }
+    }
+
+    private mutating func consumeBlockComment() throws {
+        index += 2
+        while index + 1 < scalars.count, !peek("*/") {
+            if scalars[index] == "\n" { line += 1 }
+            index += 1
+        }
+        guard index + 1 < scalars.count else {
+            throw WorkflowScriptAnalysisError.invalidSyntax("unterminated block comment")
+        }
+        index += 2
+    }
+
+    private mutating func consumeString(quote: UnicodeScalar) throws -> String {
+        index += 1
+        var output = ""
+        while index < scalars.count, scalars[index] != quote {
+            let scalar = scalars[index]
+            guard scalar != "\n", scalar != "\r" else {
+                throw WorkflowScriptAnalysisError.invalidSyntax("newline in string literal")
+            }
+            if scalar == "\\" {
+                index += 1
+                guard index < scalars.count else {
+                    throw WorkflowScriptAnalysisError.invalidSyntax("unterminated string escape")
+                }
+                let escaped = scalars[index]
+                switch escaped {
+                case "n": output.append("\n")
+                case "r": output.append("\r")
+                case "t": output.append("\t")
+                case "b": output.append("\u{8}")
+                case "f": output.append("\u{c}")
+                case "v": output.append("\u{b}")
+                case "0": output.append("\0")
+                case "\\", "\"", "'", "/": output.unicodeScalars.append(escaped)
+                default:
+                    throw WorkflowScriptAnalysisError.malformedMetadata("unsupported string escape")
+                }
+                index += 1
+                continue
+            }
+            output.unicodeScalars.append(scalar)
+            index += 1
+        }
+        guard index < scalars.count else {
+            throw WorkflowScriptAnalysisError.invalidSyntax("unterminated string literal")
+        }
+        index += 1
+        return output
+    }
+
+    private mutating func consumeTemplate() throws {
+        index += 1
+        while index < scalars.count {
+            if scalars[index] == "\\" { index += 2; continue }
+            if scalars[index] == "\n" { line += 1 }
+            if scalars[index] == "`" { index += 1; return }
+            index += 1
+        }
+        throw WorkflowScriptAnalysisError.invalidSyntax("unterminated template literal")
+    }
+
+    private mutating func consumeRegex() throws {
+        index += 1
+        var inClass = false
+        while index < scalars.count {
+            if scalars[index] == "\\" { index += 2; continue }
+            if scalars[index] == "\n" {
+                throw WorkflowScriptAnalysisError.invalidSyntax("newline in regular expression")
+            }
+            if scalars[index] == "[" { inClass = true }
+            if scalars[index] == "]" { inClass = false }
+            if scalars[index] == "/", !inClass {
+                index += 1
+                while index < scalars.count, isIdentifierContinue(scalars[index]) { index += 1 }
+                return
+            }
+            index += 1
+        }
+        throw WorkflowScriptAnalysisError.invalidSyntax("unterminated regular expression")
+    }
+
+    private func isRegexStart() -> Bool {
+        guard let previous = result.last else { return true }
+        if let symbol = previous.symbol {
+            return ["(", "[", "{", ",", ";", ":", "=", "!", "?", "&&", "||", "??", "=>"].contains(symbol)
+        }
+        return ["return", "case", "throw", "else", "do", "typeof", "void", "delete", "in", "of"]
+            .contains(previous.identifier ?? "")
+    }
+
+    private func peek(_ value: String) -> Bool {
+        let expected = Array(value.unicodeScalars)
+        guard index + expected.count <= scalars.count else { return false }
+        return Array(scalars[index ..< index + expected.count]) == expected
+    }
+
+    private func isWhitespace(_ scalar: UnicodeScalar) -> Bool {
+        CharacterSet.whitespacesAndNewlines.contains(scalar)
+    }
+
+    private func isIdentifierStart(_ scalar: UnicodeScalar) -> Bool {
+        scalar == "_" || scalar == "$" || ("a" ... "z").contains(scalar) || ("A" ... "Z").contains(scalar)
+    }
+
+    private func isIdentifierContinue(_ scalar: UnicodeScalar) -> Bool {
+        isIdentifierStart(scalar) || isDigit(scalar)
+    }
+
+    private func isDigit(_ scalar: UnicodeScalar) -> Bool { ("0" ... "9").contains(scalar) }
+}

@@ -75,7 +75,17 @@ public struct JournalMessageReference: Hashable, Codable, Sendable {
 }
 
 public struct ProjectionOutboxItem: Hashable, Codable, Sendable {
-    public enum Kind: String, Codable, Sendable { case acceptedUserMessage, finalAnswer, deleteConversation }
+    public enum Kind: String, Codable, Sendable {
+        case acceptedUserMessage
+        case finalAnswer
+        /// Durable acknowledgement for an internal workflow/subagent input. The conversation
+        /// projector consumes it without creating a user-visible message.
+        case internalRunAccepted
+        /// Durable acknowledgement for an internal workflow/subagent result. The owning harness
+        /// consumes the result through its execution handle, never as a chat answer.
+        case internalRunFinalized
+        case deleteConversation
+    }
     public let idempotencyKey: String
     public let conversationID: ConversationID
     public let runID: AgentRunID?

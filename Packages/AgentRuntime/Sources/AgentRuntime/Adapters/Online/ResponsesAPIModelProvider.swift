@@ -368,7 +368,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         if !streamed {
             // Non-streaming fallback keeps the reasoning-only retry (streamed reasoning-only is
             // handled below; both stay inside the same authorization boundary).
-            if parsed.text.isEmpty, parsed.calls.isEmpty, parsed.hasReasoning, emitReasoning {
+            if parsed.text.isEmpty, parsed.calls.isEmpty, parsed.hasReasoning {
                 let retryBody = try Self.requestBody(
                     request: request,
                     baseURL: configuration.baseURL,
@@ -384,7 +384,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
                 streamed = retriedStreamed
                 data = retriedData
             }
-        } else if parsed.text.isEmpty, parsed.calls.isEmpty, parsed.hasReasoning, emitReasoning {
+        } else if parsed.text.isEmpty, parsed.calls.isEmpty, parsed.hasReasoning {
             // Streamed reasoning-only: reasoning was already shown live; retry once without reasoning
             // so the ANSWER streams too (no duplication of answer text).
             let retryBody = try Self.requestBody(

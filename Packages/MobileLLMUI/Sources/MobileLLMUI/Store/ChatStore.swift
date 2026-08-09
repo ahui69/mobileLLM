@@ -185,7 +185,6 @@ public final class ChatStore {
     /// it. IDs leave this set only when delete fails, Undo succeeds, or a full erase resets the session.
     private var locallyRemovedConversationIDs: Set<UUID> = []
     /// workflowID → assistant message id that already projected the workflow's final answer.
-    private var workflowAssistantMessageIDs: [UUID: UUID] = [:]
     /// Settings can be open in more than one macOS window. Each erase request owns a reservation so an
     /// earlier failing request cannot reopen persistence while another window is still deleting files.
     private var conversationEraseReservations = 0
@@ -321,7 +320,17 @@ public final class ChatStore {
     func commitLoadedConversations(_ loaded: [Conversation]) {
         let live = conversations
         let liveIDs = Set(live.map(\.id))
-        conversations = (live + loaded.filter {
+        var neutralLoaded = loaded
+        for conversationIndex in neutralLoaded.indices {
+            for messageIndex in neutralLoaded[conversationIndex].messages.indices
+                where neutralLoaded[conversationIndex].messages[messageIndex]
+                    .workflowRecord?.dynamic != nil
+            {
+                neutralLoaded[conversationIndex].messages[messageIndex]
+                    .workflowRecord?.isAttachedInCurrentProcess = false
+            }
+        }
+        conversations = (live + neutralLoaded.filter {
             !liveIDs.contains($0.id) && !locallyRemovedConversationIDs.contains($0.id)
         }).sorted(by: Self.recency)
         if let selected = activeID, !conversations.contains(where: { $0.id == selected }) {
@@ -423,9 +432,6 @@ public final class ChatStore {
         conversationApprovalMode ?? .safePreset
     }
 
-    /// Whether a workflow is running in the active conversation (spec §20/§23). The workflow runtime is
-    /// not implemented yet, so this is always false — the ••• Workflow entry stays disabled until it
-    /// becomes true, exactly as specified.
     /// The active thread's reasoning effort (nil = medium). Applies whenever reasoning is enabled.
     public var conversationReasoningEffort: ReasoningEffort? {
         get { activeConversation?.reasoningEffort }
@@ -1270,11 +1276,14 @@ public final class ChatStore {
             if record.status == .completed,
                let answer = record.finalAnswer,
                !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               workflowAssistantMessageIDs[workflowID] == nil
+               !conversations[ci].messages.contains(where: { $0.workflowResultID == workflowID })
             {
-                let assistant = Message(role: .assistant, answer: answer)
+                let assistant = Message(
+                    role: .assistant,
+                    answer: answer,
+                    workflowResultID: workflowID
+                )
                 conversations[ci].messages.append(assistant)
-                workflowAssistantMessageIDs[workflowID] = assistant.id
                 conversations[ci].updatedAt = Date()
                 persist(conversations[ci])
             }

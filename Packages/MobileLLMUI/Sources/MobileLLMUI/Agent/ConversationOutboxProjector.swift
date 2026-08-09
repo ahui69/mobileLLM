@@ -117,6 +117,11 @@ public final class ConversationOutboxProjector: Sendable {
             try await applyAcceptedUserMessage(item)
         case .finalAnswer:
             try await applyFinalAnswer(item)
+        case .internalRunAccepted, .internalRunFinalized:
+            // Internal agent inputs/results are presented by their owning workflow record. Keeping
+            // these as durable no-op outbox commands lets the repository preserve one atomic
+            // submission/finalization boundary without leaking orchestration traffic into chat.
+            return
         case .deleteConversation:
             try await store.softDelete(item.conversationID.rawValue)
         }

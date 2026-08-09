@@ -583,7 +583,18 @@ public struct AgentRequest: Hashable, Codable, Sendable, AgentContractPayload {
               Set(artifactReferences.map(\.id)).count == artifactReferences.count
         else { throw AgentContractError.invalidName("agent request") }
         if let parent {
-            _ = try parent.capabilityCeiling.attenuating(to: capabilityCeiling.authority, requireStrict: true)
+            if parent.capabilityCeiling.authority == .empty {
+                guard capabilityCeiling.authority == .empty else {
+                    throw AgentContractError.capabilityEscalation(
+                        capabilityCeiling.capabilities.values
+                    )
+                }
+            } else {
+                _ = try parent.capabilityCeiling.attenuating(
+                    to: capabilityCeiling.authority,
+                    requireStrict: true
+                )
+            }
             guard provenance.source == .parentAgent || provenance.source == .workflow else {
                 throw AgentContractError.invalidName("child request provenance")
             }

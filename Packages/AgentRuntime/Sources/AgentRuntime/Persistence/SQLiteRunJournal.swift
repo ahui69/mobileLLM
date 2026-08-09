@@ -184,10 +184,19 @@ public actor SQLiteRunJournal: RuntimeRepository {
         let message = finalization.message
         let outbox = finalization.outbox
         let mutation = finalization.mutation
+        guard let db = try existingConnection(),
+              let durableSubmission = try submission(for: message.runID, db: db)
+        else { throw RuntimeRepositoryError.invalidSubmission("finalization has no durable submission") }
+        let expectedKind: ProjectionOutboxItem.Kind = durableSubmission.request.payload
+            .provenance.source.projectsConversation ? .finalAnswer : .internalRunFinalized
+        let internalMessageIdentityIsValid = durableSubmission.request.payload
+            .provenance.source.projectsConversation
+            || message.messageID == ExecutionStableID.message(runID: message.runID, role: .assistant)
         guard message.role == .assistant,
+              internalMessageIdentityIsValid,
               message.runID == mutation.append.runID,
               mutation.append.events.last?.payload.event.isRunTerminal == true,
-              outbox.kind == .finalAnswer,
+              outbox.kind == expectedKind,
               outbox.runID == message.runID,
               outbox.messageID == message.messageID,
               outbox.conversationID == message.conversationID,
@@ -1374,7 +1383,8 @@ public actor SQLiteRunJournal: RuntimeRepository {
               submission.initialLedger.consumed == .zero,
               submission.initialLedger.reservations.isEmpty,
               append.events.last?.payload.cumulativeUsage == .zero,
-              submission.outbox.kind == .acceptedUserMessage,
+              submission.outbox.kind == (request.provenance.source.projectsConversation
+                  ? .acceptedUserMessage : .internalRunAccepted),
               submission.outbox.runID == request.runID,
               submission.outbox.messageID == submission.userMessage.messageID,
               submission.outbox.conversationID == request.conversationID,
@@ -1383,10 +1393,19 @@ public actor SQLiteRunJournal: RuntimeRepository {
         else {
             throw RuntimeRepositoryError.invalidSubmission("submission bindings are inconsistent")
         }
-        if let sourceMessageID = request.provenance.sourceMessageID,
+        if request.provenance.source.projectsConversation,
+           let sourceMessageID = request.provenance.sourceMessageID,
            sourceMessageID != submission.userMessage.messageID
         {
             throw RuntimeRepositoryError.invalidSubmission("request provenance message differs")
+        }
+        if !request.provenance.source.projectsConversation,
+           submission.userMessage.messageID != ExecutionStableID.message(
+               runID: request.runID,
+               role: .user
+           )
+        {
+            throw RuntimeRepositoryError.invalidSubmission("internal run message identity is not run-scoped")
         }
         let requestPayload = try encoder.encode(submission.request)
         _ = try AgentRequestEnvelope.decodeUntrusted(from: requestPayload)

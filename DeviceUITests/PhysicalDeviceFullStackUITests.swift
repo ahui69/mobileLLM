@@ -1671,10 +1671,10 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
         )
     }
 
-    // TEST-ID: AHT-WORKFLOW-002-DEVICE
-    /// Matrix test31: the full message-anchored workflow (auto-plan → research children → staged
-    /// phases → audit/revise/verify → delivered plan) runs to completion on the physical device with
-    /// the online model, then projects the final plan into the chat and opens its summary page.
+    // TEST-ID: AHT-DYNAMIC-DEVICE-001
+    /// Matrix test31: the full message-anchored Dynamic Workflow lifecycle runs on the physical
+    /// device: inert candidate generation, exact-source inspection, separate approval and Start,
+    /// durable child execution, and final-result projection back into the chat.
     @MainActor
     func test31WorkflowCompletesOnDevice() throws {
         let app = try launchApp()
@@ -1712,30 +1712,63 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
             throw DeviceE2EHarnessError.precondition("The message-anchored workflow record did not appear")
         }
 
-        var lastValue = readWorkflowValue(row) ?? ""
-        var sawMultiPhase = false
-        var sawLiveStats = false
+        var rowState = readWorkflowValue(row) ?? ""
+        let candidateDeadline = Date().addingTimeInterval(300)
+        while Date() < candidateDeadline,
+              !rowState.contains("Waiting for approval"),
+              !rowState.contains("Failed")
+        {
+            approvePendingAgentApprovalIfNeeded(in: app)
+            Thread.sleep(forTimeInterval: 1)
+            rowState = readWorkflowValue(row) ?? rowState
+        }
+        guard rowState.contains("Waiting for approval") else {
+            attachDiagnostics(app, name: "workflow-candidate-failed")
+            throw DeviceE2EHarnessError.precondition(
+                "Dynamic Workflow candidate was not ready for approval: \(rowState)"
+            )
+        }
+
+        row.tap()
+        guard app.navigationBars["Workflow"].waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Workflow candidate page did not open")
+        }
+        let sourceDisclosure = app.buttons["JavaScript source"]
+        guard sourceDisclosure.waitForExistence(timeout: 10) else {
+            throw DeviceE2EHarnessError.precondition("Exact JavaScript source disclosure is missing")
+        }
+        sourceDisclosure.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["workflow.source"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["workflow.approval"].exists)
+        XCTAssertFalse(app.descendants(matching: .any)["workflow.start"].exists,
+                       "an unapproved candidate must not expose Start")
+
+        let once = app.buttons["Once"]
+        guard once.waitForExistence(timeout: 5) else {
+            throw DeviceE2EHarnessError.precondition("Once approval is missing")
+        }
+        once.tap()
+        let start = app.descendants(matching: .any)["workflow.start"]
+        guard start.waitForExistence(timeout: 20) else {
+            throw DeviceE2EHarnessError.precondition("Approval did not queue the workflow")
+        }
+        XCTAssertEqual(app.descendants(matching: .any)["workflow.state"].label,
+                       "Approved — ready to start",
+                       "approval must not implicitly execute")
+        start.tap()
+
+        let state = app.descendants(matching: .any)["workflow.state"]
+        var lastState = state.label
         var sawCompleted = false
         let deadline = Date().addingTimeInterval(3_300)
         while Date() < deadline {
             approvePendingAgentApprovalIfNeeded(in: app)
-            lastValue = readWorkflowValue(row) ?? lastValue
-            if lastValue.contains("Completed") {
+            lastState = state.label
+            if lastState == "Completed" {
                 sawCompleted = true
                 break
             }
-            if lastValue.contains("Failed") || lastValue.contains("Cancelled") { break }
-            if lastValue.contains("phase 3/") || lastValue.contains("phase 4/")
-                || lastValue.contains("phase 5/") || lastValue.contains("phase 6/")
-                || lastValue.contains("phase 7/") || lastValue.contains("phase 8/")
-            {
-                sawMultiPhase = true
-            }
-            if lastValue.contains("tokens") && !lastValue.contains("0 tokens")
-                && lastValue.contains("tool calls")
-            {
-                sawLiveStats = true
-            }
+            if ["Failed", "Denied or stopped", "Needs reconciliation"].contains(lastState) { break }
             if app.state != .runningForeground {
                 attachDiagnostics(app, name: "workflow-left-foreground")
                 throw DeviceE2EHarnessError.precondition("App left foreground during workflow execution")
@@ -1745,41 +1778,25 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
 
         var failures: [String] = []
         if !sawCompleted {
-            failures.append("workflow did not reach Completed; last status: \(lastValue)")
-        }
-        if sawCompleted, !sawMultiPhase {
-            failures.append("workflow completed with fewer than 3 phases: \(lastValue)")
-        }
-        if !sawLiveStats {
-            failures.append("workflow never showed non-zero token/tool-call statistics: \(lastValue)")
+            failures.append("workflow did not reach Completed; last status: \(lastState)")
         }
         if sawCompleted {
+            let hierarchy = XCTAttachment(string: app.debugDescription)
+            hierarchy.name = "workflow-summary-page"
+            hierarchy.lifetime = .keepAlways
+            add(hierarchy)
+            app.navigationBars["Workflow"].buttons.firstMatch.tap()
             let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
             if answers.count == 0 {
-                failures.append("workflow completed without projecting a final plan into the chat")
-            }
-            let completedRow = app.descendants(matching: .any).matching(
-                NSPredicate(format: "label BEGINSWITH %@", "Workflow:")
-            ).firstMatch
-            if completedRow.waitForExistence(timeout: 10) {
-                completedRow.tap()
-                if app.navigationBars["Workflow"].waitForExistence(timeout: 10) {
-                    let hierarchy = XCTAttachment(string: app.debugDescription)
-                    hierarchy.name = "workflow-summary-page"
-                    hierarchy.lifetime = .keepAlways
-                    add(hierarchy)
-                } else {
-                    failures.append("completed workflow row did not open the summary page")
-                }
-            } else {
-                failures.append("completed workflow row disappeared from the thread")
+                failures.append("workflow completed without projecting its final result into the chat")
             }
         }
 
         let summary = XCTAttachment(string: """
-        last_status=\(lastValue)
-        saw_multiphase=\(sawMultiPhase)
-        saw_live_stats=\(sawLiveStats)
+        candidate_status=\(rowState)
+        last_status=\(lastState)
+        inspected_exact_source=true
+        separate_approval_and_start=true
         failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
         """)
         summary.name = "workflow-completion-device"

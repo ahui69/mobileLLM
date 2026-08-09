@@ -11,6 +11,7 @@ import Foundation
 public struct ArtifactOwner: Hashable, Codable, Sendable, Comparable {
     public enum Kind: String, CaseIterable, Hashable, Codable, Sendable {
         case run
+        case workflowRun
         case conversation
         case message
         case durableRecord
@@ -35,6 +36,10 @@ public struct ArtifactOwner: Hashable, Codable, Sendable, Comparable {
 
     public static func run(_ id: AgentRunID) -> Self {
         try! Self(kind: .run, identifier: id.description)
+    }
+
+    public static func workflowRun(_ id: WorkflowRunID) -> Self {
+        try! Self(kind: .workflowRun, identifier: id.description)
     }
 
     public static func conversation(_ id: ConversationID) -> Self {

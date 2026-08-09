@@ -581,7 +581,7 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
         XCTAssertFalse(serverError.safeMessage.contains("API key"))
     }
 
-    func testGenerateRetriesReasoningOnlyResponseWithoutReasoning() async throws {
+    func testGenerateRetriesReasoningOnlyResponseEvenWhenReasoningWasAlreadyDisabled() async throws {
         MockResponsesURLProtocol.requestCount = 0
         MockResponsesURLProtocol.handler = { request in
             MockResponsesURLProtocol.requestCount += 1
@@ -593,9 +593,9 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
                 headerFields: ["Content-Type": "application/json"]
             )!
             if MockResponsesURLProtocol.requestCount == 1 {
-                XCTAssertFalse(
-                    body.contains("reasoning"),
-                    "the first attempt keeps service-side reasoning: \(body)"
+                XCTAssertTrue(
+                    body.contains("reasoning") && body.contains("enabled"),
+                    "the first attempt must request reasoning-disabled mode: \(body)"
                 )
                 return (response, Data("""
                 {"usage":{"input_tokens":1,"output_tokens":12},
@@ -632,7 +632,7 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
         )
         let fixture = try ModelFixture(
             location: .remote,
-            thinkingMode: .enabled,
+            thinkingMode: .disabled,
             providerID: ResponsesAPIModelProvider.providerID,
             remoteDestination: "openai.responses:responses-api-key:fixture-model"
         )

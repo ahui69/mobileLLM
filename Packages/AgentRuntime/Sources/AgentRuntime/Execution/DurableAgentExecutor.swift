@@ -190,8 +190,11 @@ public actor AgentRunController {
             artifactID: inputArtifact.id
         )
         let handleID = ExecutionStableID.handle(request: request, commandID: commandID)
-        let messageID = request.provenance.sourceMessageID
-            ?? ExecutionStableID.message(runID: request.runID, role: .user)
+        let projectsConversation = request.provenance.source.projectsConversation
+        let messageID = projectsConversation
+            ? (request.provenance.sourceMessageID
+                ?? ExecutionStableID.message(runID: request.runID, role: .user))
+            : ExecutionStableID.message(runID: request.runID, role: .user)
         let userBody = Data(frozen.currentUser.frozen.content.utf8)
         let userArtifact = try await payloadStore.commit(
             data: userBody,
@@ -232,11 +235,13 @@ public actor AgentRunController {
             createdAt: timestamp
         )
         let outbox = ProjectionOutboxItem(
-            idempotencyKey: "accepted:\(messageID.description)",
+            idempotencyKey: projectsConversation
+                ? "accepted:\(messageID.description)"
+                : "internal-accepted:\(request.runID.description)",
             conversationID: request.conversationID,
             runID: request.runID,
             messageID: messageID,
-            kind: .acceptedUserMessage,
+            kind: projectsConversation ? .acceptedUserMessage : .internalRunAccepted,
             payloadDigest: message.bodyDigest,
             payloadArtifactID: message.bodyArtifactID
         )

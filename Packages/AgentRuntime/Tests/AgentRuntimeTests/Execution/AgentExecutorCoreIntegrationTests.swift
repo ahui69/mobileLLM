@@ -9,6 +9,68 @@ import XCTest
 // TEST-ID: AHT-CHAT-001
 // TEST-ID: AHT-OUTBOX-001
 final class AgentExecutorCoreIntegrationTests: XCTestCase {
+    func testInternalWorkflowRunsSharingOneOriginStayRunScopedAndOutOfChat() async throws {
+        let model = try ExecutorTestModelDefinition(offset: 92)
+        let originMessageID = MessageID(rawValue: ExecutorTestID.uuid(92_001))
+        let provenance = AgentRequestProvenance(
+            source: .workflow,
+            sourceMessageID: originMessageID
+        )
+        let harness = try ExecutorTestHarness(
+            offset: 92,
+            provider: try FixedCompletionModelProvider(model: model, answer: "internal result"),
+            model: model,
+            provenance: provenance
+        )
+
+        let firstHandleID = try await harness.executor.submit(
+            harness.request,
+            commandID: ExecutorTestID.command(92)
+        )
+        _ = try await collectTerminalEvents(
+            from: harness.executor.attach(to: firstHandleID)
+        )
+
+        let second = try AgentRequest(
+            id: ExecutorTestID.request(93),
+            runID: ExecutorTestID.run(93),
+            conversationID: harness.request.conversationID,
+            userTurnID: harness.request.userTurnID,
+            role: "workflow-generator",
+            instruction: "Repair the internal workflow candidate.",
+            outputRequirement: harness.request.outputRequirement,
+            modelPolicy: harness.request.modelPolicy,
+            capabilityCeiling: harness.request.capabilityCeiling,
+            budget: harness.request.budget,
+            provenance: provenance,
+            approvalMode: harness.request.approvalMode
+        )
+        let secondHandleID = try await harness.executor.submit(
+            second,
+            commandID: ExecutorTestID.command(93)
+        )
+        _ = try await collectTerminalEvents(
+            from: harness.executor.attach(to: secondHandleID)
+        )
+
+        let database = try SQLiteConnection(url: harness.databaseURL, create: false, readOnly: true)
+        defer { database.close() }
+        let rows = try database.rows(
+            "SELECT run_id, role, message_id FROM messages ORDER BY run_id, role"
+        )
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertFalse(rows.contains { $0[2].text == originMessageID.description })
+        XCTAssertEqual(Set(try database.rows(
+            "SELECT kind FROM projection_outbox ORDER BY idempotency_key"
+        ).compactMap { $0[0].text }), [
+            ProjectionOutboxItem.Kind.internalRunAccepted.rawValue,
+            ProjectionOutboxItem.Kind.internalRunFinalized.rawValue,
+        ])
+        XCTAssertEqual(try database.scalarInt(
+            "SELECT COUNT(*) FROM projection_outbox WHERE kind IN ('acceptedUserMessage', 'finalAnswer')"
+        ), 0)
+    }
+
     func testCallerOwnedMessageIdentitiesFlowThroughBothJournalOutboxRows() async throws {
         let model = try ExecutorTestModelDefinition(offset: 91)
         let userMessageID = MessageID(rawValue: ExecutorTestID.uuid(91_001))

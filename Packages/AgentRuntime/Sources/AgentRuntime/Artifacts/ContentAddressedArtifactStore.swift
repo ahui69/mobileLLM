@@ -401,9 +401,13 @@ public actor ContentAddressedArtifactStore {
     ) throws {
         switch request.retentionPolicy {
         case .run:
-            guard owner.kind == .run,
-                  request.provenance.runID?.description == owner.identifier
-            else { throw ArtifactStoreError.retentionOwnerMismatch }
+            let matchesAgentRun = owner.kind == .run
+                && request.provenance.runID?.description == owner.identifier
+            let matchesWorkflowRun = owner.kind == .workflowRun
+                && request.provenance.workflowRunID?.description == owner.identifier
+            guard matchesAgentRun || matchesWorkflowRun else {
+                throw ArtifactStoreError.retentionOwnerMismatch
+            }
         case .conversation:
             guard owner.kind == .conversation || owner.kind == .message else {
                 throw ArtifactStoreError.retentionOwnerMismatch

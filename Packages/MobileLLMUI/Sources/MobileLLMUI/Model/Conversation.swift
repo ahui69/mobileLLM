@@ -98,13 +98,17 @@ public struct Message: Identifiable, Codable, Sendable, Equatable {
     /// Message-anchored workflow record (spec §20/§23): the initiating message owns the live and
     /// completed workflow row. Optional → old records decode without one.
     public var workflowRecord: WorkflowMessageRecord?
+    /// Stable provenance for a workflow's projected final answer. This persisted identity, rather
+    /// than an in-memory map or answer-text heuristic, enforces exactly-once projection on relaunch.
+    public var workflowResultID: UUID?
 
     public init(id: UUID = UUID(), role: Role, createdAt: Date = Date(),
                 answer: String, reasoning: String? = nil, thinkingSeconds: Double? = nil,
                 toolRuns: [ToolRun]? = nil, stats: Stats? = nil, parentID: UUID? = nil,
                 emptyOutcome: EmptyOutcome? = nil, attachments: [ImageRef]? = nil,
                 generatedBy: GenerationModel? = nil,
-                workflowRecord: WorkflowMessageRecord? = nil) {
+                workflowRecord: WorkflowMessageRecord? = nil,
+                workflowResultID: UUID? = nil) {
         self.id = id
         self.role = role
         self.createdAt = createdAt
@@ -118,6 +122,7 @@ public struct Message: Identifiable, Codable, Sendable, Equatable {
         self.emptyOutcome = emptyOutcome
         self.attachments = attachments
         self.workflowRecord = workflowRecord
+        self.workflowResultID = workflowResultID
     }
 
     /// A CJK-aware token estimate (`LLMCore.TokenEstimate`) used for context-window trimming — the old

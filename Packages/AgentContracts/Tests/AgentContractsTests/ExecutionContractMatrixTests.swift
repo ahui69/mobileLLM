@@ -98,7 +98,7 @@ final class ExecutionContractMatrixTests: XCTestCase {
         let failures = AgentFailureClassification.allCases.map { classification in
             (classification, failure(for: classification))
         }
-        XCTAssertEqual(failures.count, 7)
+        XCTAssertEqual(failures.count, 8)
 
         for state in [AgentRunState.completed, .failed, .cancelled] {
             XCTAssertTrue(state.isTerminal)

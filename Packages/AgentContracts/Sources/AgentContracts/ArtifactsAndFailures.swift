@@ -92,6 +92,8 @@ public enum ArtifactIntegrityStatus: String, CaseIterable, Hashable, Codable, Se
 public struct ArtifactProvenance: Hashable, Codable, Sendable {
     /// Run that created or first accepted the artifact.
     public let runID: AgentRunID?
+    /// Dynamic workflow run that created the artifact when there is no synthetic agent run.
+    public let workflowRunID: WorkflowRunID?
     /// Stable step that created the artifact.
     public let stepID: AgentStepID?
     /// Tool invocation that created the artifact.
@@ -104,11 +106,15 @@ public struct ArtifactProvenance: Hashable, Codable, Sendable {
     /// Creates provenance without requiring a run for preaccepted user attachments.
     public init(
         runID: AgentRunID? = nil,
+        workflowRunID: WorkflowRunID? = nil,
         stepID: AgentStepID? = nil,
         invocationID: ToolInvocationID? = nil,
         externalOperationFingerprint: StableDigest? = nil,
         providerID: String? = nil
     ) throws {
+        guard runID == nil || workflowRunID == nil else {
+            throw AgentContractError.invalidArtifactReference("artifact has multiple producing runs")
+        }
         if stepID != nil || invocationID != nil {
             guard runID != nil else {
                 throw AgentContractError.invalidArtifactReference("step provenance requires a run")
@@ -118,6 +124,7 @@ public struct ArtifactProvenance: Hashable, Codable, Sendable {
             throw AgentContractError.invalidArtifactReference("empty provider identity")
         }
         self.runID = runID
+        self.workflowRunID = workflowRunID
         self.stepID = stepID
         self.invocationID = invocationID
         self.externalOperationFingerprint = externalOperationFingerprint
@@ -130,6 +137,10 @@ public struct ArtifactProvenance: Hashable, Codable, Sendable {
         do {
             try self.init(
                 runID: container.decodeIfPresent(AgentRunID.self, forKey: .runID),
+                workflowRunID: container.decodeIfPresent(
+                    WorkflowRunID.self,
+                    forKey: .workflowRunID
+                ),
                 stepID: container.decodeIfPresent(AgentStepID.self, forKey: .stepID),
                 invocationID: container.decodeIfPresent(ToolInvocationID.self, forKey: .invocationID),
                 externalOperationFingerprint: container.decodeIfPresent(
@@ -146,7 +157,7 @@ public struct ArtifactProvenance: Hashable, Codable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runID, stepID, invocationID, externalOperationFingerprint, providerID
+        case runID, workflowRunID, stepID, invocationID, externalOperationFingerprint, providerID
     }
 }
 
@@ -244,6 +255,9 @@ public struct ArtifactReference: Hashable, Codable, Sendable {
 
 /// Stable failure category controlling retry, recovery, and user presentation policy.
 public enum AgentFailureClassification: String, CaseIterable, Hashable, Codable, Sendable {
+    /// A model, provider, or other optional execution dependency is temporarily unavailable.
+    /// Workflow orchestration may explicitly degrade this category to an unavailable/null value.
+    case availabilityRelated
     /// A bounded retry may succeed without changing authority or inputs.
     case transient
     /// Retrying unchanged input cannot succeed.

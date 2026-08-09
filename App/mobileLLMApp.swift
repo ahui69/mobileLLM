@@ -9,6 +9,112 @@ import LLMEngineLlama
 import LLMEngineApple
 import AgentRuntime
 
+#if DEBUG
+/// Deterministic Responses API transport used only by the opt-in simulator UI test. It exercises
+/// the production provider parser, durable executor, analyzer, approval UI, and workflow engine
+/// without making release-gating UI behavior depend on a live model's latency or output quality.
+private final class DynamicWorkflowUITestResponsesProtocol: URLProtocol, @unchecked Sendable {
+    private static let environmentKey = "MOBILELLM_DYNAMIC_WORKFLOW_RESPONSES_FIXTURE"
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        ProcessInfo.processInfo.environment[environmentKey] == "1"
+            && request.url?.path.hasSuffix("/responses") == true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let body = Self.requestBodyString(request)
+        let text: String
+        if body.contains("mobileLLM Dynamic Workflow V1")
+            || body.contains("Repair one mobileLLM Dynamic Workflow V1")
+        {
+            text = """
+            export const meta = {
+              name: "simulator-workflow",
+              description: "Exercises candidate approval and explicit start.",
+              whenToUse: "Simulator UI verification",
+              phases: [{ title: "Delegate", detail: "Run one bounded child task." }]
+            };
+            phase("Delegate");
+            const result = await agent("Return a concise simulator fixture result.");
+            return { result };
+            """
+        } else {
+            text = "simulator child completed"
+        }
+        do {
+            let delta = try JSONSerialization.data(
+                withJSONObject: ["type": "response.output_text.delta", "delta": text],
+                options: [.sortedKeys]
+            )
+            let completed = try JSONSerialization.data(
+                withJSONObject: [
+                    "type": "response.completed",
+                    "status": "completed",
+                    "usage": ["input_tokens": 16, "output_tokens": 32],
+                ],
+                options: [.sortedKeys]
+            )
+            var bytes = Data("data: ".utf8)
+            bytes.append(delta)
+            bytes.append(Data("\n\ndata: ".utf8))
+            bytes.append(completed)
+            bytes.append(Data("\n\n".utf8))
+            let response = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "text/event-stream"]
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: bytes)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+
+    private static func requestBodyString(_ request: URLRequest) -> String {
+        if let data = request.httpBody { return String(data: data, encoding: .utf8) ?? "" }
+        guard let stream = request.httpBodyStream else { return "" }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        let capacity = 4_096
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+        defer { buffer.deallocate() }
+        while stream.hasBytesAvailable {
+            let count = stream.read(buffer, maxLength: capacity)
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    static func session() -> URLSession {
+        guard ProcessInfo.processInfo.environment[environmentKey] == "1" else { return .shared }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DynamicWorkflowUITestResponsesProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+}
+#endif
+
+private func agentRuntimeURLSession() -> URLSession {
+    #if DEBUG
+    DynamicWorkflowUITestResponsesProtocol.session()
+    #else
+    .shared
+    #endif
+}
+
 #if DEBUG && os(macOS)
 import AppKit
 
@@ -344,6 +450,7 @@ struct MobileLLMApp: App {
                     eventStore: container.toolEventStore,
                     locationProvider: container.toolLocationProvider,
                     mcpDiscovery: container.mcpDiscovery,
+                    session: agentRuntimeURLSession(),
                     onlineConfiguration: { onlineConfigBox.configuration(for: $0) }
                 )
                 container.attachAgentRuns(assembly.runStore)
@@ -411,6 +518,39 @@ struct MobileLLMApp: App {
                 container.workflowStore.resumeHandler = { [launcher] workflowID in
                     try await launcher.resume(workflowID: workflowID)
                 }
+                container.workflowStore.dynamicApproveHandler = { [launcher] workflowID, scope in
+                    try await launcher.approveDynamic(workflowID: workflowID, reuseScope: scope)
+                }
+                container.workflowStore.dynamicDenyHandler = { [launcher] workflowID in
+                    try await launcher.denyDynamic(workflowID: workflowID)
+                }
+                container.workflowStore.dynamicStartHandler = { [launcher] workflowID in
+                    try await launcher.startDynamic(workflowID: workflowID)
+                }
+                container.workflowStore.dynamicPauseHandler = { [launcher] workflowID in
+                    try await launcher.pauseDynamic(workflowID: workflowID)
+                }
+                container.workflowStore.dynamicResumeHandler = { [launcher] workflowID in
+                    try await launcher.resumeDynamic(workflowID: workflowID)
+                }
+                container.workflowStore.dynamicReconcileHandler = { [launcher] workflowID, decision in
+                    try await launcher.reconcileDynamic(
+                        workflowID: workflowID,
+                        decision: decision
+                    )
+                }
+                container.workflowStore.dynamicStopHandler = { [launcher] workflowID in
+                    try await launcher.stopDynamic(workflowID: workflowID)
+                }
+                container.workflowStore.dynamicRestartHandler = { [launcher] workflowID, callID in
+                    try await launcher.restartDynamicAgent(
+                        workflowID: workflowID,
+                        callID: callID
+                    )
+                }
+                // Journal reconciliation is projection-only. Opening the app never starts or
+                // resumes a workflow and never loads a model.
+                Task { await launcher.reconcileDynamicWorkflows() }
             } catch {
                 container.recordAgentRuntimeFailure(error)
                 AgentRuntimeAssembly.logger(
@@ -553,7 +693,7 @@ func makeAgentSnapshot(
             ModelDownloader(downloadBase: downloadBase)
                 .localURL(repoId: variant.source.huggingFaceRepo)
         )
-    } else if let onlineModelID,
+    } else if onlineModelID != nil,
               let fallback = container.models.model(id: container.settings.defaultModelID)
                 ?? LLMCatalog.all.first
     {

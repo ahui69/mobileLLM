@@ -11,6 +11,7 @@ public enum SubagentSpawnError: Error, Hashable, Sendable {
     case budgetNotAttenuated(BudgetDimension)
     case resultUnavailable
     case invalidResult
+    case reconciliationRequired(AgentFailure)
 }
 
 /// Spawns and collects durable child runs (spec §22). Children inherit only a strict subset of the
@@ -21,6 +22,45 @@ public protocol SubagentSpawning: Sendable {
     func spawn(_ request: SubagentSpawnRequest) async throws -> AgentExecutionHandleID
     /// Waits for the child's durable terminal result.
     func collect(_ handleID: AgentExecutionHandleID) async throws -> SubagentResult
+    /// Idempotently cancels one durable child. Used for explicit workflow stop and un-awaited calls.
+    func cancel(_ handleID: AgentExecutionHandleID, runID: AgentRunID) async throws
+    /// Resolves the exact uncertain child invocation through its normal durable command path.
+    func reconcile(
+        _ handleID: AgentExecutionHandleID,
+        runID: AgentRunID,
+        decision: AgentReconciliationDecision
+    ) async throws
+    /// Generation-disambiguated reconciliation for a child that may cross more than one uncertain
+    /// operation during its lifetime. Generations are durable workflow facts and start at one.
+    func reconcile(
+        _ handleID: AgentExecutionHandleID,
+        runID: AgentRunID,
+        decision: AgentReconciliationDecision,
+        generation: UInt32
+    ) async throws
+}
+
+public extension SubagentSpawning {
+    func cancel(_: AgentExecutionHandleID, runID _: AgentRunID) async throws {
+        throw SubagentSpawnError.resultUnavailable
+    }
+
+    func reconcile(
+        _: AgentExecutionHandleID,
+        runID _: AgentRunID,
+        decision _: AgentReconciliationDecision
+    ) async throws {
+        throw SubagentSpawnError.resultUnavailable
+    }
+
+    func reconcile(
+        _ handleID: AgentExecutionHandleID,
+        runID: AgentRunID,
+        decision: AgentReconciliationDecision,
+        generation _: UInt32
+    ) async throws {
+        try await reconcile(handleID, runID: runID, decision: decision)
+    }
 }
 
 /// Production spawner over a shared `AgentExecutor` and the run journal.
@@ -51,10 +91,18 @@ public struct DurableSubagentSpawner: SubagentSpawning, Sendable {
         }
         // Strict ceiling attenuation against the LIVE parent ceiling, never the caller's word.
         do {
-            _ = try parentPayload.capabilityCeiling.attenuating(
-                to: request.capabilityCeiling.authority,
-                requireStrict: true
-            )
+            if parentPayload.capabilityCeiling.authority == .empty {
+                // Empty is the irreducible least-authority scope; pure children cannot remove an
+                // authority element that does not exist.
+                guard request.capabilityCeiling.authority == .empty else {
+                    throw SubagentSpawnError.ceilingNotStrictlyAttenuated
+                }
+            } else {
+                _ = try parentPayload.capabilityCeiling.attenuating(
+                    to: request.capabilityCeiling.authority,
+                    requireStrict: true
+                )
+            }
         } catch {
             throw SubagentSpawnError.ceilingNotStrictlyAttenuated
         }
@@ -105,7 +153,11 @@ public struct DurableSubagentSpawner: SubagentSpawning, Sendable {
 
     public func collect(_ handleID: AgentExecutionHandleID) async throws -> SubagentResult {
         let handle = try await executor.attach(to: handleID)
+        try Self.rejectReconciliationWait(try await handle.status())
         for try await envelope in handle.events(after: nil) {
+            if case .statusChanged(let status) = envelope.payload.event {
+                try Self.rejectReconciliationWait(status)
+            }
             guard case .terminal = envelope.payload.event else { continue }
             guard let result = try await handle.result() else {
                 throw SubagentSpawnError.resultUnavailable
@@ -113,6 +165,100 @@ public struct DurableSubagentSpawner: SubagentSpawning, Sendable {
             return try Self.normalize(result)
         }
         throw SubagentSpawnError.resultUnavailable
+    }
+
+    public func cancel(_ handleID: AgentExecutionHandleID, runID: AgentRunID) async throws {
+        let handle = try await executor.attach(to: handleID)
+        let commandID = SubagentStableID.cancelCommand(runID: runID, handleID: handleID)
+        let envelope: AgentCommandEnvelope
+        if let existing = try await repository.loadCommand(commandID) {
+            guard existing.runID == runID, existing.envelope.payload.action == .cancel else {
+                throw SubagentSpawnError.invalidResult
+            }
+            if existing.state == .completed {
+                guard existing.receipt?.payload.disposition == .accepted else {
+                    throw SubagentSpawnError.resultUnavailable
+                }
+                return
+            }
+            envelope = existing.envelope
+        } else {
+            let status = try await handle.status()
+            guard !status.state.isTerminal else { return }
+            envelope = try AgentCommandEnvelope(payload: AgentCommand(
+                commandID: commandID,
+                runID: runID,
+                expectedRunStateVersion: status.stateVersion,
+                action: .cancel,
+                issuedAt: try AgentTimestamp(Date())
+            ))
+        }
+        let receipt = try await handle.send(envelope)
+        guard receipt.disposition == .accepted else {
+            throw SubagentSpawnError.resultUnavailable
+        }
+    }
+
+    public func reconcile(
+        _ handleID: AgentExecutionHandleID,
+        runID: AgentRunID,
+        decision: AgentReconciliationDecision
+    ) async throws {
+        try await reconcile(handleID, runID: runID, decision: decision, generation: 1)
+    }
+
+    public func reconcile(
+        _ handleID: AgentExecutionHandleID,
+        runID: AgentRunID,
+        decision: AgentReconciliationDecision,
+        generation: UInt32
+    ) async throws {
+        guard generation > 0 else { throw SubagentSpawnError.invalidResult }
+        let handle = try await executor.attach(to: handleID)
+        let commandID = SubagentStableID.reconcileCommand(
+            runID: runID,
+            handleID: handleID,
+            decision: decision,
+            generation: generation
+        )
+        let envelope: AgentCommandEnvelope
+        if let existing = try await repository.loadCommand(commandID) {
+            guard existing.runID == runID,
+                  case .reconcile(_, let recordedDecision) = existing.envelope.payload.action,
+                  recordedDecision == decision
+            else { throw SubagentSpawnError.invalidResult }
+            if existing.state == .completed {
+                guard existing.receipt?.payload.disposition == .accepted else {
+                    throw SubagentSpawnError.resultUnavailable
+                }
+                return
+            }
+            // Replay the byte-identical admitted command. Reconstructing it with a new timestamp
+            // or state version would conflict with the stable command identity after a crash.
+            envelope = existing.envelope
+        } else {
+            let status = try await handle.status()
+            guard status.state == .waitingForReconciliation,
+                  case .reconciliation(let invocationID) = status.blockingReason
+            else { throw SubagentSpawnError.resultUnavailable }
+            envelope = try AgentCommandEnvelope(payload: AgentCommand(
+                commandID: commandID,
+                runID: runID,
+                expectedRunStateVersion: status.stateVersion,
+                action: .reconcile(invocationID: invocationID, decision: decision),
+                issuedAt: try AgentTimestamp(Date())
+            ))
+        }
+        let receipt = try await handle.send(envelope)
+        guard receipt.disposition == .accepted else {
+            throw SubagentSpawnError.resultUnavailable
+        }
+    }
+
+    private static func rejectReconciliationWait(_ status: AgentRunStatus) throws {
+        guard status.state == .waitingForReconciliation else { return }
+        guard let failure = status.failure else { throw SubagentSpawnError.invalidResult }
+        throw SubagentSpawnError.reconciliationRequired(failure)
     }
 
     private static func normalize(_ result: AgentResult) throws -> SubagentResult {
@@ -151,6 +297,10 @@ public struct DurableSubagentSpawner: SubagentSpawning, Sendable {
             }
             if childValue < parentValue { strictlySmaller = true }
         }
+        guard child.maximumThermalState <= parent.maximumThermalState,
+              child.memoryPressureResponse == parent.memoryPressureResponse
+        else { throw SubagentSpawnError.budgetNotAttenuated(.activeMilliseconds) }
+        if child.maximumThermalState < parent.maximumThermalState { strictlySmaller = true }
         guard strictlySmaller else {
             throw SubagentSpawnError.budgetNotAttenuated(.activeMilliseconds)
         }
@@ -178,6 +328,30 @@ enum SubagentStableID {
         AgentCommandID(rawValue: uuid(
             domain: "subagent-command.v1",
             components: [parentRunID.description, childRunID.description]
+        ))
+    }
+
+    static func cancelCommand(runID: AgentRunID, handleID: AgentExecutionHandleID) -> AgentCommandID {
+        AgentCommandID(rawValue: uuid(
+            domain: "subagent-cancel-command.v1",
+            components: [runID.description, handleID.description]
+        ))
+    }
+
+    static func reconcileCommand(
+        runID: AgentRunID,
+        handleID: AgentExecutionHandleID,
+        decision: AgentReconciliationDecision,
+        generation: UInt32
+    ) -> AgentCommandID {
+        AgentCommandID(rawValue: uuid(
+            domain: "subagent-reconcile-command.v1",
+            components: [
+                runID.description,
+                handleID.description,
+                decision.rawValue,
+                String(generation),
+            ]
         ))
     }
 

@@ -14,6 +14,7 @@ public final class WorkflowStore: WorkflowRecording {
     public private(set) var workflows: [UUID: WorkflowSummary] = [:]
     public private(set) var lastError: String?
     public private(set) var resumingWorkflowIDs: Set<UUID> = []
+    public private(set) var actioningWorkflowIDs: Set<UUID> = []
     /// Workflows known to be executing in this process. A durable `.running` record loaded from disk
     /// is deliberately absent until the user explicitly resumes it.
     public private(set) var executingWorkflowIDs: Set<UUID> = []
@@ -21,6 +22,14 @@ public final class WorkflowStore: WorkflowRecording {
     /// App-owned recovery seam. Loading the store never calls it; only an explicit Resume action
     /// from the workflow UI may restart durable work.
     public var resumeHandler: (@MainActor (UUID) async throws -> Void)?
+    public var dynamicApproveHandler: (@MainActor (UUID, WorkflowLaunchApprovalReuseScopeV1?) async throws -> Void)?
+    public var dynamicDenyHandler: (@MainActor (UUID) async throws -> Void)?
+    public var dynamicStartHandler: (@MainActor (UUID) async throws -> Void)?
+    public var dynamicPauseHandler: (@MainActor (UUID) async throws -> Void)?
+    public var dynamicResumeHandler: (@MainActor (UUID) async throws -> Void)?
+    public var dynamicReconcileHandler: (@MainActor (UUID, AgentReconciliationDecision) async throws -> Void)?
+    public var dynamicStopHandler: (@MainActor (UUID) async throws -> Void)?
+    public var dynamicRestartHandler: (@MainActor (UUID, WorkflowAgentCallID) async throws -> Void)?
 
     private let fileURL: URL
     private let encoder: JSONEncoder
@@ -46,7 +55,12 @@ public final class WorkflowStore: WorkflowRecording {
     }
 
     public func messageRecord(workflowID: UUID) -> WorkflowMessageRecord? {
-        workflows[workflowID].map(WorkflowMessageRecord.init)
+        guard let summary = workflows[workflowID] else { return nil }
+        var record = WorkflowMessageRecord(summary: summary)
+        if summary.dynamic != nil {
+            record.isAttachedInCurrentProcess = executingWorkflowIDs.contains(workflowID)
+        }
+        return record
     }
 
     public func resume(workflowID: UUID) async {
@@ -64,6 +78,76 @@ public final class WorkflowStore: WorkflowRecording {
         } catch {
             executingWorkflowIDs.remove(workflowID)
             lastError = "Workflow could not resume: \(error.localizedDescription)"
+        }
+    }
+
+    public func approveDynamic(
+        workflowID: UUID,
+        reuseScope: WorkflowLaunchApprovalReuseScopeV1?
+    ) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicApproveHandler] in
+            guard let dynamicApproveHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicApproveHandler(workflowID, reuseScope)
+        }
+    }
+
+    public func denyDynamic(workflowID: UUID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicDenyHandler] in
+            guard let dynamicDenyHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicDenyHandler(workflowID)
+        }
+    }
+
+    public func startDynamic(workflowID: UUID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicStartHandler] in
+            guard let dynamicStartHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicStartHandler(workflowID)
+        }
+    }
+
+    public func pauseDynamic(workflowID: UUID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicPauseHandler] in
+            guard let dynamicPauseHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicPauseHandler(workflowID)
+        }
+    }
+
+    public func resumeDynamic(workflowID: UUID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicResumeHandler] in
+            guard let dynamicResumeHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicResumeHandler(workflowID)
+        }
+    }
+
+    public func stopDynamic(workflowID: UUID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicStopHandler] in
+            guard let dynamicStopHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicStopHandler(workflowID)
+        }
+    }
+
+    public func restartDynamic(workflowID: UUID, callID: WorkflowAgentCallID) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicRestartHandler] in
+            guard let dynamicRestartHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicRestartHandler(workflowID, callID)
+        }
+    }
+
+    /// Marks attachment only after an explicit Start/Resume/Restart succeeds. Journal projection
+    /// and `load()` never call this, preserving neutral relaunch semantics.
+    public func markDynamicExecutionAttached(workflowID: UUID) {
+        guard workflows[workflowID]?.dynamic != nil else { return }
+        executingWorkflowIDs.insert(workflowID)
+        onWorkflowChanged?(workflowID)
+    }
+
+    public func reconcileDynamic(
+        workflowID: UUID,
+        decision: AgentReconciliationDecision
+    ) async {
+        await performDynamicAction(workflowID: workflowID) { [dynamicReconcileHandler] in
+            guard let dynamicReconcileHandler else { throw WorkflowStoreActionError.unavailable }
+            try await dynamicReconcileHandler(workflowID, decision)
         }
     }
 
@@ -88,9 +172,12 @@ public final class WorkflowStore: WorkflowRecording {
 
     public func save(_ summary: WorkflowSummary) async throws {
         workflows[summary.id] = summary
-        if summary.status == .running {
+        if summary.dynamic == nil, summary.status == .running {
             executingWorkflowIDs.insert(summary.id)
-        } else {
+        } else if let dynamic = summary.dynamic,
+                  summary.status != .running
+                    || ![DynamicWorkflowPresentationState.running, .pausing].contains(dynamic.state)
+        {
             executingWorkflowIDs.remove(summary.id)
         }
         try persist()
@@ -101,7 +188,25 @@ public final class WorkflowStore: WorkflowRecording {
         workflows.removeValue(forKey: workflowID)
         resumingWorkflowIDs.remove(workflowID)
         executingWorkflowIDs.remove(workflowID)
+        actioningWorkflowIDs.remove(workflowID)
         try? persist()
+    }
+
+    private func performDynamicAction(
+        workflowID: UUID,
+        operation: () async throws -> Void
+    ) async {
+        guard workflows[workflowID]?.dynamic != nil,
+              !actioningWorkflowIDs.contains(workflowID)
+        else { return }
+        actioningWorkflowIDs.insert(workflowID)
+        lastError = nil
+        defer { actioningWorkflowIDs.remove(workflowID) }
+        do {
+            try await operation()
+        } catch {
+            lastError = "Workflow action failed: \(error.localizedDescription)"
+        }
     }
 
     private func persist() throws {
@@ -114,4 +219,10 @@ public final class WorkflowStore: WorkflowRecording {
         )
         try data.write(to: fileURL, options: .atomic)
     }
+}
+
+private enum WorkflowStoreActionError: LocalizedError {
+    case unavailable
+
+    var errorDescription: String? { "This workflow action is unavailable." }
 }

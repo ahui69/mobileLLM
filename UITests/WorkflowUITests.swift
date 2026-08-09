@@ -2,10 +2,10 @@
 
 import XCTest
 
-// TEST-ID: AHT-WORKFLOW-001
-/// Simulator E2E for the message-anchored workflow surface (spec §20/§22): `/workflow <goal>`
-/// creates the running record below the initiating message immediately, then the orchestrator
-/// drives the child run (online model injected from ~/.mobilellm/openai.json by the runner).
+// TEST-ID: AHT-DYNAMIC-UI-001
+/// Simulator E2E for the message-anchored Dynamic Workflow surface (spec §34): `/workflow <goal>`
+/// first creates an inert candidate, exposes the exact analyzed JavaScript, and requires separate
+/// approval and Start actions before any child work can run.
 final class WorkflowUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -14,6 +14,7 @@ final class WorkflowUITests: XCTestCase {
     @MainActor
     func testWorkflowCommandShowsMessageAnchoredRecord() throws {
         let app = XCUIApplication()
+        app.launchEnvironment["MOBILELLM_DYNAMIC_WORKFLOW_RESPONSES_FIXTURE"] = "1"
         app.launch()
 
         let newChat = app.buttons.matching(identifier: "New chat").firstMatch
@@ -36,8 +37,9 @@ final class WorkflowUITests: XCTestCase {
             "the composer must clear after a /workflow send"
         )
 
-        // The DEBUG app seeds its online service from the build-time embedded openai-config.json
-        // (scripts/embed-openai-app-config.sh), so no runner-side key injection is needed.
+        // The DEBUG app seeds its online service from the build-time config and routes Responses API
+        // traffic through an opt-in deterministic transport. This still exercises the production
+        // provider parser/runtime path without making UI acceptance depend on a live model.
         let row = app.descendants(matching: .any).matching(
             NSPredicate(format: "label BEGINSWITH %@", "Workflow: deploy Kimi K3")
         ).firstMatch
@@ -46,68 +48,56 @@ final class WorkflowUITests: XCTestCase {
         }
         let value = readValue(row) ?? ""
         XCTAssertTrue(
-            value.contains("Running") || value.contains("Completed"),
-            "the workflow row should be Running or Completed, got '\(value)'"
+            value.contains("Generating candidate") || value.contains("Waiting for approval"),
+            "the workflow must begin as an inert candidate, got '\(value)'"
         )
-        XCTAssertTrue(
-            value.contains("/") && value.contains("subagents"),
-            "workflow subagent totals must be x/y from the start, got '\(value)'"
-        )
-        // The real planner + real children take many minutes on the online API; this routine E2E
-        // asserts the multi-phase engine is genuinely progressing with live statistics, not full
-        // completion (the full audit→revise→verify→deliver run is the device scenario test31).
-        let deadline = Date().addingTimeInterval(480)
-        var terminal = readValue(row) ?? ""
-        var reachedPhaseThree = false
-        var sawLiveStats = false
-        while Date() < deadline,
-              !terminal.contains("Completed"),
-              !terminal.contains("Failed"),
-              !terminal.contains("Cancelled")
+
+        let candidateDeadline = Date().addingTimeInterval(180)
+        var candidateState = readValue(row) ?? ""
+        while Date() < candidateDeadline,
+              !candidateState.contains("Waiting for approval"),
+              !candidateState.contains("Failed")
         {
-            if terminal.contains("phase 3/") || terminal.contains("phase 4/")
-                || terminal.contains("phase 5/") || terminal.contains("phase 6/")
-            {
-                reachedPhaseThree = true
-            }
-            if terminal.contains("tokens") && !terminal.contains("0 tokens")
-                && terminal.contains("tool calls")
-            {
-                sawLiveStats = true
-            }
-            if reachedPhaseThree, sawLiveStats { break }
-            Thread.sleep(forTimeInterval: 2)
-            terminal = readValue(row) ?? terminal
-        }
-        if terminal.contains("Completed") {
-            reachedPhaseThree = true
-            sawLiveStats = terminal.contains("tokens") && !terminal.contains("0 tokens")
-                && terminal.contains("tool calls")
+            Thread.sleep(forTimeInterval: 1)
+            candidateState = readValue(row) ?? candidateState
         }
         XCTAssertTrue(
-            reachedPhaseThree,
-            "the workflow must reach at least phase 3 of its auto-generated plan, got '\(terminal)'"
+            candidateState.contains("Waiting for approval"),
+            "candidate generation must finish without auto-execution, got '\(candidateState)'"
         )
-        XCTAssertTrue(
-            sawLiveStats,
-            "live token/tool-call statistics must appear, got '\(terminal)'"
-        )
-        XCTAssertTrue(
-            !terminal.contains("Failed") && !terminal.contains("Cancelled"),
-            "the workflow must not fail during the progression window, got '\(terminal)'"
-        )
+
+        row.tap()
+        let sourceDisclosure = app.buttons["JavaScript source"]
+        XCTAssertTrue(sourceDisclosure.waitForExistence(timeout: 20), "source disclosure is missing")
+        sourceDisclosure.tap()
+        let source = app.descendants(matching: .any)["workflow.source"]
+        let approval = app.descendants(matching: .any)["workflow.approval"]
+        XCTAssertTrue(source.waitForExistence(timeout: 5), "exact JavaScript source is not inspectable")
+        XCTAssertTrue(approval.exists, "candidate approval controls are missing")
+        XCTAssertFalse(app.descendants(matching: .any)["workflow.start"].exists)
+
+        let once = app.buttons["Once"]
+        XCTAssertTrue(once.exists)
+        once.tap()
+        let start = app.descendants(matching: .any)["workflow.start"]
+        XCTAssertTrue(start.waitForExistence(timeout: 20), "approval must queue, not auto-start")
+        XCTAssertEqual(app.descendants(matching: .any)["workflow.state"].label,
+                       "Approved — ready to start")
+
+        start.tap()
+        let state = app.descendants(matching: .any)["workflow.state"]
+        let started = NSPredicate(format: "label == 'Running' OR label == 'Completed'")
+        expectation(for: started, evaluatedWith: state)
+        waitForExpectations(timeout: 20)
     }
 
     /// Reading `.value` immediately after `waitForExistence` can race a list re-render; retry a few
-    /// times before giving up.
+    /// snapshots before giving up.
+    @MainActor
     private func readValue(_ element: XCUIElement) -> String? {
         for _ in 0 ..< 10 {
-            do {
-                if element.exists, let value = element.value as? String {
-                    return value
-                }
-            } catch {
-                // Transient snapshot failure while the app's main thread is busy; retry.
+            if element.exists, let value = element.value as? String {
+                return value
             }
             Thread.sleep(forTimeInterval: 0.2)
         }

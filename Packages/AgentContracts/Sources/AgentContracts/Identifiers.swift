@@ -93,6 +93,14 @@ public enum SandboxExecutionHandleIDDomain: AgentIdentifierDomain {}
 public enum SandboxCommandIDDomain: AgentIdentifierDomain {}
 /// Identifier domain for a sandbox event.
 public enum SandboxEventIDDomain: AgentIdentifierDomain {}
+/// Identifier domain for a stable saved dynamic-workflow script family.
+public enum WorkflowScriptIDDomain: AgentIdentifierDomain {}
+/// Identifier domain for one durable dynamic-workflow execution.
+public enum WorkflowRunIDDomain: AgentIdentifierDomain {}
+/// Identifier domain for one dynamic-workflow journal event.
+public enum WorkflowEventIDDomain: AgentIdentifierDomain {}
+/// Identifier domain for one ordered agent invocation in a workflow run.
+public enum WorkflowAgentCallIDDomain: AgentIdentifierDomain {}
 
 /// Stable identifier for an agent run.
 public typealias AgentRunID = AgentIdentifier<AgentRunIDDomain>
@@ -134,6 +142,14 @@ public typealias SandboxExecutionHandleID = AgentIdentifier<SandboxExecutionHand
 public typealias SandboxCommandID = AgentIdentifier<SandboxCommandIDDomain>
 /// Stable identity for one durable sandbox event.
 public typealias SandboxEventID = AgentIdentifier<SandboxEventIDDomain>
+/// Stable identity shared by every immutable saved version of a workflow script.
+public typealias WorkflowScriptID = AgentIdentifier<WorkflowScriptIDDomain>
+/// Stable identity of one execution of an exact workflow script digest.
+public typealias WorkflowRunID = AgentIdentifier<WorkflowRunIDDomain>
+/// Stable identity of one event in a workflow instance journal.
+public typealias WorkflowEventID = AgentIdentifier<WorkflowEventIDDomain>
+/// Stable identity for one started-order workflow agent invocation.
+public typealias WorkflowAgentCallID = AgentIdentifier<WorkflowAgentCallIDDomain>
 
 /// Cursor bound to one sandbox execution stream and committed event.
 public struct SandboxEventCursor: Hashable, Codable, Sendable, Comparable {

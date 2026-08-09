@@ -5,6 +5,7 @@ import AgentContracts
 @testable import MobileLLMUI
 
 // TEST-ID: AHT-WORKFLOW-001
+// TEST-ID: AHT-DYNAMIC-001
 @MainActor
 final class WorkflowStoreTests: XCTestCase {
     func testSaveLoadRoundTripAndRunningFlag() async throws {
@@ -104,5 +105,160 @@ final class WorkflowStoreTests: XCTestCase {
         XCTAssertEqual(store.lastError, "Workflow could not resume: fixture failed")
         XCTAssertFalse(store.executingWorkflowIDs.contains(workflowID))
         XCTAssertTrue(store.resumingWorkflowIDs.isEmpty)
+    }
+
+    func testPendingDynamicApprovalSurvivesRelaunchWithoutStarting() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-dynamic-pending-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let runID = WorkflowRunID(rawValue: workflowID)
+        let writer = WorkflowStore(directory: directory)
+        try await writer.save(WorkflowSummary(
+            id: workflowID,
+            title: "Review me",
+            conversationID: UUID(),
+            dynamic: DynamicWorkflowPresentation(
+                runID: runID,
+                source: "export const meta = {};",
+                state: .waitingForLaunchApproval
+            )
+        ))
+
+        let reloaded = WorkflowStore(directory: directory)
+        var startCount = 0
+        reloaded.dynamicStartHandler = { _ in startCount += 1 }
+        reloaded.load()
+
+        XCTAssertEqual(reloaded.summary(workflowID: workflowID)?.dynamic?.runID, runID)
+        XCTAssertEqual(
+            reloaded.messageRecord(workflowID: workflowID)?.dynamic?.state,
+            .waitingForLaunchApproval
+        )
+        XCTAssertEqual(startCount, 0, "loading a pending approval must remain projection-only")
+        XCTAssertFalse(reloaded.executingWorkflowIDs.contains(workflowID))
+    }
+
+    func testDynamicApprovalAndStartAreSeparateExplicitActions() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-dynamic-actions-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let store = WorkflowStore(directory: directory)
+        try await store.save(WorkflowSummary(
+            id: workflowID,
+            title: "Explicit control",
+            dynamic: DynamicWorkflowPresentation(
+                runID: WorkflowRunID(rawValue: workflowID),
+                state: .waitingForLaunchApproval
+            )
+        ))
+        var approvals: [WorkflowLaunchApprovalReuseScopeV1?] = []
+        var startCount = 0
+        store.dynamicApproveHandler = { id, scope in
+            XCTAssertEqual(id, workflowID)
+            approvals.append(scope)
+        }
+        store.dynamicStartHandler = { id in
+            XCTAssertEqual(id, workflowID)
+            startCount += 1
+        }
+
+        await store.approveDynamic(workflowID: workflowID, reuseScope: .conversation)
+        XCTAssertEqual(approvals, [.conversation])
+        XCTAssertEqual(startCount, 0, "approval must not implicitly execute the workflow")
+
+        await store.startDynamic(workflowID: workflowID)
+        XCTAssertEqual(startCount, 1)
+    }
+
+    func testDynamicReconciliationForwardsExactDecisionWithoutGenericResume() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-dynamic-reconcile-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let store = WorkflowStore(directory: directory)
+        try await store.save(WorkflowSummary(
+            id: workflowID,
+            title: "Reconcile uncertain action",
+            dynamic: DynamicWorkflowPresentation(
+                runID: WorkflowRunID(rawValue: workflowID),
+                state: .waitingForReconciliation,
+                reconciliationCallID: WorkflowAgentCallID()
+            )
+        ))
+        var reconciliations: [AgentReconciliationDecision] = []
+        var resumeCount = 0
+        store.dynamicReconcileHandler = { id, decision in
+            XCTAssertEqual(id, workflowID)
+            reconciliations.append(decision)
+        }
+        store.dynamicResumeHandler = { _ in resumeCount += 1 }
+
+        await store.reconcileDynamic(workflowID: workflowID, decision: .abandoned)
+
+        XCTAssertEqual(reconciliations, [.abandoned])
+        XCTAssertEqual(resumeCount, 0, "reconciliation must not be represented as a generic resume")
+        XCTAssertTrue(store.actioningWorkflowIDs.isEmpty)
+    }
+
+    // TEST-ID: AHT-DYNAMIC-UI-001
+    func testRunningJournalProjectionRemainsInterruptedUntilExplicitAttachment() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-dynamic-interrupted-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let writer = WorkflowStore(directory: directory)
+        try await writer.save(WorkflowSummary(
+            id: workflowID,
+            title: "Interrupted",
+            dynamic: DynamicWorkflowPresentation(
+                runID: WorkflowRunID(rawValue: workflowID),
+                state: .running
+            )
+        ))
+
+        let reloaded = WorkflowStore(directory: directory)
+        reloaded.load()
+        var projected = try XCTUnwrap(reloaded.summary(workflowID: workflowID))
+        projected.dynamic?.logs = ["journal replayed"]
+        try await reloaded.save(projected)
+
+        XCTAssertFalse(reloaded.executingWorkflowIDs.contains(workflowID))
+        XCTAssertEqual(
+            reloaded.messageRecord(workflowID: workflowID)?.isAttachedInCurrentProcess,
+            false
+        )
+
+        reloaded.markDynamicExecutionAttached(workflowID: workflowID)
+        XCTAssertTrue(reloaded.executingWorkflowIDs.contains(workflowID))
+        XCTAssertEqual(
+            reloaded.messageRecord(workflowID: workflowID)?.isAttachedInCurrentProcess,
+            true
+        )
+    }
+
+    func testDynamicRestartForwardsExactCallWithoutGenericResume() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("workflow-dynamic-restart-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let workflowID = UUID()
+        let callID = WorkflowAgentCallID()
+        let store = WorkflowStore(directory: directory)
+        try await store.save(WorkflowSummary(
+            id: workflowID,
+            title: "Restart",
+            dynamic: DynamicWorkflowPresentation(
+                runID: WorkflowRunID(rawValue: workflowID),
+                state: .paused
+            )
+        ))
+        var received: (UUID, WorkflowAgentCallID)?
+        store.dynamicRestartHandler = { received = ($0, $1) }
+
+        await store.restartDynamic(workflowID: workflowID, callID: callID)
+
+        XCTAssertEqual(received?.0, workflowID)
+        XCTAssertEqual(received?.1, callID)
     }
 }

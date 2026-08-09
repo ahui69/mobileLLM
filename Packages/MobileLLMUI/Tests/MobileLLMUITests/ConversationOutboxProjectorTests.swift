@@ -190,6 +190,50 @@ final class ConversationOutboxProjectorTests: XCTestCase {
         XCTAssertTrue(loaded.messages.isEmpty)
     }
 
+    func testInternalRunBoundariesAcknowledgeWithoutLeakingMessages() async throws {
+        let (store, dir) = tempStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let conversationID = UUID()
+        try await store.save(Conversation(
+            id: conversationID,
+            modelID: "bonsai-8b",
+            variantID: "mlx"
+        ))
+        let payload = Data("private orchestration traffic".utf8)
+        let outbox = FakeOutboxProvider()
+        await outbox.seed([
+            item(
+                conversationID: conversationID,
+                messageID: UUID(),
+                kind: .internalRunAccepted,
+                payload: payload,
+                idempotencyKey: "internal-accepted:1"
+            ),
+            item(
+                conversationID: conversationID,
+                messageID: UUID(),
+                kind: .internalRunFinalized,
+                payload: payload,
+                idempotencyKey: "internal-final:1"
+            ),
+        ])
+
+        // A no-op boundary must not even require the internal artifact to be readable by the UI.
+        let projector = makeProjector(
+            store: store,
+            outbox: outbox,
+            payloads: FakePayloadProvider(payloads: [:])
+        )
+        await projector.drain()
+
+        let delivered = await outbox.deliveredKeys()
+        XCTAssertEqual(Set(delivered), [
+            "internal-accepted:1", "internal-final:1",
+        ])
+        let loaded = try await loadConversation(conversationID, from: store)
+        XCTAssertTrue(loaded.messages.isEmpty)
+    }
+
     func testDeleteConversationOutboxSoftDeletes() async throws {
         let (store, dir) = tempStore()
         defer { try? FileManager.default.removeItem(at: dir) }

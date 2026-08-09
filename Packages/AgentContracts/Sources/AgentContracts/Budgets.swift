@@ -117,6 +117,77 @@ public struct BudgetQuantities: Hashable, Codable, Sendable {
         return Self(values)
     }
 
+    /// Aggregates independently measured usage using the accounting rule of each dimension.
+    /// Run totals are summed, while per-attempt/operation ceilings and peaks retain their maximum.
+    /// This is intentionally distinct from ``adding(_:)``, which is raw vector arithmetic used by
+    /// callers that are not combining usage observations.
+    public func aggregatingUsage(_ other: Self) throws -> Self {
+        var values: [BudgetDimension: UInt64] = [:]
+        for dimension in BudgetDimension.allCases {
+            let value: UInt64
+            switch dimension.accounting {
+            case .cumulative:
+                let (sum, overflow) = self[dimension].addingReportingOverflow(other[dimension])
+                guard !overflow else {
+                    throw AgentContractError.arithmeticOverflow(dimension: dimension)
+                }
+                value = sum
+            case .maximum:
+                value = max(self[dimension], other[dimension])
+            }
+            if value > 0 || contains(dimension) || other.contains(dimension) {
+                values[dimension] = value
+            }
+        }
+        return Self(values)
+    }
+
+    /// Returns one fair reservation share for bounded parallel work. Cumulative dimensions are
+    /// divided so `participantCount` simultaneous children can fit the parent budget; maximum and
+    /// peak dimensions retain the parent's per-child ceiling.
+    public func sharingCumulativeCapacity(among participantCount: UInt64) throws -> Self {
+        guard participantCount > 0 else {
+            throw AgentContractError.invalidName("parallel budget participant count")
+        }
+        var values: [BudgetDimension: UInt64] = [:]
+        for dimension in BudgetDimension.allCases {
+            let original = self[dimension]
+            let value: UInt64 = switch dimension.accounting {
+            case .cumulative:
+                original / participantCount
+            case .maximum:
+                original
+            }
+            if value > 0 || contains(dimension) { values[dimension] = value }
+        }
+        return Self(values)
+    }
+
+    /// Expands only total/cumulative capacity for a bounded parent that coordinates several
+    /// independent children. Per-attempt, per-operation, and peak ceilings remain unchanged.
+    public func scalingCumulativeCapacity(by factor: UInt64) throws -> Self {
+        guard factor > 0 else {
+            throw AgentContractError.invalidName("workflow budget scale")
+        }
+        var values: [BudgetDimension: UInt64] = [:]
+        for dimension in BudgetDimension.allCases {
+            let original = self[dimension]
+            let value: UInt64
+            switch dimension.accounting {
+            case .cumulative:
+                let (product, overflow) = original.multipliedReportingOverflow(by: factor)
+                guard !overflow else {
+                    throw AgentContractError.arithmeticOverflow(dimension: dimension)
+                }
+                value = product
+            case .maximum:
+                value = original
+            }
+            if value > 0 || contains(dimension) { values[dimension] = value }
+        }
+        return Self(values)
+    }
+
     /// Returns a vector formed by taking each component's maximum.
     public func componentwiseMaximum(_ other: Self) -> Self {
         Self(Dictionary(uniqueKeysWithValues: BudgetDimension.allCases.map {
@@ -292,6 +363,11 @@ public struct AgentUsage: Hashable, Codable, Sendable {
 
     /// A zero-usage value.
     public static let zero = Self()
+
+    /// Returns the accounting-correct aggregate of independent usage observations.
+    public func aggregating(_ other: Self) throws -> Self {
+        Self(quantities: try quantities.aggregatingUsage(other.quantities))
+    }
 }
 
 /// A maximum resource reservation recorded before work begins.

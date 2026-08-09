@@ -31,7 +31,7 @@ public struct ContentAddressedExecutionPayloadStore: AgentExecutionPayloadStorin
         case .conversation, .message: .conversation
         case .userManaged: .userManaged
         case .transient: .transient
-        case .durableRecord:
+        case .durableRecord, .workflowRun:
             throw AgentExecutionError.internalInvariant(
                 "durable-record payload owner has no compatible retention policy"
             )

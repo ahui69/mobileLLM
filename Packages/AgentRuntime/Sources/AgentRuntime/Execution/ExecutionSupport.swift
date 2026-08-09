@@ -120,6 +120,17 @@ enum ExecutionStableID {
     }
 }
 
+extension AgentRequestProvenance.Source {
+    /// Only direct user work (including an explicit user resume) belongs in the conversation
+    /// projection. Workflow generators and child agents are inspected through their parent record.
+    var projectsConversation: Bool {
+        switch self {
+        case .user, .resume: true
+        case .parentAgent, .workflow: false
+        }
+    }
+}
+
 struct ExecutionEventBuilder {
     let requestID: AgentRequestID
     let handleID: AgentExecutionHandleID

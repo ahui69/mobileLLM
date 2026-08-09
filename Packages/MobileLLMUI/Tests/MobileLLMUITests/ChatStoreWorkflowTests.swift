@@ -137,6 +137,42 @@ final class ChatStoreWorkflowTests: XCTestCase {
         } ?? []
         XCTAssertEqual(assistantMessages.count, 1, "the final answer must be projected exactly once")
         XCTAssertTrue(assistantMessages[0].answer.contains("llama.cpp"))
+        XCTAssertEqual(assistantMessages[0].workflowResultID, workflowID)
+
+        // TEST-ID: AHT-DYNAMIC-UI-002
+        // Two cold projections emulate consecutive relaunches. The persisted workflow provenance,
+        // not process memory, must suppress both duplicate insertions.
+        try await waitForPersistedWorkflowResult(store: store, workflowID: workflowID)
+        for relaunch in 1 ... 2 {
+            let reloadedWorkflowStore = WorkflowStore(
+                directory: dir.appendingPathComponent("wf", isDirectory: true)
+            )
+            let reloaded = ChatStore(
+                engine: MockLLMEngine(script: .init(answer: "unused")),
+                store: store,
+                settings: AppSettings(defaults: UserDefaults(
+                    suiteName: "workflow-relaunch-\(relaunch)-\(UUID().uuidString)"
+                )!),
+                activeModel: LoadedModel(
+                    model: LLMCatalog.bonsai8b,
+                    variant: LLMCatalog.bonsai8b.defaultVariantValue
+                ),
+                workflowStore: reloadedWorkflowStore
+            )
+            await reloaded.load()
+            reloadedWorkflowStore.load()
+            try await reloadedWorkflowStore.save(completed)
+
+            let projected = reloaded.conversations.flatMap(\.messages).filter {
+                $0.workflowResultID == workflowID
+            }
+            XCTAssertEqual(
+                projected.count,
+                1,
+                "relaunch \(relaunch) duplicated the persisted workflow result"
+            )
+            try await waitForPersistedWorkflowResult(store: store, workflowID: workflowID)
+        }
     }
 
     private func tempStore() -> (ConversationStore, URL) {
@@ -155,5 +191,19 @@ final class ChatStoreWorkflowTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("condition timed out")
+    }
+
+    private func waitForPersistedWorkflowResult(
+        store: ConversationStore,
+        workflowID: UUID
+    ) async throws {
+        for _ in 0 ..< 200 {
+            let count = await store.loadAllLive().flatMap(\.messages).filter {
+                $0.workflowResultID == workflowID
+            }.count
+            if count == 1 { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("workflow result provenance was not durably persisted exactly once")
     }
 }

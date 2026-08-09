@@ -655,6 +655,14 @@ extension AgentRunController {
         // real network round trip that legitimately runs minutes for long answers, so the per-attempt
         // ceiling is generous and the run budget still bounds the whole run (15 minutes by default).
         let attemptTimeoutCap: UInt64 = provider.descriptor.location == .remote ? 300_000 : 60_000
+        let attemptActiveReservation: UInt64 = if provider.descriptor.location == .remote {
+            // Remote providers may legitimately use the full five-minute request window. Reserve
+            // that window plus bounded cancellation/settlement grace; the prior fixed 120s local
+            // allowance made a healthy long response fail only when its usage was committed.
+            min(attemptTimeoutCap + 30_000, facts.submission!.request.payload.budget.limits[.activeMilliseconds])
+        } else {
+            min(2 * attemptTimeoutCap, facts.submission!.request.payload.budget.limits[.activeMilliseconds])
+        }
         let prepContext = try ModelPreparationContext(
             conversationID: facts.submission!.request.payload.conversationID,
             modelPolicy: facts.submission!.request.payload.modelPolicy,
@@ -782,6 +790,7 @@ extension AgentRunController {
         let reservation = try modelReservation(
             request: modelRequest,
             budget: facts.submission!.request.payload.budget,
+            maximumActiveMilliseconds: attemptActiveReservation,
             structuredRepair: history.repairCount > 0
         )
         guard let durableLedger = facts.budgetLedger else {
@@ -902,6 +911,7 @@ extension AgentRunController {
     private func modelReservation(
         request: AgentModelRequest,
         budget: AgentBudget,
+        maximumActiveMilliseconds: UInt64,
         structuredRepair: Bool
     ) throws -> BudgetReservation {
         try BudgetReservation(
@@ -916,10 +926,10 @@ extension AgentRunController {
                 .inputTokens: request.generationParameters.maximumContextTokens,
                 .outputTokens: request.generationParameters.maximumOutputTokens,
                 .contextTokensPerAttempt: request.generationParameters.maximumContextTokens,
-                // A local decode can legitimately overrun the request timeout by a small margin on a
-                // warm device; reserving twice the timeout (still bounded by the run ceiling) keeps a
-                // 500ms settle overrun from killing an otherwise healthy run.
-                .activeMilliseconds: min(2 * 60_000, budget.limits[.activeMilliseconds]),
+                .activeMilliseconds: min(
+                    maximumActiveMilliseconds,
+                    budget.limits[.activeMilliseconds]
+                ),
                 .peakMemoryBytes: budget.limits[.peakMemoryBytes],
             ])),
             reason: "model-attempt"
@@ -1179,7 +1189,7 @@ extension AgentRunController {
         switch failure.classification {
         case .budgetRelated: .budgetExceeded
         case .permissionRelated: .permissionDenied
-        case .incompatible: .modelUnavailable
+        case .availabilityRelated, .incompatible: .modelUnavailable
         case .potentiallySideEffecting: .externalResultUncertain
         case .cancelled, .permanent, .transient: .internalFailure
         }
@@ -1339,8 +1349,14 @@ extension AgentRunController {
     private func finalize(runID: AgentRunID, answer: AgentAnswer) async throws {
         let (facts, _) = try await loadRun(runID)
         let data = try ExecutionEncoding.encode(answer)
-        let messageID = facts.submission?.request.payload.provenance.responseMessageID
-            ?? ExecutionStableID.message(runID: runID, role: .assistant)
+        guard let request = facts.submission?.request.payload else {
+            throw AgentExecutionError.invalidRecoveryBoundary
+        }
+        let projectsConversation = request.provenance.source.projectsConversation
+        let messageID = projectsConversation
+            ? (request.provenance.responseMessageID
+                ?? ExecutionStableID.message(runID: runID, role: .assistant))
+            : ExecutionStableID.message(runID: runID, role: .assistant)
         let artifact = try await payloadStore.commit(
             data: data,
             mimeType: "application/json",
@@ -1405,11 +1421,13 @@ extension AgentRunController {
             createdAt: builder.timestamp
         )
         let outbox = ProjectionOutboxItem(
-            idempotencyKey: "final:\(messageID.description)",
+            idempotencyKey: projectsConversation
+                ? "final:\(messageID.description)"
+                : "internal-final:\(runID.description)",
             conversationID: conversationID,
             runID: runID,
             messageID: messageID,
-            kind: .finalAnswer,
+            kind: projectsConversation ? .finalAnswer : .internalRunFinalized,
             payloadDigest: digest,
             payloadArtifactID: artifact.id
         )

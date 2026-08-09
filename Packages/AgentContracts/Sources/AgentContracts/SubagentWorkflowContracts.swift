@@ -143,6 +143,141 @@ public enum WorkflowStatus: String, CaseIterable, Hashable, Codable, Sendable {
     case cancelled
 }
 
+/// UI-facing lifecycle for a Claude-style JavaScript workflow. Candidate generation is an app
+/// concern that intentionally precedes the durable runtime state machine; every other case is a
+/// lossless presentation of `WorkflowRunStateV1`.
+public enum DynamicWorkflowPresentationState: String, CaseIterable, Hashable, Codable, Sendable {
+    case generatingCandidate
+    case waitingForLaunchApproval
+    case queued
+    case running
+    case pausing
+    case paused
+    case waitingForForeground
+    case waitingForReconciliation
+    case completed
+    case failed
+    case cancelled
+
+    public init(_ runtimeState: WorkflowRunStateV1) {
+        self = switch runtimeState {
+        case .waitingForLaunchApproval: .waitingForLaunchApproval
+        case .queued: .queued
+        case .running: .running
+        case .pausing: .pausing
+        case .paused: .paused
+        case .waitingForForeground: .waitingForForeground
+        case .waitingForReconciliation: .waitingForReconciliation
+        case .completed: .completed
+        case .failed: .failed
+        case .cancelled: .cancelled
+        }
+    }
+
+    public var workflowStatus: WorkflowStatus {
+        switch self {
+        case .completed: .completed
+        case .failed: .failed
+        case .cancelled: .cancelled
+        default: .running
+        }
+    }
+}
+
+public enum DynamicWorkflowChildStatus: String, Hashable, Codable, Sendable {
+    case prepared
+    case submitted
+    case completed
+    case failed
+    case unavailable
+    case stopped
+    case uncertain
+}
+
+/// Inspectable, non-secret child-call projection. Prompts remain digest-only; labels, attempts and
+/// durable identities are sufficient for status inspection and explicit recovery controls.
+public struct DynamicWorkflowChildPresentation: Hashable, Codable, Sendable, Identifiable {
+    public var id: WorkflowAgentCallID { callID }
+    public let callID: WorkflowAgentCallID
+    public let ordinal: UInt32
+    public let attempt: UInt16
+    public let label: String?
+    public let phase: String?
+    public let childRunID: AgentRunID
+    public let handleID: AgentExecutionHandleID?
+    public let status: DynamicWorkflowChildStatus
+    public let detail: String?
+
+    public init(
+        callID: WorkflowAgentCallID,
+        ordinal: UInt32,
+        attempt: UInt16,
+        label: String? = nil,
+        phase: String? = nil,
+        childRunID: AgentRunID,
+        handleID: AgentExecutionHandleID? = nil,
+        status: DynamicWorkflowChildStatus,
+        detail: String? = nil
+    ) {
+        self.callID = callID
+        self.ordinal = ordinal
+        self.attempt = attempt
+        self.label = label
+        self.phase = phase
+        self.childRunID = childRunID
+        self.handleID = handleID
+        self.status = status
+        self.detail = detail
+    }
+}
+
+/// Persisted presentation snapshot for a Dynamic Workflow. Keeping the exact analyzed source and
+/// phase metadata beside the initiating message makes approval review available after relaunch;
+/// the runtime journal remains authoritative for execution state.
+public struct DynamicWorkflowPresentation: Hashable, Codable, Sendable {
+    public let runID: WorkflowRunID
+    public var scriptReference: WorkflowScriptReferenceV1?
+    public var metadata: WorkflowScriptMetadataV1?
+    public var source: String?
+    public var state: DynamicWorkflowPresentationState
+    public var currentPhase: String?
+    public var logs: [String]
+    public var completedCallCount: Int
+    public var totalCallCount: Int
+    /// Optional for backward decoding of dynamic summaries written before child inspection landed.
+    public var childCalls: [DynamicWorkflowChildPresentation]?
+    public var reconciliationCallID: WorkflowAgentCallID?
+    public var failure: String?
+
+    public init(
+        runID: WorkflowRunID,
+        scriptReference: WorkflowScriptReferenceV1? = nil,
+        metadata: WorkflowScriptMetadataV1? = nil,
+        source: String? = nil,
+        state: DynamicWorkflowPresentationState,
+        currentPhase: String? = nil,
+        logs: [String] = [],
+        completedCallCount: Int = 0,
+        totalCallCount: Int = 0,
+        childCalls: [DynamicWorkflowChildPresentation] = [],
+        reconciliationCallID: WorkflowAgentCallID? = nil,
+        failure: String? = nil
+    ) {
+        self.runID = runID
+        self.scriptReference = scriptReference
+        self.metadata = metadata
+        self.source = source
+        self.state = state
+        self.currentPhase = currentPhase
+        self.logs = logs
+        self.completedCallCount = completedCallCount
+        self.totalCallCount = totalCallCount
+        self.childCalls = childCalls
+        self.reconciliationCallID = reconciliationCallID
+        self.failure = failure
+    }
+}
+
 /// Aggregated workflow/phase statistics (spec §20/§23).
 public struct WorkflowAggregatedStats: Hashable, Codable, Sendable {
     public var subagentCount: Int
@@ -279,6 +414,8 @@ public struct WorkflowSummary: Hashable, Codable, Sendable, Identifiable {
     public var totalPhaseCount: Int
     /// The workflow's final result text, projected into the chat on completion.
     public var finalAnswer: String?
+    /// Present only for the Dynamic Workflows path. `nil` preserves all legacy staged-plan records.
+    public var dynamic: DynamicWorkflowPresentation?
 
     public init(
         id: UUID = UUID(),
@@ -293,7 +430,8 @@ public struct WorkflowSummary: Hashable, Codable, Sendable, Identifiable {
         aggregated: WorkflowAggregatedStats = WorkflowAggregatedStats(),
         completedPhaseCount: Int = 0,
         totalPhaseCount: Int = 0,
-        finalAnswer: String? = nil
+        finalAnswer: String? = nil,
+        dynamic: DynamicWorkflowPresentation? = nil
     ) {
         self.id = id
         self.title = title
@@ -308,6 +446,7 @@ public struct WorkflowSummary: Hashable, Codable, Sendable, Identifiable {
         self.completedPhaseCount = completedPhaseCount
         self.totalPhaseCount = totalPhaseCount
         self.finalAnswer = finalAnswer
+        self.dynamic = dynamic
     }
 
     public var isRunning: Bool { status == .running }
@@ -362,6 +501,9 @@ public struct WorkflowMessageRecord: Hashable, Codable, Sendable {
     public var completedSubagentCount: Int
     public var totalSubagentCount: Int
     public var finalAnswer: String?
+    public var dynamic: DynamicWorkflowPresentation?
+    /// Process-local attachment projected by `WorkflowStore`; false after neutral relaunch.
+    public var isAttachedInCurrentProcess: Bool?
 
     public init(
         workflowID: UUID,
@@ -376,7 +518,9 @@ public struct WorkflowMessageRecord: Hashable, Codable, Sendable {
         totalPhaseCount: Int = 0,
         completedSubagentCount: Int = 0,
         totalSubagentCount: Int = 0,
-        finalAnswer: String? = nil
+        finalAnswer: String? = nil,
+        dynamic: DynamicWorkflowPresentation? = nil,
+        isAttachedInCurrentProcess: Bool? = nil
     ) {
         self.workflowID = workflowID
         self.title = title
@@ -391,6 +535,8 @@ public struct WorkflowMessageRecord: Hashable, Codable, Sendable {
         self.completedSubagentCount = completedSubagentCount
         self.totalSubagentCount = totalSubagentCount
         self.finalAnswer = finalAnswer
+        self.dynamic = dynamic
+        self.isAttachedInCurrentProcess = isAttachedInCurrentProcess
     }
 
     public init(summary: WorkflowSummary) {
@@ -407,6 +553,8 @@ public struct WorkflowMessageRecord: Hashable, Codable, Sendable {
         completedSubagentCount = summary.completedSubagentCount
         totalSubagentCount = summary.totalSubagentCount
         finalAnswer = summary.finalAnswer
+        dynamic = summary.dynamic
+        isAttachedInCurrentProcess = nil
     }
 }
 
