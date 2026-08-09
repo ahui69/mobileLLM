@@ -1710,7 +1710,7 @@
     },
     {
       "id": "AHT-SPAWNER-001",
-      "title": "Spawner runs durable sequential child runs with attenuated authority",
+      "title": "Spawner runs durable child runs with attenuated authority",
       "status": "active",
       "kind": "integration",
       "riskTier": "P1",
@@ -1743,6 +1743,65 @@
       ],
       "requiredEvidence": [
         "Spawner admission, parent-run identity, ceiling attenuation, structured results, and journal tree reconstruction"
+      ],
+      "determinism": {
+        "fixedSeedRequired": true,
+        "rotatingSeedRequired": true
+      }
+    },
+    {
+      "id": "AHT-SUBAGENT-002",
+      "title": "Bounded parallel subagents overlap and merge deterministically",
+      "status": "active",
+      "kind": "integration",
+      "riskTier": "P0",
+      "requirementIDs": [
+        "AH-SUBAGENT-002"
+      ],
+      "selectors": [
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowRunsChildrenInBoundedParallelBatchesAndMergesInPlanOrder"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowAdvanceReEntryDoesNotDoubleCountAlreadySpawnedChildren"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowFailsWhenChildFails"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowFailureDrainsStartedParallelSiblingsBeforeBarrier"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowSpawnFailureDrainsAlreadyStartedSibling"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowCollectionFailureDrainsSuccessfulSibling"
+        },
+        {
+          "kind": "xctest",
+          "value": "AgentRuntimeTests.MultiAgentWorkflowIntegrationTests/testWorkflowCancellationDrainsSiblingAndCoversFullHandoffInstruction"
+        }
+      ],
+      "platforms": [
+        "swiftpm",
+        "macos",
+        "ios-simulator",
+        "ios-device"
+      ],
+      "verificationTiers": [
+        "every-change",
+        "pull-request",
+        "nightly",
+        "release-candidate"
+      ],
+      "requiredEvidence": [
+        "Observed overlap at the configured cap, deterministic result order, exact-once relaunch accounting, and drained failure barrier"
       ],
       "determinism": {
         "fixedSeedRequired": true,
@@ -1784,6 +1843,33 @@
       ],
       "requiredEvidence": [
         "Concurrent ceiling, budget, duplicate-suppression, reconciliation, and cancellation matrix"
+      ],
+      "determinism": {
+        "fixedSeedRequired": true,
+        "rotatingSeedRequired": true
+      }
+    },
+    {
+      "id": "AHT-DYNAMIC-001",
+      "title": "Full Dynamic Workflows compiler, scheduler, recovery, and migration suite",
+      "status": "planned",
+      "kind": "property",
+      "riskTier": "P0",
+      "requirementIDs": [
+        "AH-DYNAMIC-001"
+      ],
+      "selectors": [],
+      "platforms": [
+        "all"
+      ],
+      "verificationTiers": [
+        "every-change",
+        "pull-request",
+        "nightly",
+        "release-candidate"
+      ],
+      "requiredEvidence": [
+        "Exhaustive small graphs, invalid-definition generation, rotating schedules, crash boundaries, deterministic replay, authority attenuation, cancellation/reconciliation, migration, UI, long-run resources, and performance"
       ],
       "determinism": {
         "fixedSeedRequired": true,

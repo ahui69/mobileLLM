@@ -68,15 +68,25 @@ public enum WorkflowOrchestratorError: Error, Hashable, Sendable {
 /// `WorkflowPhaseRecord` / `WorkflowHandoff` records. It holds no direct filesystem, network, tool,
 /// or sandbox authority.
 public struct WorkflowOrchestrator: Sendable {
+    /// Hard product cap for concurrently executing child runs. The configured value is clamped to
+    /// this range so a model-produced fan-out can never turn into unbounded work.
+    public static let maximumParallelChildrenLimit = 4
+
     public let spawner: any SubagentSpawning
     public let recording: any WorkflowRecording
+    public let maximumParallelChildren: Int
 
     public init(
         spawner: any SubagentSpawning,
-        recording: any WorkflowRecording
+        recording: any WorkflowRecording,
+        maximumParallelChildren: Int = WorkflowOrchestrator.maximumParallelChildrenLimit
     ) {
         self.spawner = spawner
         self.recording = recording
+        self.maximumParallelChildren = min(
+            Self.maximumParallelChildrenLimit,
+            max(1, maximumParallelChildren)
+        )
     }
 
     /// Creates the durable summary from a plan and runs every phase to completion.
@@ -157,6 +167,11 @@ public struct WorkflowOrchestrator: Sendable {
         // The previous phase's handoff carries audit findings / decisions the next phase must
         // consume (e.g. a Revise phase fixing what the Audit phase flagged).
         let upstreamHandoff = index > 0 ? summary.phases[index - 1].handoff : nil
+
+        // Prepare the entire batch before starting any child. A bad attenuation decision therefore
+        // fails without leaving already-started siblings behind.
+        var preparedChildren: [PreparedWorkflowChild] = []
+        preparedChildren.reserveCapacity(phasePlan.childInstructions.count)
         for (childIndex, childInstruction) in phasePlan.childInstructions.enumerated() {
             let childRunID = SubagentStableID.childRun(
                 workflowID: workflowID,
@@ -212,85 +227,132 @@ public struct WorkflowOrchestrator: Sendable {
                     childIndex
                 )
             }
-            let handleID: AgentExecutionHandleID
-            do {
-                handleID = try await spawner.spawn(spawnRequest)
-            } catch {
-                phase.status = .failed
-                phase.endTime = Date()
-                summary.phases[index] = phase
-                summary.status = .failed
-                summary.endTime = Date()
-                try await recording.save(summary)
-                throw WorkflowOrchestratorError.childSpawnFailed(
-                    workflowID,
-                    phasePlan.sequence,
-                    childIndex
-                )
-            }
-            // Relaunch resume (spec §23/§33 gap 3): children already durably spawned keep their
-            // stable identity; re-spawning is idempotent and must never double-count the record.
-            let alreadySpawned = phase.childRunIDs.contains(childRunID)
-            if !alreadySpawned {
-                phase.childRunIDs.append(childRunID)
-                phase.stats.subagentCount += 1
-            }
-            summary.phases[index] = phase
-            try await recording.save(summary)
+            preparedChildren.append(PreparedWorkflowChild(
+                index: childIndex,
+                runID: childRunID,
+                request: spawnRequest
+            ))
+        }
 
-            let result: SubagentResult
-            do {
-                result = try await spawner.collect(handleID)
-            } catch {
+        // Each batch starts at most `maximumParallelChildren` durable runs. Collection happens in
+        // structured concurrency, then results cross a deterministic child-index barrier before
+        // any phase decision or handoff is produced. Local model children may still serialize in
+        // the resource arbiter; online and non-model work can execute concurrently.
+        for batchStart in stride(
+            from: 0,
+            to: preparedChildren.count,
+            by: maximumParallelChildren
+        ) {
+            let batchEnd = min(batchStart + maximumParallelChildren, preparedChildren.count)
+            let batch = preparedChildren[batchStart ..< batchEnd]
+            var running: [RunningWorkflowChild] = []
+            var spawnFailureIndex: Int?
+
+            for child in batch {
+                do {
+                    let handleID = try await spawner.spawn(child.request)
+                    let alreadySpawned = phase.childRunIDs.contains(child.runID)
+                    if !alreadySpawned {
+                        phase.childRunIDs.append(child.runID)
+                        phase.stats.subagentCount += 1
+                    }
+                    running.append(RunningWorkflowChild(
+                        index: child.index,
+                        runID: child.runID,
+                        handleID: handleID,
+                        alreadyCompleted: child.index < phase.completedChildCount
+                    ))
+                    summary.phases[index] = phase
+                    summary.refreshAggregates()
+                    try await recording.save(summary)
+                } catch {
+                    spawnFailureIndex = child.index
+                    break
+                }
+            }
+
+            let collected = await withTaskGroup(
+                of: CollectedWorkflowChild.self,
+                returning: [CollectedWorkflowChild].self
+            ) { group in
+                for child in running {
+                    group.addTask { [spawner] in
+                        do {
+                            return CollectedWorkflowChild(
+                                child: child,
+                                result: try await spawner.collect(child.handleID)
+                            )
+                        } catch {
+                            return CollectedWorkflowChild(child: child, result: nil)
+                        }
+                    }
+                }
+                var values: [CollectedWorkflowChild] = []
+                values.reserveCapacity(running.count)
+                for await value in group {
+                    values.append(value)
+                }
+                return values.sorted { $0.child.index < $1.child.index }
+            }
+
+            var terminalFailureIndex = spawnFailureIndex
+            var batchWasCancelled = false
+            for collectedChild in collected {
+                guard let result = collectedChild.result else {
+                    terminalFailureIndex = terminalFailureIndex ?? collectedChild.child.index
+                    continue
+                }
+                results.append(result)
+                switch result.outcome {
+                case .completed(let answer, let usage):
+                    // Rebuild phase outputs even on relaunch. Usage and completion are a durable
+                    // child-index prefix and are therefore merged exactly once.
+                    outputArtifacts.append(contentsOf: answer.artifacts)
+                    if !collectedChild.child.alreadyCompleted {
+                        phase.stats.merge(Self.stats(usage: usage))
+                        phase.completedChildCount += 1
+                    }
+                    if let text = answer.text,
+                       !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    {
+                        lastAnswer = text
+                    }
+                case .failed(_, let usage):
+                    if !collectedChild.child.alreadyCompleted {
+                        phase.stats.merge(Self.stats(usage: usage))
+                        phase.completedChildCount += 1
+                    }
+                    terminalFailureIndex = terminalFailureIndex ?? collectedChild.child.index
+                case .cancelled:
+                    if !collectedChild.child.alreadyCompleted {
+                        phase.completedChildCount += 1
+                    }
+                    batchWasCancelled = true
+                }
+            }
+
+            if let failedIndex = terminalFailureIndex {
                 phase.status = .failed
                 phase.endTime = Date()
                 summary.phases[index] = phase
                 summary.status = .failed
                 summary.endTime = Date()
+                summary.refreshAggregates()
                 try await recording.save(summary)
+                if spawnFailureIndex != nil {
+                    throw WorkflowOrchestratorError.childSpawnFailed(
+                        workflowID,
+                        phasePlan.sequence,
+                        failedIndex
+                    )
+                }
                 throw WorkflowOrchestratorError.childFailed(
                     workflowID,
                     phasePlan.sequence,
-                    childIndex
+                    failedIndex
                 )
             }
-            results.append(result)
-            switch result.outcome {
-            case .completed(let answer, let usage):
-                if !alreadySpawned {
-                    outputArtifacts.append(contentsOf: answer.artifacts)
-                    phase.stats.merge(Self.stats(usage: usage))
-                }
-                if let text = answer.text, !text.trimmingCharacters(in: .whitespaces).isEmpty {
-                    lastAnswer = text
-                }
-            case .failed(_, let usage):
-                if !alreadySpawned {
-                    phase.stats.merge(Self.stats(usage: usage))
-                    phase.completedChildCount += 1
-                }
-                summary.phases[index] = phase
-                summary.refreshAggregates()
-                try await recording.save(summary)
-                phase.status = .failed
-                phase.endTime = Date()
-                summary.phases[index] = phase
-                summary.status = .failed
-                summary.endTime = Date()
-                summary.refreshAggregates()
-                try await recording.save(summary)
-                throw WorkflowOrchestratorError.childFailed(
-                    workflowID,
-                    phasePlan.sequence,
-                    childIndex
-                )
-            case .cancelled:
-                if !alreadySpawned {
-                    phase.completedChildCount += 1
-                }
-                summary.phases[index] = phase
-                summary.refreshAggregates()
-                try await recording.save(summary)
+            if batchWasCancelled {
                 phase.status = .cancelled
                 phase.endTime = Date()
                 summary.phases[index] = phase
@@ -300,9 +362,10 @@ public struct WorkflowOrchestrator: Sendable {
                 try await recording.save(summary)
                 return summary
             }
-            if !alreadySpawned {
-                phase.completedChildCount += 1
-            }
+
+            // Persist terminal child facts only after the deterministic batch barrier. This keeps
+            // `completedChildCount` a durable prefix even if collection fails or the process dies
+            // between sibling completions; a relaunch can safely replay the whole unfinished batch.
             summary.phases[index] = phase
             summary.refreshAggregates()
             try await recording.save(summary)
@@ -311,7 +374,9 @@ public struct WorkflowOrchestrator: Sendable {
         phase.status = .completed
         phase.endTime = Date()
         phase.outputArtifactReferences = outputArtifacts
-        summary.finalAnswer = lastAnswer ?? summary.finalAnswer
+        if let lastAnswer {
+            summary.finalAnswer = lastAnswer
+        }
         if let nextPlan = plan.phases.dropFirst(Int(index) + 1).first {
             phase.handoff = Self.makeHandoff(
                 phasePlan: phasePlan,
@@ -422,4 +487,22 @@ public struct WorkflowOrchestrator: Sendable {
             toolInvocationCount: Int64(clamping: usage.quantities[.toolInvocations])
         )
     }
+}
+
+private struct PreparedWorkflowChild: Sendable {
+    let index: Int
+    let runID: AgentRunID
+    let request: SubagentSpawnRequest
+}
+
+private struct RunningWorkflowChild: Sendable {
+    let index: Int
+    let runID: AgentRunID
+    let handleID: AgentExecutionHandleID
+    let alreadyCompleted: Bool
+}
+
+private struct CollectedWorkflowChild: Sendable {
+    let child: RunningWorkflowChild
+    let result: SubagentResult?
 }

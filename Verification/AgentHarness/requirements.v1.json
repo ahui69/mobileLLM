@@ -4,8 +4,8 @@
   "documentID": "AH-REQUIREMENTS-V1",
   "sourceSpecification": {
     "path": "spec.md",
-    "sha256": "c3a192618a60997cb8fa08dacea89ea2a1a5b56b5ef11252276b8e33292afe46",
-    "capturedAtUTC": "2026-08-08T22:42:43Z"
+    "sha256": "b8abcb5aef3d3e838c52b2ace88ff2fdbc65dcb2af04faa262f9042091a5db37",
+    "capturedAtUTC": "2026-08-09T08:05:00Z"
   },
   "requirements": [
     {
@@ -1710,7 +1710,7 @@
     {
       "id": "AH-SUBAGENT-001",
       "area": "subagents-workflows",
-      "title": "Subagent spawner runs durable sequential child runs",
+      "title": "Subagent spawner runs durable child runs",
       "statement": "A SubagentSpawner starts child runs under a reserved parent identity with attenuated ceilings, independent budgets and contexts, structured results and artifact references, and no self-approval; children are visible in the journal tree and inherit only what the roadmap in §30 permits.",
       "status": "active",
       "riskTier": "P1",
@@ -1735,6 +1735,37 @@
       ],
       "requiredEvidence": [
         "Spawner admission policy, ceiling attenuation, independent budgets, structured results, and journal tree reconstruction"
+      ]
+    },
+    {
+      "id": "AH-SUBAGENT-002",
+      "area": "subagents-workflows",
+      "title": "Subagent scheduler executes bounded parallel batches",
+      "statement": "Independent workflow children execute in batches capped at four, record durable identities before collection, drain all started siblings, and merge terminal results by stable child index before the phase advances; local-model residency may further serialize execution.",
+      "status": "active",
+      "riskTier": "P0",
+      "specAnchors": [
+        {
+          "section": "34.4",
+          "heading": "Parallel subagent contract",
+          "lineStart": 1712,
+          "lineEnd": 1723
+        }
+      ],
+      "platforms": [
+        "all"
+      ],
+      "verificationTiers": [
+        "every-change",
+        "pull-request",
+        "nightly",
+        "release-candidate"
+      ],
+      "testIDs": [
+        "AHT-SUBAGENT-002"
+      ],
+      "requiredEvidence": [
+        "Observed overlap, hard concurrency cap, deterministic fan-in, durable progress, relaunch idempotency, and failure-barrier scenarios"
       ]
     },
     {
@@ -1795,6 +1826,37 @@
       ],
       "requiredEvidence": [
         "Phase record, handoff, fan-out/fan-in, acceptance-gate, and dataflow-graph scenarios"
+      ]
+    },
+    {
+      "id": "AH-DYNAMIC-001",
+      "area": "subagents-workflows",
+      "title": "Full Dynamic Workflows is the P0 next milestone",
+      "statement": "The next harness milestone implements content-addressed WorkflowDefinitionV1, typed nodes and ports, a fail-closed graph compiler, durable event-sourced instances, bounded ready-queue scheduling, deterministic joins, saved versions, explicit failure policy, recovery, and migration of staged workflows without granting the workflow layer direct effect authority.",
+      "status": "planned",
+      "riskTier": "P0",
+      "specAnchors": [
+        {
+          "section": "34",
+          "heading": "P0 full Dynamic Workflows program",
+          "lineStart": 1632,
+          "lineEnd": 1749
+        }
+      ],
+      "platforms": [
+        "all"
+      ],
+      "verificationTiers": [
+        "every-change",
+        "pull-request",
+        "nightly",
+        "release-candidate"
+      ],
+      "testIDs": [
+        "AHT-DYNAMIC-001"
+      ],
+      "requiredEvidence": [
+        "Graph model checking, compiler rejection matrix, rotating-seed scheduling, crash replay, attenuation, migration, accessibility, long-run resources, and matched performance baselines"
       ]
     },
     {

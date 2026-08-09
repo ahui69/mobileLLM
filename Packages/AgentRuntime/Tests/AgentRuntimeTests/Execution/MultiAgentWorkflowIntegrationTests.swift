@@ -531,12 +531,76 @@ final class MultiAgentWorkflowIntegrationTests: XCTestCase {
         XCTAssertTrue(handoff.taskBrief.contains("Synthesize"))
         XCTAssertTrue(handoff.keyDecisions.contains("source A"))
         XCTAssertEqual(spawner.spawnedRequests.count, 3)
-        // Live progress: the store must have saved after each child, not only at phase boundaries.
+        // Live progress: both children are visible once the parallel batch starts, and completion
+        // advances atomically at the deterministic batch barrier.
         let snapshots = await recording.savedSnapshots
-        XCTAssertTrue(snapshots.contains { $0.aggregated.subagentCount == 1
-            && $0.phases[0].completedChildCount == 1 })
         XCTAssertTrue(snapshots.contains { $0.aggregated.subagentCount == 2
             && $0.phases[0].completedChildCount == 2 })
+    }
+
+    // TEST-ID: AHT-SUBAGENT-002
+    func testWorkflowRunsChildrenInBoundedParallelBatchesAndMergesInPlanOrder() async throws {
+        let parent = makeWorkflowParent()
+        let plan = try WorkflowPlan(
+            goal: "Parallel research",
+            phases: [
+                WorkflowPhasePlan(
+                    sequence: 1,
+                    title: "Research",
+                    acceptanceCriteria: "All lanes complete",
+                    childInstructions: ["lane 1", "lane 2", "lane 3", "lane 4", "lane 5"]
+                ),
+            ]
+        )
+        let probe = SubagentConcurrencyProbe(delayNanoseconds: 40_000_000)
+        let spawner = FakeSubagentSpawner(
+            results: try (1 ... 5).map { value in
+                .completed(
+                    answer: try AgentAnswer(text: "answer \(value)"),
+                    usage: usage(input: UInt64(value), output: 1, tools: 0, active: 1)
+                )
+            },
+            concurrencyProbe: probe
+        )
+        let recording = InMemoryWorkflowRecording()
+        let orchestrator = WorkflowOrchestrator(
+            spawner: spawner,
+            recording: recording,
+            maximumParallelChildren: 2
+        )
+
+        let summary = try await orchestrator.start(
+            workflowID: UUID(),
+            title: "Parallel",
+            plan: plan,
+            parent: parent,
+            ceilingAttenuator: { ceiling, _, _ in
+                try ceiling.attenuating(
+                    to: AgentAuthorityScope(capabilities: AgentCapabilitySet([.localRead])),
+                    requireStrict: true
+                )
+            },
+            budgetAttenuator: { budget, _, _ in
+                var values = Dictionary(uniqueKeysWithValues: BudgetDimension.allCases.map {
+                    ($0, budget.limits[$0])
+                })
+                values[.modelAttempts] = 2
+                return try AgentBudget(
+                    limits: BudgetQuantities(values),
+                    maximumThermalState: budget.maximumThermalState,
+                    memoryPressureResponse: budget.memoryPressureResponse
+                )
+            }
+        )
+
+        let maximumObserved = await probe.maximumObserved
+        XCTAssertEqual(maximumObserved, 2, "two independent child runs must overlap")
+        XCTAssertEqual(summary.status, .completed)
+        XCTAssertEqual(summary.phases[0].completedChildCount, 5)
+        XCTAssertEqual(summary.phases[0].stats.subagentCount, 5)
+        XCTAssertEqual(summary.phases[0].stats.inputTokens, 15)
+        XCTAssertEqual(summary.finalAnswer, "answer 5",
+                       "fan-in must follow plan order, not completion order")
     }
 
     func testWorkflowFailsWhenChildFails() async throws {
@@ -603,6 +667,223 @@ final class MultiAgentWorkflowIntegrationTests: XCTestCase {
         let summary = try XCTUnwrap(lastSaved)
         XCTAssertEqual(summary.status, .failed)
         XCTAssertEqual(summary.phases[0].status, .failed)
+    }
+
+    func testWorkflowFailureDrainsStartedParallelSiblingsBeforeBarrier() async throws {
+        let parent = makeWorkflowParent()
+        let plan = try WorkflowPlan(
+            goal: "Parallel failure",
+            phases: [
+                WorkflowPhasePlan(
+                    sequence: 1,
+                    title: "Parallel",
+                    acceptanceCriteria: "Both lanes finish",
+                    childInstructions: ["failing lane", "successful lane"]
+                ),
+            ]
+        )
+        let failure = try AgentFailure(
+            code: "test.parallel-child-failed",
+            classification: .permanent,
+            safeMessage: "child failed",
+            retryAdvice: .never,
+            externalEffect: .confirmedNone,
+            requiredUserAction: .none,
+            redaction: RedactionMetadata(classification: .internalMetadata, policyVersion: 1)
+        )
+        let spawner = FakeSubagentSpawner(results: [
+            .failed(failure: failure, usage: usage(input: 3, output: 1, tools: 0, active: 1)),
+            .completed(
+                answer: try AgentAnswer(text: "sibling drained"),
+                usage: usage(input: 5, output: 1, tools: 0, active: 1)
+            ),
+        ])
+        let recording = InMemoryWorkflowRecording()
+        let orchestrator = WorkflowOrchestrator(
+            spawner: spawner,
+            recording: recording,
+            maximumParallelChildren: 2
+        )
+
+        do {
+            _ = try await orchestrator.start(
+                workflowID: UUID(),
+                title: "Parallel failure",
+                plan: plan,
+                parent: parent,
+                ceilingAttenuator: { ceiling, _, _ in
+                    try ceiling.attenuating(
+                        to: AgentAuthorityScope(capabilities: AgentCapabilitySet([.localRead])),
+                        requireStrict: true
+                    )
+                },
+                budgetAttenuator: { budget, _, _ in
+                    var values = Dictionary(uniqueKeysWithValues: BudgetDimension.allCases.map {
+                        ($0, budget.limits[$0])
+                    })
+                    values[.modelAttempts] = 2
+                    return try AgentBudget(
+                        limits: BudgetQuantities(values),
+                        maximumThermalState: budget.maximumThermalState,
+                        memoryPressureResponse: budget.memoryPressureResponse
+                    )
+                }
+            )
+            XCTFail("expected child failure")
+        } catch WorkflowOrchestratorError.childFailed {
+        }
+
+        let lastSaved = await recording.lastSaved
+        let saved = try XCTUnwrap(lastSaved)
+        XCTAssertEqual(saved.status, .failed)
+        XCTAssertEqual(saved.phases[0].completedChildCount, 2,
+                       "the sibling that was already started must be drained before failure")
+        XCTAssertEqual(saved.phases[0].stats.inputTokens, 8)
+        XCTAssertEqual(spawner.spawnedRequests.count, 2)
+    }
+
+    func testWorkflowSpawnFailureDrainsAlreadyStartedSibling() async throws {
+        let parent = makeWorkflowParent()
+        let plan = try WorkflowPlan(
+            goal: "Spawn failure",
+            phases: [WorkflowPhasePlan(
+                sequence: 1,
+                title: "Parallel",
+                acceptanceCriteria: "Done",
+                childInstructions: ["started", "fails to spawn"]
+            )]
+        )
+        let spawner = FakeSubagentSpawner(
+            results: [.completed(
+                answer: try AgentAnswer(text: "started child drained"),
+                usage: usage(input: 4, output: 1, tools: 0, active: 1)
+            )],
+            spawnFailureIndex: 1
+        )
+        let recording = InMemoryWorkflowRecording()
+        let orchestrator = WorkflowOrchestrator(
+            spawner: spawner,
+            recording: recording,
+            maximumParallelChildren: 2
+        )
+
+        do {
+            _ = try await runWorkflowForFailureCoverage(
+                orchestrator: orchestrator,
+                plan: plan,
+                parent: parent
+            )
+            XCTFail("expected spawn failure")
+        } catch WorkflowOrchestratorError.childSpawnFailed(_, _, let childIndex) {
+            XCTAssertEqual(childIndex, 1)
+        }
+        let lastSaved = await recording.lastSaved
+        let saved = try XCTUnwrap(lastSaved)
+        XCTAssertEqual(saved.status, .failed)
+        XCTAssertEqual(saved.phases[0].completedChildCount, 1)
+        XCTAssertEqual(saved.phases[0].stats.inputTokens, 4)
+    }
+
+    func testWorkflowCollectionFailureDrainsSuccessfulSibling() async throws {
+        let parent = makeWorkflowParent()
+        let plan = try WorkflowPlan(
+            goal: "Collection failure",
+            phases: [WorkflowPhasePlan(
+                sequence: 1,
+                title: "Parallel",
+                acceptanceCriteria: "Done",
+                childInstructions: ["missing result", "successful sibling"]
+            )]
+        )
+        let spawner = FakeSubagentSpawner(
+            results: [
+                .cancelled,
+                .completed(
+                    answer: try AgentAnswer(text: "successful sibling drained"),
+                    usage: usage(input: 6, output: 1, tools: 0, active: 1)
+                ),
+            ],
+            collectFailureIndices: [0]
+        )
+        let recording = InMemoryWorkflowRecording()
+        let orchestrator = WorkflowOrchestrator(
+            spawner: spawner,
+            recording: recording,
+            maximumParallelChildren: 2
+        )
+
+        do {
+            _ = try await runWorkflowForFailureCoverage(
+                orchestrator: orchestrator,
+                plan: plan,
+                parent: parent
+            )
+            XCTFail("expected collection failure")
+        } catch WorkflowOrchestratorError.childFailed(_, _, let childIndex) {
+            XCTAssertEqual(childIndex, 0)
+        }
+        let lastSaved = await recording.lastSaved
+        let saved = try XCTUnwrap(lastSaved)
+        XCTAssertEqual(saved.status, .failed)
+        XCTAssertEqual(saved.phases[0].completedChildCount, 1)
+        XCTAssertEqual(saved.phases[0].stats.inputTokens, 6)
+    }
+
+    func testWorkflowCancellationDrainsSiblingAndCoversFullHandoffInstruction() async throws {
+        let parent = makeWorkflowParent()
+        let plan = try WorkflowPlan(
+            goal: "Cancellation",
+            phases: [
+                WorkflowPhasePlan(
+                    sequence: 1,
+                    title: "Prepare",
+                    acceptanceCriteria: "Prepared",
+                    childInstructions: ["prepare"],
+                    handoff: WorkflowHandoff(
+                        taskBrief: "Prepare the input",
+                        acceptanceCriteria: "Prepared",
+                        knownRisks: ["risk one"],
+                        verificationDuties: ["verify preparation"]
+                    )
+                ),
+                WorkflowPhasePlan(
+                    sequence: 2,
+                    title: "Parallel",
+                    acceptanceCriteria: "Done",
+                    childInstructions: ["cancelled child", "successful sibling"],
+                    handoff: WorkflowHandoff(
+                        taskBrief: "Use the prepared input",
+                        acceptanceCriteria: "Done",
+                        knownRisks: ["risk two"],
+                        verificationDuties: ["verify output"]
+                    )
+                ),
+            ]
+        )
+        let spawner = FakeSubagentSpawner(results: [
+            .completed(answer: try AgentAnswer(text: "prepared"), usage: .zero),
+            .cancelled,
+            .completed(answer: try AgentAnswer(text: "sibling drained"), usage: .zero),
+        ])
+        let recording = InMemoryWorkflowRecording()
+        let orchestrator = WorkflowOrchestrator(
+            spawner: spawner,
+            recording: recording,
+            maximumParallelChildren: 2
+        )
+
+        let summary = try await runWorkflowForFailureCoverage(
+            orchestrator: orchestrator,
+            plan: plan,
+            parent: parent
+        )
+        XCTAssertEqual(summary.status, .cancelled)
+        XCTAssertEqual(summary.phases[1].completedChildCount, 2)
+        XCTAssertEqual(spawner.spawnedRequests.count, 3)
+        let secondPhaseInstruction = spawner.spawnedRequests[1].instruction
+        XCTAssertTrue(secondPhaseInstruction.contains("Use the prepared input"))
+        XCTAssertTrue(secondPhaseInstruction.contains("risk one"))
+        XCTAssertTrue(secondPhaseInstruction.contains("verify output"))
     }
 
     func testWorkflowAdvanceResumesFromDurableRecording() async throws {
@@ -1053,6 +1334,36 @@ final class MultiAgentWorkflowIntegrationTests: XCTestCase {
         return child
     }
 
+    private func runWorkflowForFailureCoverage(
+        orchestrator: WorkflowOrchestrator,
+        plan: WorkflowPlan,
+        parent: WorkflowParentContext
+    ) async throws -> WorkflowSummary {
+        try await orchestrator.start(
+            workflowID: UUID(),
+            title: plan.goal,
+            plan: plan,
+            parent: parent,
+            ceilingAttenuator: { ceiling, _, _ in
+                try ceiling.attenuating(
+                    to: AgentAuthorityScope(capabilities: AgentCapabilitySet([.localRead])),
+                    requireStrict: true
+                )
+            },
+            budgetAttenuator: { budget, _, _ in
+                var values = Dictionary(uniqueKeysWithValues: BudgetDimension.allCases.map {
+                    ($0, budget.limits[$0])
+                })
+                values[.modelAttempts] = 2
+                return try AgentBudget(
+                    limits: BudgetQuantities(values),
+                    maximumThermalState: budget.maximumThermalState,
+                    memoryPressureResponse: budget.memoryPressureResponse
+                )
+            }
+        )
+    }
+
     private func makeArtifactReference(_ value: Int) -> ArtifactReference {
         try! ArtifactReference(
             id: ArtifactID(rawValue: ExecutorTestID.uuid(value)),
@@ -1294,11 +1605,23 @@ struct PairToolCatalog: ExecutableToolCatalog, Sendable {
 
 final class FakeSubagentSpawner: SubagentSpawning, @unchecked Sendable {
     private let lock = NSLock()
-    private var results: [SubagentOutcome]
+    private let results: [SubagentOutcome]
+    private let concurrencyProbe: SubagentConcurrencyProbe?
+    private let spawnFailureIndex: Int?
+    private let collectFailureIndices: Set<Int>
     private var spawned: [SubagentSpawnRequest] = []
+    private var bindings: [AgentExecutionHandleID: (index: Int, runID: AgentRunID)] = [:]
 
-    init(results: [SubagentOutcome]) {
+    init(
+        results: [SubagentOutcome],
+        concurrencyProbe: SubagentConcurrencyProbe? = nil,
+        spawnFailureIndex: Int? = nil,
+        collectFailureIndices: Set<Int> = []
+    ) {
         self.results = results
+        self.concurrencyProbe = concurrencyProbe
+        self.spawnFailureIndex = spawnFailureIndex
+        self.collectFailureIndices = collectFailureIndices
     }
 
     var spawnedRequests: [SubagentSpawnRequest] {
@@ -1306,24 +1629,52 @@ final class FakeSubagentSpawner: SubagentSpawning, @unchecked Sendable {
     }
 
     func spawn(_ request: SubagentSpawnRequest) async throws -> AgentExecutionHandleID {
-        lock.withLock {
+        try lock.withLock { () throws -> AgentExecutionHandleID in
+            let index = spawned.count
+            if spawnFailureIndex == index {
+                throw SubagentSpawnError.resultUnavailable
+            }
             spawned.append(request)
+            let handleID = AgentExecutionHandleID(rawValue: ExecutorTestID.uuid(900 + index))
+            bindings[handleID] = (index, request.childRunID)
+            return handleID
         }
-        return AgentExecutionHandleID(rawValue: ExecutorTestID.uuid(900))
     }
 
     func collect(_ handleID: AgentExecutionHandleID) async throws -> SubagentResult {
-        let outcome = lock.withLock { () -> SubagentOutcome in
-            guard !results.isEmpty else {
-                return .cancelled
-            }
-            return results.removeFirst()
+        let binding = lock.withLock {
+            bindings[handleID]
         }
+        guard let binding else { throw SubagentSpawnError.resultUnavailable }
+        if collectFailureIndices.contains(binding.index) {
+            throw SubagentSpawnError.resultUnavailable
+        }
+        if let concurrencyProbe {
+            await concurrencyProbe.run()
+        }
+        let outcome = binding.index < results.count ? results[binding.index] : .cancelled
         return SubagentResult(
-            runID: ExecutorTestID.run(430),
+            runID: binding.runID,
             handleID: handleID,
             outcome: outcome
         )
+    }
+}
+
+actor SubagentConcurrencyProbe {
+    private let delayNanoseconds: UInt64
+    private var active = 0
+    private(set) var maximumObserved = 0
+
+    init(delayNanoseconds: UInt64) {
+        self.delayNanoseconds = delayNanoseconds
+    }
+
+    func run() async {
+        active += 1
+        maximumObserved = max(maximumObserved, active)
+        try? await Task.sleep(nanoseconds: delayNanoseconds)
+        active -= 1
     }
 }
 

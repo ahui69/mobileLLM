@@ -10,6 +10,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  # Every CI invocation receives a reproducible but rotating semantic/property-test seed.
+  AGENT_HARNESS_ROTATING_SEED: ${{ github.run_id }}
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -38,6 +45,7 @@ jobs:
           bash -n scripts/verification/reset-agent-test-container.sh
           bash -n scripts/verification/run-agent-package-coverage.sh
           bash -n scripts/verification/run-agent-mutation-gates.sh
+          bash -n scripts/verification/verify-xcode-coverage.sh
 
       - name: Test the verification gate
         run: swift test --package-path Tools/AgentHarnessVerification
@@ -176,9 +184,32 @@ jobs:
           swift --version
 
       - name: Kill all six security mutations
-        env:
-          AGENT_HARNESS_ROTATING_SEED: ${{ github.run_id }}
         run: bash scripts/verification/run-agent-mutation-gates.sh
+
+  agent-nightly-stress:
+    name: nightly recovery and concurrency stress
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: agent-harness-verification
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select latest stable Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          swift --version
+
+      - name: Run the complete runtime fault and recovery corpus
+        run: swift test --package-path Packages/AgentRuntime
+
+      - name: Repeat the bounded parallel-subagent oracle
+        run: |
+          for pass in {1..25}; do
+            swift test --package-path Packages/AgentRuntime \
+              --filter MultiAgentWorkflowIntegrationTests/testWorkflowRunsChildrenInBoundedParallelBatchesAndMergesInPlanOrder
+          done
 
   build-app-and-engines:
     name: xcodebuild (app + engines)
@@ -188,12 +219,33 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Select latest stable Xcode
         run: |
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           swift --version
           xcodebuild -version
+
+      - name: Resolve changed-lines base
+        id: xcode-coverage-base
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          zero_sha='0000000000000000000000000000000000000000'
+          if [[ -n "${PR_BASE_SHA:-}" ]] && git cat-file -e "${PR_BASE_SHA}^{commit}"; then
+            base_sha="$PR_BASE_SHA"
+          elif [[ -n "${PUSH_BEFORE_SHA:-}" && "$PUSH_BEFORE_SHA" != "$zero_sha" ]] \
+              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}"; then
+            base_sha="$PUSH_BEFORE_SHA"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base_sha="$(git rev-parse HEAD^)"
+          else
+            base_sha="$(git rev-parse HEAD)"
+          fi
+          echo "base-sha=$base_sha" >> "$GITHUB_OUTPUT"
 
       - name: Install project tools
         run: |
@@ -255,6 +307,8 @@ jobs:
             -scheme SimulatorCI \
             -destination "platform=iOS Simulator,id=$simulator_udid" \
             -parallel-testing-enabled NO \
+            -enableCodeCoverage YES \
+            -resultBundlePath "$RUNNER_TEMP/SimulatorCI.xcresult" \
             -skipMacroValidation \
             MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
             CODE_SIGNING_ALLOWED=NO
@@ -265,6 +319,37 @@ jobs:
             -project mobileLLM.xcodeproj \
             -scheme EngineTests \
             -destination 'platform=macOS,arch=arm64' \
+            -enableCodeCoverage YES \
+            -resultBundlePath "$RUNNER_TEMP/EngineTests.xcresult" \
             -skipMacroValidation \
             MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
             CODE_SIGNING_ALLOWED=NO
+
+      - name: Export Xcode coverage evidence
+        run: |
+          mkdir -p "$RUNNER_TEMP/xcode-coverage"
+          xcrun xccov view --report --json "$RUNNER_TEMP/SimulatorCI.xcresult" \
+            > "$RUNNER_TEMP/xcode-coverage/SimulatorCI.xccov.json"
+          xcrun xccov view --report --json "$RUNNER_TEMP/EngineTests.xcresult" \
+            > "$RUNNER_TEMP/xcode-coverage/EngineTests.xccov.json"
+          jq -e '.targets | type == "array" and length > 0' \
+            "$RUNNER_TEMP/xcode-coverage/SimulatorCI.xccov.json"
+          jq -e '.targets | type == "array" and length > 0' \
+            "$RUNNER_TEMP/xcode-coverage/EngineTests.xccov.json"
+          bash scripts/verification/verify-xcode-coverage.sh \
+            --base-ref "${{ steps.xcode-coverage-base.outputs.base-sha }}" \
+            --report "$RUNNER_TEMP/xcode-coverage/SimulatorCI.xccov.json" \
+            --report "$RUNNER_TEMP/xcode-coverage/EngineTests.xccov.json" \
+            --output "$RUNNER_TEMP/xcode-coverage/coverage-report.v1.json"
+
+      - name: Upload Xcode result and coverage evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-coverage-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/SimulatorCI.xcresult
+            ${{ runner.temp }}/EngineTests.xcresult
+            ${{ runner.temp }}/xcode-coverage
+          if-no-files-found: error
+          retention-days: 14

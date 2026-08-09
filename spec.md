@@ -6,7 +6,7 @@
 
 **Scope:** Full-featured iOS agent harness, local-first with optional online providers
 
-**Out of scope for this release:** Agent Sandbox Runtime implementation and full Dynamic Workflows (language, DAG, branching, saved definitions)
+**Out of scope for the current release candidate, but P0 next milestone:** Agent Sandbox Runtime implementation and full Dynamic Workflows (language, DAG, branching, saved definitions)
 
 ## 1. Executive summary
 
@@ -24,8 +24,8 @@ iOS is the product and acceptance scope. Because the repository shares packages 
 MLX-free runtime must continue to compile on macOS and existing Mac chat behavior must not regress; Mac-specific agent
 features and sandbox integration are not part of this release.
 
-The current staged workflow orchestrator coordinates instances of the same `AgentExecutor` defined here. Full
-Dynamic Workflows remain future work: no workflow language, DAG scheduler, branching, or saved definitions ship now.
+The current staged workflow orchestrator coordinates bounded parallel instances of the same `AgentExecutor` defined
+here. Full Dynamic Workflows are the P0 next milestone; the current release candidate does not falsely claim them.
 
 ## 2. Frozen product decisions
 
@@ -44,8 +44,8 @@ The following decisions are requirements, not open questions:
    disclosed when a run performs work.
 7. The open-source target exposes a versioned Agent Sandbox API but includes no sandbox implementation. A future
    private module may supply that implementation through dependency injection.
-8. A bounded staged workflow orchestrator is included. Full Dynamic Workflows — language, DAG/branching
-   semantics, saved definitions, and general scheduling — remain explicitly deferred.
+8. A bounded staged workflow orchestrator with parallel subagent batches is included. Full Dynamic Workflows —
+   language, typed DAG/branching semantics, saved definitions, and durable scheduling — are the P0 next milestone.
 9. App launch must not load a model, reopen the previous conversation, or silently resume a suspended run. Pending
    runs are discoverable and resume only through explicit user intent, except for an already-authorized operating
    system continued-processing task that is still active.
@@ -84,13 +84,13 @@ The harness must support:
 The architecture must allow later additions of:
 
 - additional online provider protocols, routing, and cost policy;
-- parallel and remotely scheduled workflow-managed subagents;
+- nested and remotely scheduled workflow-managed subagents beyond the shipped bounded local scheduler;
 - the private Agent Sandbox Runtime;
 - a separate Dynamic Workflows runtime that coordinates many `AgentExecutor` instances;
 - saved, versioned orchestration definitions.
 
-Future compatibility means stable contracts and identifiers. It does not mean implementing unused schedulers,
-interpreters, or UI now.
+Future compatibility means stable contracts and identifiers. Section 34 turns that compatibility into a committed,
+test-gated P0 program rather than an indefinite placeholder.
 
 ## 4. Non-goals
 
@@ -1102,9 +1102,9 @@ Respond command changes the run. Commands carry target run/request IDs and expec
 - optional sandbox requirement;
 - labels and provenance.
 
-Implementation roadmap (§30): the first release adds a `SubagentSpawner` that runs child runs sequentially and
-advertises the spawn capability only when the spawner is available; bounded parallel subagent execution follows the
-parallel tool-batch concurrency layer, and the staged workflow orchestrator builds on both. Subagents:
+The current release advertises `SubagentSpawner` only when the spawner is available and executes independent children
+in deterministic batches of at most four. Local decoding remains serialized by the resource arbiter, while online or
+non-model work may overlap. Every batch drains at a deterministic barrier before its phase advances. Subagents:
 
 - inherit only a strict subset of parent capabilities;
 - receive independent contexts and budgets;
@@ -1119,13 +1119,13 @@ guaranteed trigger. Every workflow is anchored to the message that initiated it,
 durably, and spawns child runs under the reserved parent-run identity so the journal can reconstruct
 the full tree after relaunch.
 
-Implementation order (see §30): the subagent spawner lands first, then bounded parallel tool batches,
-then this orchestrator.
+Implementation order (see §30): the subagent spawner landed first, then bounded parallel tool batches,
+then the staged orchestrator, and now bounded parallel child execution.
 
 ## 23. Dynamic Workflows compatibility seam
 
-The current staged workflow runtime creates, sequences, and verifies `AgentRequest` values. Future Dynamic Workflows
-may add branching and repetition; orchestration remains a separate layer above `AgentExecutor`.
+The current staged workflow runtime creates, sequences, and verifies `AgentRequest` values. P0 Dynamic Workflows add
+typed branching, bounded repetition, joins, and saved definitions above the same `AgentExecutor` boundary (§34).
 
 The harness exposes the contracts used by both the current orchestrator and future Dynamic Workflows:
 
@@ -1139,9 +1139,9 @@ The harness exposes the contracts used by both the current orchestrator and futu
 - explicit verification/evidence fields.
 
 No current or future workflow script or graph receives direct filesystem, network, tool, or sandbox authority. It
-coordinates agents; agents act through the same policy-controlled runtime. No workflow language, interpreter, general
-dependency scheduler, branching DAG, or saved definition format is added in this release; current staged records use
-the public identity, status, artifact, and handoff types that future Dynamic Workflows must preserve.
+coordinates agents; agents act through the same policy-controlled runtime. The current release does not yet add the
+P0 language/interpreter/general DAG/saved-definition format; current staged records use the public identity, status,
+artifact, and handoff types that the §34 implementation must preserve.
 
 Each workflow persists a record on its initiating message with: workflow id, title (e.g. "完成任务 B"),
 status (running / completed / failed / cancelled), start and end time, aggregated statistics (subagent
@@ -1156,9 +1156,9 @@ The staged workflow runtime decomposes the initiating goal into durable, reviewa
 before any child run starts. The decomposition is a first-class journal record, not hidden
 chain-of-thought: each phase names its inputs, expected outputs, acceptance criteria, dependency
 order, and any approval gate the user must pass before that phase executes. A phase may fan out to
-multiple child runs; the orchestrator fans their results back in and advances only when the phase's
-acceptance criteria are met. Parallelism, scheduling limits, and the interpreter remain deferred per
-§30, but the record contracts below are fixed now.
+multiple child runs; the orchestrator executes them in bounded batches, fans their results back in by
+stable child index, and advances only when the phase's acceptance criteria are met. General graph scheduling and the
+interpreter remain the P0 §34 milestone, but the record contracts below are fixed now.
 
 Child runs communicate through versioned artifacts and structured handoff records, never through a
 free-form agent-to-agent chat channel or full-transcript passing. The orchestrator holds no direct
@@ -1501,7 +1501,7 @@ later explicitly scoped release.
 No production implementation begins until this specification has completed independent review and its blocking
 findings have been resolved.
 
-## 30. Deferred decisions
+## 30. Deferred decisions and committed next milestone
 
 These decisions are intentionally deferred because the corresponding capability is not implemented now:
 
@@ -1509,21 +1509,20 @@ These decisions are intentionally deferred because the corresponding capability 
 - server-side native tools (e.g. DeepSeek `web_search`): policy recorded in §15.5, implementation
   deferred until the capability metadata, provider translation, step UI, and approval wiring land together;
 - the private sandbox runtime's transport, packaging, entitlements, and binary distribution;
-- remote/cross-device concurrency and production subagent scheduling policies (local subagent
-  spawning, bounded parallel tool batches, and the staged workflow orchestrator are implemented as of
-  2026-08-06 and are not deferred);
-- workflow definition language, interpreter, DAG semantics, and saved-workflow locations (the
-  message-anchored workflow UI and record contracts are fixed in §20/§23 and are NOT deferred);
+- remote/cross-device concurrency (local spawning, bounded parallel tool batches, bounded parallel
+  subagent execution, and the staged workflow orchestrator are implemented and are not deferred);
+- the workflow definition language, interpreter, typed DAG semantics, and saved-workflow locations are
+  the committed P0 next milestone in §34, not an unspecified future backlog item;
 - distributed or cross-device execution.
 
-The multi-agent implementation order is fixed and has shipped: (1) `SubagentSpawner` with sequential
+The multi-agent implementation order is fixed and has shipped: (1) `SubagentSpawner` with durable
 child runs, attenuated ceilings, independent budgets/contexts, structured results and artifacts, and
 child visibility in the journal (§22); (2) bounded parallel tool batches inside one run under the same
 ceiling, budget ledger, duplicate suppression, and reconciliation invariants (§12); (3) the staged
 workflow orchestrator with phase decomposition, fan-out/fan-in, `WorkflowPhaseRecord`, and
-`WorkflowHandoff` dataflow (§23/§23.1). What remains deferred: parallel subagent *execution* (children
-currently run sequentially per phase), the workflow definition language / interpreter / DAG semantics,
-saved-workflow locations, remote/cross-device execution, and production scheduling policies.
+`WorkflowHandoff` dataflow (§23/§23.1); and (4) bounded parallel subagent batches with deterministic
+fan-in. The immediate P0 work is the full Dynamic Workflows definition/compiler/runtime (§34).
+Only remote/cross-device execution and private-runtime integration details remain priority-deferred.
 
 Their future implementations must honor the contracts and authority boundaries established here.
 
@@ -1543,8 +1542,8 @@ changes**. This revision incorporates its blocking findings:
 - separate logical conversation tool identity from exact run/approval descriptor identity;
 - bind future online-model generation to the same prepared and authorized external-operation contract.
 
-The review found the full Dynamic Workflows boundary correctly deferred; a staged orchestrator was added later. The
-post-review scope changes require the consistency and release gates in §27-§29 before release.
+The review originally deferred full Dynamic Workflows; a staged orchestrator and bounded parallel scheduler landed
+later. Product priority now supersedes that deferral through the explicit P0 program in §34.
 
 A separate independent test-strategy review completed on 2026-08-01. After the specification added stable
 requirement/test IDs, semantic completeness registries, P0 gates, automated coverage/result collection, isolated
@@ -1570,7 +1569,7 @@ Implemented foundations:
 - durable root runs, frozen inputs, SQLite events/CAS, budgets, approvals, reconciliation, and artifact storage;
 - local providers plus explicitly configured OpenAI-compatible Responses providers;
 - Tool V2 adapters, MCP, per-conversation tool policy and approval mode;
-- durable subagent runs with strict authority and budget attenuation;
+- durable subagent runs with strict authority/budget attenuation and bounded parallel child batches;
 - bounded parallel tool batches and a message-anchored staged workflow orchestrator;
 - iOS 17 quiescence and iOS 26 continued-processing integration seams.
 
@@ -1627,5 +1626,124 @@ Open conformance gaps:
    accepted service endpoint/reasoning/output configuration, so later settings edits or another service cannot redirect
    an in-flight or recovered run; the API key remains a Keychain reference resolved only at execution.
 
-Terminology: the shipped feature is **staged multi-agent workflows v1**. **Dynamic Workflows** is reserved for the
-future language/graph system with branching, repetition, saved versioned definitions, and a complete recovery driver.
+Terminology: the shipped feature is **staged multi-agent workflows v1**. **Dynamic Workflows** names the P0 next
+milestone: a language/graph system with branching, repetition, saved versioned definitions, and complete recovery.
+
+## 34. P0 full Dynamic Workflows program
+
+Full Dynamic Workflows and production-quality parallel subagents are the highest-priority capability after the current
+release gates. “Full” means a durable, versioned workflow definition and execution system, not a larger prompt wrapped
+around the staged orchestrator. The implementation must preserve the iOS 17 target, local-first behavior, online-model
+compatibility, explicit approval policy, and the future private Agent Sandbox Runtime seam.
+
+### 34.1 Design lessons adopted from Codex and OpenCode
+
+The design adopts these proven constraints, while avoiding source-level coupling to either project:
+
+- delegate only concrete, bounded work that is independent of the immediate critical path; do not duplicate the same
+  work in parent and child, and use explicit ownership when children may write;
+- make every child a durable, addressable session/run with a stable parent path, resumable identity, structured result,
+  and observable lifecycle rather than an anonymous in-process task;
+- treat inherited context as an explicit choice (none, bounded recent context, or a complete frozen snapshot), while
+  always injecting applicable system/project policy independently of transcript inheritance;
+- attenuate permissions, capabilities, destinations, budgets, model choices, sandbox requirements, and delegation
+  depth transitively. A child can never recover authority denied to its parent;
+- keep background children observable and collectable without making the parent conversation semantically serial;
+  late results, interruption, detach/reattach, and user steering are first-class events;
+- execute only genuinely independent ready nodes concurrently, enforce global and per-workflow concurrency/cost limits,
+  and merge outputs through one deterministic barrier with explicit retry, cancellation, and stopping rules;
+- preserve one clear handoff, acceptance criteria, evidence requirements, and output schema per node; completed work is
+  referenced rather than repeated in downstream prompts.
+
+Primary references inspected for these constraints:
+
+- OpenAI Codex multi-agent tool specification and bounded-delegation guidance:
+  <https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/multi_agents_spec.rs>
+- OpenAI model guidance for parallel subagents, approval boundaries, routing, and evaluation:
+  <https://developers.openai.com/api/docs/guides/latest-model>
+- OpenCode agent model, permissions, child-session navigation, and task permissions:
+  <https://opencode.ai/docs/agents/>
+- OpenCode task implementation for durable parent/child sessions, resumption, depth limits, background execution, and
+  transitive child permission derivation:
+  <https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/task.ts>
+
+### 34.2 Versioned definition and compiler
+
+`WorkflowDefinitionV1` is immutable and content-addressed. It contains a definition ID/version, input/output JSON
+schemas, typed nodes and ports, dependency edges, default budgets, concurrency policy, approval gates, migration
+metadata, and a digest of every referenced agent/tool/skill definition. Supported node kinds are initially:
+
+- agent task;
+- decision/conditional branch;
+- bounded parallel and bounded map;
+- deterministic join/reduce;
+- explicit approval gate;
+- durable wait for user input, time, or an external event;
+- bounded loop with a compile-time maximum iteration count;
+- subworkflow call pinned to an exact definition version.
+
+There is no direct filesystem/network/tool node. An agent node requests those effects through `AgentExecutor`, so every
+operation still crosses `prepare -> authorize -> execute`. The compiler rejects unknown schemas, dangling edges,
+ambiguous joins, implicit cycles, unbounded maps/loops, excessive fan-out/depth, incompatible port types, authority or
+budget widening, unavailable providers, and definitions whose worst-case resource envelope exceeds policy.
+
+A model may synthesize a candidate definition, but synthesis grants no authority. The candidate is normalized,
+validated, costed, previewed, and saved as a new immutable version. Any external effect still requires the normal
+operation approval; installing or enabling a definition with broader declared authority requires separate user intent.
+
+### 34.3 Durable execution and scheduler
+
+`WorkflowInstance` is event-sourced and binds one exact definition digest plus immutable inputs. Durable records include
+node attempts, edge activations, branch decisions, join membership, child handles, artifact references, approvals,
+usage, checkpoints, definition migrations, and the terminal output. Replaying the log must reconstruct the same ready
+set and must never re-run a committed node outcome.
+
+The scheduler owns no effect authority. It computes a deterministic ready queue, asks the policy/resource layer for a
+lease, starts at most the configured number of independent nodes, and commits one ordered fan-in barrier. Scheduling
+uses global root-run fairness, per-workflow concurrency, local-model residency, provider rate/cost limits, thermal and
+memory pressure, and child budget envelopes. Local model decoding remains single-residency unless a future measured
+resource policy proves otherwise; online/model-free nodes can overlap within their limits.
+
+Failure policy is explicit per node and definition: fail-fast after draining already-started siblings, collect-all,
+bounded retry, fallback edge, compensate through a separately authorized node, or require user resolution. Cancellation
+propagates downward as durable commands and waits for safe boundaries; an uncertain external effect routes to
+reconciliation rather than being labelled cancelled or retried. Parent interruption never discards child results.
+
+### 34.4 Parallel subagent contract
+
+Every spawn records the canonical parent path, purpose, role, frozen policy snapshot, context-inheritance mode, owned
+artifacts/write scope, exact capability ceiling, independent budget, model policy, maximum child depth, and expected
+output/evidence schema. Default depth is one; nested delegation must be explicitly allowed and strictly attenuated.
+Children publish append-only progress and terminal artifacts to their own namespace. Cross-child coordination is
+parent-mediated through typed handoffs; unrestricted shared mutable memory and overlapping write ownership are denied.
+
+The current staged orchestrator is the compatibility implementation of a sequence of bounded-parallel agent nodes. It
+must migrate into the general runtime without changing existing workflow IDs, child IDs, message anchors, approvals,
+or archived summaries.
+
+### 34.5 Sandbox runtime seam
+
+An agent/workflow node may declare an `AgentSandboxRequirement`, but only the injected provider negotiates and executes
+it. Workflow definitions store requirements and capability digests, never private provider transports, entitlements,
+binary details, or credentials. A missing or incompatible provider yields a typed waiting/unsupported state and cannot
+silently fall back to unsandboxed execution.
+
+### 34.6 Required implementation order and gates
+
+This is one implementation program followed by the single consolidated audit in §29:
+
+1. Freeze `WorkflowDefinitionV1`, typed ports/nodes, validation limits, instance events, child context/permission
+   inheritance, scheduler leases, and migration contracts.
+2. Implement the deterministic graph compiler/validator and model-synthesized candidate preview with no execution.
+3. Implement the durable ready-queue scheduler, bounded parallel nodes, joins, cancellation, retry, reconciliation,
+   detach/reattach, and crash recovery over fake executors.
+4. Migrate staged workflows through the general runtime and add saved/versioned definitions without a separate UI.
+5. Connect local/online model routes and the public sandbox requirement seam; do not integrate the private runtime yet.
+6. Complete simulator, macOS, and physical-device evidence, then perform the one consolidated audit.
+
+P0 verification must include exhaustive small-graph model checking; randomized valid/invalid definition generation;
+all compile rejection classes; rotating-seed scheduling; concurrency-bound/fairness/deadlock/starvation tests; every
+spawn/join/checkpoint crash boundary; deterministic replay; authority/budget/depth attenuation; cancellation and
+uncertain-effect reconciliation; schema and definition migration; staged-workflow compatibility; UI accessibility;
+long-run resource/leak tests; and matched local/online performance baselines. No Dynamic Workflows requirement becomes
+release-green from a happy-path demonstration alone.
