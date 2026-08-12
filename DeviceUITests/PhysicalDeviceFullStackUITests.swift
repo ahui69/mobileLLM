@@ -1713,7 +1713,9 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
         }
 
         var rowState = readWorkflowValue(row) ?? ""
-        let candidateDeadline = Date().addingTimeInterval(300)
+        // Candidate preparation may include one full analyzer-guided repair after the first live
+        // model pass. Observe both bounded passes rather than timing out a valid repair in flight.
+        let candidateDeadline = Date().addingTimeInterval(1_200)
         while Date() < candidateDeadline,
               !rowState.contains("Running"),
               !rowState.contains("Completed"),
@@ -1784,7 +1786,8 @@ final class PhysicalDeviceFullStackUITests: DeviceE2ETestCase {
         candidate_status=\(rowState)
         last_status=\(lastState)
         inspected_exact_source=true
-        separate_approval_and_start=true
+        automatic_one_run_launch=true
+        obsolete_launch_authorization_absent=true
         failures=\(failures.isEmpty ? "none" : failures.joined(separator: "\n- "))
         """)
         summary.name = "workflow-completion-device"

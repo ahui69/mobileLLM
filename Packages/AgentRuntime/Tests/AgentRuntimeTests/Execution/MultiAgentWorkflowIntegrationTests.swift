@@ -221,6 +221,36 @@ final class MultiAgentWorkflowIntegrationTests: XCTestCase {
         }
     }
 
+    func testSubagentCancellationRetriesAProvenStaleCASWithANewDurableIdentity() async throws {
+        let handleID = AgentExecutionHandleID()
+        let runID = AgentRunID()
+        let handle = try StaleThenAcceptedCancellationHandle(
+            id: handleID,
+            runID: runID
+        )
+        let databaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("subagent-cancel-\(UUID().uuidString).sqlite")
+        defer {
+            for suffix in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(
+                    at: URL(fileURLWithPath: databaseURL.path + suffix)
+                )
+            }
+        }
+        let spawner = DurableSubagentSpawner(
+            executor: CancellationTestExecutor(handle: handle),
+            repository: SQLiteRunJournal(databaseURL: databaseURL)
+        )
+
+        try await spawner.cancel(handleID, runID: runID)
+
+        let commands = await handle.sentCommands()
+        XCTAssertEqual(commands.map(\.payload.expectedRunStateVersion), [4, 5])
+        XCTAssertEqual(Set(commands.map(\.payload.commandID)).count, 2)
+        let finalStatus = try await handle.status()
+        XCTAssertEqual(finalStatus.state, .cancelled)
+    }
+
     // MARK: - Parallel tool batches (real executor)
 
     func testParallelToolBatchExecutesConcurrentlyThenDeterministicBarrier() async throws {
@@ -1404,6 +1434,91 @@ final class MultiAgentWorkflowIntegrationTests: XCTestCase {
         }
         throw ExecutorIntegrationTestError.timeout
     }
+}
+
+private struct CancellationTestExecutor: AgentExecutor {
+    let handle: StaleThenAcceptedCancellationHandle
+
+    func submit(
+        _: AgentRequest,
+        commandID _: AgentCommandID
+    ) async throws -> AgentExecutionHandleID {
+        throw AgentExecutionError.internalInvariant("not used by cancellation test")
+    }
+
+    func attach(to id: AgentExecutionHandleID) async throws -> any AgentExecutionHandle {
+        guard id == handle.id else { throw AgentExecutionError.executionNotFound(id) }
+        return handle
+    }
+}
+
+private actor StaleThenAcceptedCancellationHandle: AgentExecutionHandle {
+    nonisolated let id: AgentExecutionHandleID
+    private let runID: AgentRunID
+    private var currentStatus: AgentRunStatus
+    private var commands: [AgentCommandEnvelope] = []
+
+    init(id: AgentExecutionHandleID, runID: AgentRunID) throws {
+        self.id = id
+        self.runID = runID
+        currentStatus = try AgentRunStatus(state: .generating, stateVersion: 4)
+    }
+
+    nonisolated func events(
+        after _: AgentEventCursor?
+    ) -> AsyncThrowingStream<AgentEventEnvelope, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
+    func ephemeralEvents() async -> AsyncThrowingStream<AgentEphemeralEventEnvelope, Error> {
+        AsyncThrowingStream { $0.finish() }
+    }
+
+    func status() async throws -> AgentRunStatus { currentStatus }
+
+    func result() async throws -> AgentResult? { nil }
+
+    func send(_ command: AgentCommandEnvelope) async throws -> AgentCommandReceipt {
+        guard command.payload.runID == runID,
+              command.payload.action == .cancel
+        else { throw AgentExecutionError.commandTargetsAnotherRun }
+        commands.append(command)
+        if commands.count == 1 {
+            currentStatus = try AgentRunStatus(state: .generating, stateVersion: 5)
+            return try AgentCommandReceipt(
+                commandID: command.payload.commandID,
+                runID: runID,
+                disposition: .stale,
+                currentStatus: currentStatus,
+                failure: try AgentFailure(
+                    code: "execution.command-stale",
+                    classification: .permanent,
+                    safeMessage: "The run changed before this command was applied.",
+                    retryAdvice: .never,
+                    externalEffect: .confirmedNone,
+                    requiredUserAction: .none,
+                    redaction: RedactionMetadata(
+                        classification: .publicMetadata,
+                        policyVersion: 1
+                    )
+                )
+            )
+        }
+        XCTAssertEqual(command.payload.expectedRunStateVersion, 5)
+        currentStatus = try AgentRunStatus(
+            state: .cancelled,
+            stateVersion: 6,
+            terminalReason: .cancelledByUser
+        )
+        return try AgentCommandReceipt(
+            commandID: command.payload.commandID,
+            runID: runID,
+            disposition: .accepted,
+            currentStatus: currentStatus
+        )
+    }
+
+    func sentCommands() -> [AgentCommandEnvelope] { commands }
 }
 
 // MARK: - Parallel tool fixtures

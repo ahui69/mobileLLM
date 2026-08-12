@@ -56,9 +56,10 @@ private actor ResponsesAPITimeoutStore {
     }
 }
 
-/// An `AgentModelProvider` that calls an OpenAI-compatible `/responses` endpoint. The whole request is
-/// one prepared, authorized external operation (data egress, spec §15.1): every generation runs inside
-/// the model boundary with exact destination, data category, and response accounting.
+/// An `AgentModelProvider` that calls an OpenAI-compatible `/responses` endpoint, or the documented
+/// Chat Completions endpoint for the official DeepSeek service. The whole request is one prepared,
+/// authorized external operation (data egress, spec §15.1): every generation runs inside the model
+/// boundary with exact destination, data category, and response accounting.
 public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sendable {
     public static let providerID = "openai.responses"
     /// Advertising ceiling for OpenAI-compatible services without per-model metadata (matches the
@@ -73,6 +74,11 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
     /// Per-run attempt timeout derived from the prepared plan (the run budget), so the URLSession
     /// deadline is never a second hardcoded guess. Keyed by request id; cleared after each generate.
     private let timeouts = ResponsesAPITimeoutStore()
+
+    enum WireDialect: Sendable, Equatable {
+        case responses
+        case deepSeekChatCompletions
+    }
 
     public convenience init(
         configuration: ResponsesAPIConfiguration,
@@ -200,24 +206,65 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         else {
             throw AgentModelProviderFailure(try Self.invalidBaseURLFailure())
         }
+        let dialect = Self.wireDialect(
+            baseURL: configuration.baseURL,
+            modelID: request.selection.modelID.rawValue
+        )
         let timeout = await timeouts.take(for: request.requestID) ?? 60
         func makeRequest() -> URLRequest {
-            var urlRequest = URLRequest(url: baseURL.appending(path: "responses"))
+            let endpoint = switch dialect {
+            case .responses: baseURL.appending(path: "responses")
+            case .deepSeekChatCompletions: baseURL.appending(path: "chat/completions")
+            }
+            var urlRequest = URLRequest(url: endpoint)
             urlRequest.httpMethod = "POST"
             urlRequest.timeoutInterval = timeout
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
             urlRequest.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
             return urlRequest
         }
+        func body(
+            reasoningDisabled: Bool? = nil,
+            maxOutputTokensOverride: UInt64? = nil,
+            omitReasoning: Bool = false
+        ) throws -> Data {
+            switch dialect {
+            case .responses:
+                try Self.requestBody(
+                    request: request,
+                    baseURL: configuration.baseURL,
+                    reasoningDisabled: reasoningDisabled,
+                    maxOutputTokensOverride: maxOutputTokensOverride,
+                    reasoningEffort: configuration.reasoningEffort,
+                    omitReasoning: omitReasoning,
+                    stream: true
+                )
+            case .deepSeekChatCompletions:
+                try Self.chatCompletionsRequestBody(
+                    request: request,
+                    reasoningDisabled: reasoningDisabled,
+                    maxOutputTokensOverride: maxOutputTokensOverride,
+                    reasoningEffort: configuration.reasoningEffort,
+                    omitReasoning: omitReasoning,
+                    stream: true
+                )
+            }
+        }
         let emitReasoning = request.generationParameters.thinkingMode != .disabled
+        // A structured answer is normalized before it becomes the terminal action (for example,
+        // outer whitespace/fences are removed). Streaming the raw bytes first would make the
+        // executor correctly reject the provider because the provisional answer no longer equals
+        // the normalized terminal answer. Keep structured output attempt-local until validation;
+        // normal prose still streams token by token.
+        let emitStreamDeltas = !Self.isStructured(request)
         func attempt(
-            _ body: Data,
+            _ payload: Data,
             allowEffortFallback: Bool,
             allowAutoFallback: Bool,
             streamEmission: Bool = true
         ) async throws -> (parsed: ParsedResponse, streamed: Bool, data: Data) {
             var urlRequest = makeRequest()
-            urlRequest.httpBody = body
+            urlRequest.httpBody = payload
             let (bytes, response) = try await session.bytes(for: urlRequest)
             try Task.checkCancellation()
             let http = response as? HTTPURLResponse
@@ -230,16 +277,12 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
                    let errorText = String(data: data, encoding: .utf8)
                 {
                     if allowEffortFallback,
-                       errorText.localizedCaseInsensitiveContains("reasoning")
+                       ["reasoning", "thinking"].contains(where: {
+                           errorText.localizedCaseInsensitiveContains($0)
+                       })
                     {
-                        let fallbackBody = try Self.requestBody(
-                            request: request,
-                            baseURL: configuration.baseURL,
-                            reasoningEffort: configuration.reasoningEffort,
-                            omitReasoning: true,
-                            stream: true
-                        )
-                        if fallbackBody != body {
+                        let fallbackBody = try body(omitReasoning: true)
+                        if fallbackBody != payload {
                             return try await attempt(
                                 fallbackBody,
                                 allowEffortFallback: false,
@@ -255,14 +298,10 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
                        ["max_output_tokens", "max_tokens", "output_tokens", "output limit"]
                            .contains(where: { errorText.localizedCaseInsensitiveContains($0) })
                     {
-                        let fallbackBody = try Self.requestBody(
-                            request: request,
-                            baseURL: configuration.baseURL,
-                            maxOutputTokensOverride: parameters.maximumOutputTokens,
-                            reasoningEffort: configuration.reasoningEffort,
-                            stream: true
+                        let fallbackBody = try body(
+                            maxOutputTokensOverride: parameters.maximumOutputTokens
                         )
-                        if fallbackBody != body {
+                        if fallbackBody != payload {
                             return try await attempt(
                                 fallbackBody,
                                 allowEffortFallback: false,
@@ -282,30 +321,40 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             let contentType = (http?.value(forHTTPHeaderField: "Content-Type") ?? "")
                 .lowercased()
             if contentType.contains("text/event-stream") {
-                let parsed = try await Self.consumeEventStream(
-                    bytes,
-                    emitter: emitter,
-                    emitReasoning: emitReasoning,
-                    emit: streamEmission
-                )
+                let parsed = switch dialect {
+                case .responses:
+                    try await Self.consumeEventStream(
+                        bytes,
+                        emitter: emitter,
+                        emitReasoning: emitReasoning,
+                        emit: streamEmission
+                    )
+                case .deepSeekChatCompletions:
+                    try await Self.consumeChatCompletionsEventStream(
+                        bytes,
+                        emitter: emitter,
+                        emitReasoning: emitReasoning,
+                        emit: streamEmission
+                    )
+                }
                 return (parsed, true, Data())
             }
             var data = Data()
             for try await byte in bytes { data.append(byte) }
-            return (try Self.parseResponse(data), false, data)
+            let parsed = switch dialect {
+            case .responses: try Self.parseResponse(data)
+            case .deepSeekChatCompletions: try Self.parseChatCompletion(data)
+            }
+            return (parsed, false, data)
         }
 
         let started = ContinuousClock.now
-        let firstBody = try Self.requestBody(
-            request: request,
-            baseURL: configuration.baseURL,
-            reasoningEffort: configuration.reasoningEffort,
-            stream: true
-        )
+        let firstBody = try body()
         var (parsed, streamed, data) = try await attempt(
             firstBody,
             allowEffortFallback: true,
-            allowAutoFallback: parameters.outputBudgetMode == .auto
+            allowAutoFallback: parameters.outputBudgetMode == .auto,
+            streamEmission: emitStreamDeltas
         )
 
         // Output-budget truncation: retry ONCE with a higher explicit budget. Streamed first
@@ -321,18 +370,12 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
                 max(parameters.maximumOutputTokens, 16_384),
                 retryCeiling
             )
-            let retryBody = try Self.requestBody(
-                request: request,
-                baseURL: configuration.baseURL,
-                maxOutputTokensOverride: bumped,
-                reasoningEffort: configuration.reasoningEffort,
-                stream: true
-            )
+            let retryBody = try body(maxOutputTokensOverride: bumped)
             let (retried, retriedStreamed, retriedData) = try await attempt(
                 retryBody,
                 allowEffortFallback: false,
                 allowAutoFallback: false,
-                streamEmission: !streamed
+                streamEmission: emitStreamDeltas && !streamed
             )
             if streamed {
                 let textContinues = parsed.text.isEmpty || retried.text.hasPrefix(parsed.text)
@@ -369,16 +412,12 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             // Non-streaming fallback keeps the reasoning-only retry (streamed reasoning-only is
             // handled below; both stay inside the same authorization boundary).
             if parsed.text.isEmpty, parsed.calls.isEmpty, parsed.hasReasoning {
-                let retryBody = try Self.requestBody(
-                    request: request,
-                    baseURL: configuration.baseURL,
-                    reasoningDisabled: true,
-                    stream: true
-                )
+                let retryBody = try body(reasoningDisabled: true)
                 let (retried, retriedStreamed, retriedData) = try await attempt(
                     retryBody,
                     allowEffortFallback: false,
-                    allowAutoFallback: false
+                    allowAutoFallback: false,
+                    streamEmission: emitStreamDeltas
                 )
                 parsed = retried
                 streamed = retriedStreamed
@@ -387,16 +426,12 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         } else if parsed.text.isEmpty, parsed.calls.isEmpty, parsed.hasReasoning {
             // Streamed reasoning-only: reasoning was already shown live; retry once without reasoning
             // so the ANSWER streams too (no duplication of answer text).
-            let retryBody = try Self.requestBody(
-                request: request,
-                baseURL: configuration.baseURL,
-                reasoningDisabled: true,
-                stream: true
-            )
+            let retryBody = try body(reasoningDisabled: true)
             let (retried, retriedStreamed, retriedData) = try await attempt(
                 retryBody,
                 allowEffortFallback: false,
-                allowAutoFallback: false
+                allowAutoFallback: false,
+                streamEmission: emitStreamDeltas
             )
             parsed = retried
             streamed = retriedStreamed
@@ -420,7 +455,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             if !parsed.reasoning.isEmpty, emitReasoning {
                 try await emitter.emit(.reasoningDelta(parsed.reasoning), responseBytes: 0)
             }
-            if !parsed.text.isEmpty {
+            if !parsed.text.isEmpty, emitStreamDeltas {
                 try await emitter.emit(.answerDelta(parsed.text), responseBytes: 0)
             }
         }
@@ -431,13 +466,26 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         let calls = Self.deduplicatedCalls(parsed.calls)
         let action: AgentAction
         if calls.isEmpty {
-            let finalText = Self.isStructured(request)
-                ? Self.structuredJSONText(parsed.text)
-                : parsed.text
+            let structured = Self.isStructured(request)
+            let finalText = structured ? Self.structuredJSONText(parsed.text) : parsed.text
             guard !finalText.isEmpty else {
                 throw AgentModelProviderFailure(try Self.emptyFailure())
             }
-            action = .finalAnswer(try AgentAnswer(text: finalText))
+            if structured {
+                let value: JSONValue
+                do {
+                    value = try AgentWireDecoder.decode(
+                        JSONValue.self,
+                        from: Data(finalText.utf8),
+                        limits: .inlineValue
+                    )
+                } catch {
+                    throw AgentModelProviderFailure(try Self.structuredOutputFailure())
+                }
+                action = .finalAnswer(try AgentAnswer(structuredOutput: value))
+            } else {
+                action = .finalAnswer(try AgentAnswer(text: finalText))
+            }
         } else {
             let normalized = try calls.enumerated().map { index, call in
                 try Self.normalize(
@@ -595,6 +643,107 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         )
     }
 
+    private static func consumeChatCompletionsEventStream(
+        _ bytes: URLSession.AsyncBytes,
+        emitter: AgentModelBoundaryEmitter,
+        emitReasoning: Bool,
+        emit: Bool = true
+    ) async throws -> ParsedResponse {
+        var reasoning = ""
+        var text = ""
+        var partialCalls: [Int: (name: String, arguments: String)] = [:]
+        var hasReasoningOutput = false
+        var isTruncated = false
+        var usage = ParsedUsage(inputTokens: 0, outputTokens: 0)
+
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("data:") else { continue }
+            let payload = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+            guard !payload.isEmpty, payload != "[DONE]",
+                  let value = try? AgentWireDecoder.decode(
+                      JSONValue.self,
+                      from: Data(payload.utf8),
+                      limits: .inlineValue
+                  ), case .object(let root) = value
+            else { continue }
+
+            if case .object(let error)? = root["error"] {
+                let message: String
+                if case .string(let value)? = error["message"] { message = value }
+                else { message = "The online model stream failed." }
+                throw AgentModelProviderFailure(try streamFailure(message))
+            }
+            if case .object(let usageObject)? = root["usage"] {
+                usage = ParsedUsage(
+                    inputTokens: usageNumber(
+                        usageObject,
+                        keys: ["prompt_tokens", "input_tokens", "inputTokens"]
+                    ),
+                    outputTokens: usageNumber(
+                        usageObject,
+                        keys: ["completion_tokens", "output_tokens", "outputTokens"]
+                    )
+                )
+            }
+            guard case .array(let choices)? = root["choices"] else { continue }
+            for choice in choices {
+                guard case .object(let choiceObject) = choice else { continue }
+                if case .string(let finish)? = choiceObject["finish_reason"],
+                   finish == "length" || finish == "insufficient_system_resource"
+                {
+                    isTruncated = true
+                }
+                guard case .object(let delta)? = choiceObject["delta"] else { continue }
+                if case .string(let value)? = delta["reasoning_content"], !value.isEmpty {
+                    hasReasoningOutput = true
+                    reasoning += value
+                    if emit, emitReasoning {
+                        try await emitter.emit(.reasoningDelta(value), responseBytes: 0)
+                    }
+                }
+                if case .string(let value)? = delta["content"], !value.isEmpty {
+                    text += value
+                    if emit {
+                        try await emitter.emit(.answerDelta(value), responseBytes: 0)
+                    }
+                }
+                if case .array(let toolCalls)? = delta["tool_calls"] {
+                    for toolCall in toolCalls {
+                        guard case .object(let callObject) = toolCall,
+                              let rawIndex = unsignedNumber(callObject["index"]),
+                              rawIndex <= UInt64(Int.max)
+                        else { continue }
+                        let index = Int(rawIndex)
+                        var call = partialCalls[index] ?? (name: "", arguments: "")
+                        if case .object(let function)? = callObject["function"] {
+                            if case .string(let name)? = function["name"], !name.isEmpty {
+                                call.name = name
+                            }
+                            if case .string(let arguments)? = function["arguments"] {
+                                call.arguments += arguments
+                            }
+                        }
+                        partialCalls[index] = call
+                    }
+                }
+            }
+        }
+        let calls = partialCalls.keys.sorted().compactMap { index -> ParsedCall? in
+            guard let call = partialCalls[index], !call.name.isEmpty else { return nil }
+            return ParsedCall(name: call.name, argumentsJSON: call.arguments)
+        }
+        return ParsedResponse(
+            text: text,
+            reasoning: reasoning,
+            calls: calls,
+            usage: usage,
+            hasReasoning: hasReasoningOutput,
+            isTruncated: isTruncated
+        )
+    }
+
     private static func unsignedNumber(_ value: JSONValue?) -> UInt64? {
         switch value {
         case .unsignedInteger(let v): v
@@ -658,6 +807,109 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
 
     // MARK: - Pure request/response mapping (unit-tested)
 
+    static func wireDialect(baseURL: String, modelID: String) -> WireDialect {
+        let host = URL(string: baseURL)?.host?.lowercased() ?? ""
+        // DeepSeek's public OpenAI-format contract is Chat Completions. Its undocumented
+        // `/responses` compatibility route currently ignores the thinking toggle, which can spend
+        // the whole output budget without an answer. Only select this transport for the official
+        // service host; third-party gateways keep their explicitly configured Responses contract.
+        if host == "api.deepseek.com" || host.hasSuffix(".deepseek.com") {
+            return .deepSeekChatCompletions
+        }
+        return .responses
+    }
+
+    private static func usesDeepSeekThinkingDialect(
+        baseURL: String,
+        modelID: String
+    ) -> Bool {
+        let host = URL(string: baseURL)?.host?.lowercased() ?? ""
+        return modelID.lowercased().hasPrefix("deepseek-")
+            || host == "api.deepseek.com"
+            || host.hasSuffix(".deepseek.com")
+    }
+
+    static func chatCompletionsRequestBody(
+        request: AgentModelRequest,
+        reasoningDisabled: Bool? = nil,
+        maxOutputTokensOverride: UInt64? = nil,
+        reasoningEffort: ReasoningEffort? = nil,
+        omitReasoning: Bool = false,
+        stream: Bool = false
+    ) throws -> Data {
+        let parameters = request.generationParameters
+        var fields: [String: JSONValue] = [
+            "model": .string(request.selection.modelID.rawValue),
+            "messages": .array(chatMessagesPayload(request.messages)),
+            "temperature": .number(parameters.temperature),
+            "top_p": .number(parameters.topP),
+        ]
+        if let maxOutputTokensOverride {
+            fields["max_tokens"] = .unsignedInteger(maxOutputTokensOverride)
+        } else if parameters.outputBudgetMode != .auto {
+            fields["max_tokens"] = .unsignedInteger(parameters.maximumOutputTokens)
+        }
+        let disabled = reasoningDisabled ?? (parameters.thinkingMode == .disabled)
+        if omitReasoning {
+            // One compatibility retry may omit the service-specific directive.
+        } else if disabled {
+            fields["thinking"] = .object(["type": .string("disabled")])
+        } else if parameters.thinkingMode == .enabled, reasoningEffort != nil {
+            fields["reasoning_effort"] = .string("high")
+        }
+        let tools = chatCompletionsToolsPayload(request.advertisedTools)
+        if !tools.isEmpty { fields["tools"] = .array(tools) }
+        if isStructured(request) {
+            // DeepSeek's documented Chat Completions contract supports JSON mode, but not the
+            // Responses API's `text.format` schema shape. The runtime still validates the exact
+            // frozen JSON Schema after generation; this wire hint prevents prose/fence wrappers
+            // from consuming the sole bounded repair pass before that authoritative validation.
+            fields["response_format"] = .object(["type": .string("json_object")])
+        }
+        if stream {
+            fields["stream"] = .bool(true)
+            fields["stream_options"] = .object(["include_usage": .bool(true)])
+        }
+        return try JSONValue.object(fields).canonicalData()
+    }
+
+    private static func chatMessagesPayload(
+        _ messages: [AgentModelMessage]
+    ) -> [JSONValue] {
+        messages.map { message in
+            let role: String = switch message.role {
+            case .system: "system"
+            case .user: "user"
+            case .assistant: "assistant"
+            // The compiled model message intentionally carries no provider call ID. Preserve the
+            // observation as user text, matching the existing Responses adapter semantics.
+            case .tool: "user"
+            }
+            let content = message.role == .tool
+                ? "Tool result: \(message.content)"
+                : message.content
+            return .object([
+                "role": .string(role),
+                "content": .string(content),
+            ])
+        }
+    }
+
+    private static func chatCompletionsToolsPayload(
+        _ descriptors: [AgentToolDescriptor]
+    ) -> [JSONValue] {
+        descriptors.map { descriptor in
+            .object([
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string(descriptor.id.logicalID.name),
+                    "description": .string(descriptor.summary),
+                    "parameters": descriptor.inputSchema.root,
+                ]),
+            ])
+        }
+    }
+
     static func requestBody(
         request: AgentModelRequest,
         baseURL: String,
@@ -687,18 +939,34 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         if !instructions.isEmpty {
             fields["instructions"] = .string(instructions)
         }
-        // Reasoning-first services (e.g. DeepSeek v4) default to a long reasoning phase that can
-        // consume the whole output budget before any answer token. The app maps its per-service
-        // "Allow reasoning" toggle to `.enabled`/`.disabled`: disabled asks the service to skip
-        // reasoning (fast, deterministic), enabled omits the field so the service keeps its default.
-        // `.automatic` (not produced by the app today) stays neutral.
+        // Reasoning-first services default to a long reasoning phase that can consume the whole
+        // output budget before any answer token. OpenAI Responses-compatible gateways use the
+        // `reasoning` object, while DeepSeek V4's OpenAI-format contract uses
+        // `thinking: { type: enabled|disabled }` plus a top-level `reasoning_effort`. Select the
+        // dialect from both service host and model id so DeepSeek behind a compatible proxy still
+        // receives its documented switch. `.automatic` stays neutral.
         let disableReasoning = reasoningDisabled ?? (parameters.thinkingMode == .disabled)
+        let usesDeepSeekThinkingDialect = usesDeepSeekThinkingDialect(
+            baseURL: baseURL,
+            modelID: request.selection.modelID.rawValue
+        )
         if omitReasoning {
-            // Gateway rejected the reasoning field: leave it absent entirely.
+            // Gateway rejected its reasoning/thinking field: leave the directive absent entirely.
         } else if disableReasoning {
-            fields["reasoning"] = .object(["enabled": .bool(false)])
+            if usesDeepSeekThinkingDialect {
+                fields["thinking"] = .object(["type": .string("disabled")])
+            } else {
+                fields["reasoning"] = .object(["enabled": .bool(false)])
+            }
         } else if let reasoningEffort {
-            fields["reasoning"] = .object(["effort": .string(reasoningEffort.rawValue)])
+            if usesDeepSeekThinkingDialect {
+                // DeepSeek currently accepts high/max. Its compatibility contract maps lower
+                // effort names to high, so emit the canonical value rather than relying on a
+                // gateway-specific coercion.
+                fields["reasoning_effort"] = .string("high")
+            } else {
+                fields["reasoning"] = .object(["effort": .string(reasoningEffort.rawValue)])
+            }
         }
         let tools = try toolsPayload(request.advertisedTools)
         // Some compatible gateways reject an empty array; omitting it is equivalent for every client
@@ -880,6 +1148,72 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         )
     }
 
+    static func parseChatCompletion(_ data: Data) throws -> ParsedResponse {
+        let value = try AgentWireDecoder.decode(JSONValue.self, from: data, limits: .inlineValue)
+        guard case .object(let root) = value else {
+            return ParsedResponse(
+                text: "",
+                reasoning: "",
+                calls: [],
+                usage: ParsedUsage(inputTokens: 0, outputTokens: 0),
+                hasReasoning: false,
+                isTruncated: false
+            )
+        }
+        var text = ""
+        var reasoning = ""
+        var calls: [ParsedCall] = []
+        var isTruncated = false
+        if case .array(let choices)? = root["choices"] {
+            for choice in choices {
+                guard case .object(let choiceObject) = choice else { continue }
+                if case .string(let finish)? = choiceObject["finish_reason"],
+                   finish == "length" || finish == "insufficient_system_resource"
+                {
+                    isTruncated = true
+                }
+                guard case .object(let message)? = choiceObject["message"] else { continue }
+                if case .string(let content)? = message["content"] { text += content }
+                if case .string(let content)? = message["reasoning_content"] {
+                    reasoning += content
+                }
+                if case .array(let toolCalls)? = message["tool_calls"] {
+                    for toolCall in toolCalls {
+                        guard case .object(let callObject) = toolCall,
+                              case .object(let function)? = callObject["function"],
+                              case .string(let name)? = function["name"],
+                              case .string(let arguments)? = function["arguments"]
+                        else { continue }
+                        calls.append(ParsedCall(name: name, argumentsJSON: arguments))
+                    }
+                }
+            }
+        }
+        let usage: ParsedUsage
+        if case .object(let usageObject)? = root["usage"] {
+            usage = ParsedUsage(
+                inputTokens: usageNumber(
+                    usageObject,
+                    keys: ["prompt_tokens", "input_tokens", "inputTokens"]
+                ),
+                outputTokens: usageNumber(
+                    usageObject,
+                    keys: ["completion_tokens", "output_tokens", "outputTokens"]
+                )
+            )
+        } else {
+            usage = ParsedUsage(inputTokens: 0, outputTokens: 0)
+        }
+        return ParsedResponse(
+            text: text,
+            reasoning: reasoning,
+            calls: calls,
+            usage: usage,
+            hasReasoning: !reasoning.isEmpty,
+            isTruncated: isTruncated
+        )
+    }
+
     private static func normalize(
         name: String,
         argumentsJSON: String,
@@ -982,6 +1316,18 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             classification: .permanent,
             safeMessage: "The online model returned no answer text. It may have spent its output "
                 + "budget on service-side reasoning; turn thinking off or raise Max tokens and retry.",
+            retryAdvice: .never,
+            externalEffect: .confirmedNone,
+            requiredUserAction: .none,
+            redaction: RedactionMetadata(classification: .publicMetadata, policyVersion: 1)
+        )
+    }
+
+    private static func structuredOutputFailure() throws -> AgentFailure {
+        try AgentFailure(
+            code: "model.online.structured-output-invalid",
+            classification: .permanent,
+            safeMessage: "The online model returned invalid structured output.",
             retryAdvice: .never,
             externalEffect: .confirmedNone,
             requiredUserAction: .none,

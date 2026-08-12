@@ -3,7 +3,9 @@
 import AgentContracts
 import Foundation
 
-public enum WorkflowScriptAnalysisError: Error, Hashable, Sendable, CustomStringConvertible {
+public enum WorkflowScriptAnalysisError: Error, Hashable, Sendable, CustomStringConvertible,
+    LocalizedError
+{
     case missingMetadata
     case malformedMetadata(String)
     case invalidSyntax(String)
@@ -23,6 +25,8 @@ public enum WorkflowScriptAnalysisError: Error, Hashable, Sendable, CustomString
         case .sourceLimitExceeded: "Workflow source exceeds its hard limit."
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 /// Trusted analysis result. Only this value may enter a script runtime provider.
@@ -240,6 +244,14 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
             guard index > valueStart, parentheses == 0, brackets == 0, braces == 0 else {
                 throw WorkflowScriptAnalysisError.invalidSyntax("invalid agent option value")
             }
+            if key == "isolation", index == valueStart + 1,
+               let literal = tokens[valueStart].stringValue,
+               !WorkflowAgentOptionContract.supportedIsolationValues.contains(literal)
+            {
+                throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                    "agent isolation must be 'worktree' or 'sandbox', not '\(literal)'"
+                )
+            }
             if index < closing { index += 1 }
         }
     }
@@ -277,42 +289,34 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
                 throw WorkflowScriptAnalysisError.unsupportedConstruct("escaped identifier")
             }
             if let template = token.templateValue, template.contains("${") {
-                let start = template.range(of: "${")!.lowerBound
-                let end = template.index(before: template.endIndex)
-                let expressionTail = String(template[start ..< end])
-                guard !expressionTail.contains("\\") else {
-                    throw WorkflowScriptAnalysisError.unsupportedConstruct("template escape")
-                }
-                var embeddedLexer = JavaScriptLexer(source: expressionTail)
-                let embedded = try embeddedLexer.tokens().filter { $0.templateValue == nil }
-                for embeddedToken in embedded {
-                    if case .regex = embeddedToken.kind {
-                        throw WorkflowScriptAnalysisError.forbiddenCapability("regular expressions")
+                for expression in try templateExpressions(in: template) {
+                    var embeddedLexer = JavaScriptLexer(source: expression)
+                    let embedded = try embeddedLexer.tokens()
+                    if embedded.contains(where: { $0.templateValue != nil }) {
+                        throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                            "nested template expression"
+                        )
                     }
-                    if let identifier = embeddedToken.identifier,
-                       forbiddenIdentifiers.contains(identifier)
-                            || forbiddenSynchronousBuiltins.contains(identifier)
-                            || identifier.hasPrefix("__")
-                            || identifier.hasPrefix("__mllm")
-                            || identifier.hasPrefix("__workflow")
-                            || identifier.hasPrefix("__mobileLLM")
-                    {
-                        throw WorkflowScriptAnalysisError.forbiddenCapability(identifier)
+                    // Apply the complete capability/member/mutation policy to interpolation code;
+                    // checking only bare identifiers here would make a template an alternate route
+                    // around computed-property and protected-intrinsic defenses.
+                    try rejectForbiddenCapabilities(embedded)
+                    if embedded.contains(where: {
+                        ["for", "while", "do", "function"].contains($0.identifier ?? "")
+                            || $0.symbol == "=>"
+                    }) {
+                        throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                            "control flow inside template expression"
+                        )
                     }
-                    if let string = embeddedToken.stringValue,
-                       ["constructor", "prototype", "__proto__"].contains(string)
-                            || forbiddenSynchronousBuiltins.contains(string)
-                    {
-                        throw WorkflowScriptAnalysisError.forbiddenCapability(string)
+                    if embedded.contains(where: {
+                        ["agent", "parallel", "pipeline", "workflow", "phase", "log"]
+                            .contains($0.identifier ?? "")
+                    }) {
+                        throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                            "runtime call inside template expression"
+                        )
                     }
-                }
-                if embedded.contains(where: {
-                    ["for", "while", "do", "function"].contains($0.identifier ?? "")
-                        || $0.symbol == "=>"
-                }) {
-                    throw WorkflowScriptAnalysisError.unsupportedConstruct(
-                        "control flow inside template expression"
-                    )
                 }
             }
             if let string = token.stringValue,
@@ -370,6 +374,123 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
                 throw WorkflowScriptAnalysisError.forbiddenCapability("Math.random")
             }
         }
+    }
+
+    /// Extracts exactly the JavaScript inside each `${...}` interpolation while ignoring template
+    /// text. The old first-`${`/last-backtick slice accidentally lexed ordinary prose (for example
+    /// the word "with") as privileged JavaScript and could also merge several expressions. This
+    /// scanner is deliberately conservative: it understands braces, quoted strings, and comments;
+    /// nested templates and ambiguous slash expressions fail closed before token analysis.
+    private static func templateExpressions(in template: String) throws -> [String] {
+        let scalars = Array(template.unicodeScalars)
+        guard scalars.count >= 2, scalars.first == "`", scalars.last == "`" else {
+            throw WorkflowScriptAnalysisError.invalidSyntax("malformed template literal")
+        }
+        var expressions: [String] = []
+        var index = 1
+        let end = scalars.count - 1
+        while index < end {
+            if scalars[index] == "\\" {
+                guard index + 1 < end else {
+                    throw WorkflowScriptAnalysisError.invalidSyntax("unterminated template escape")
+                }
+                index += 2
+                continue
+            }
+            guard scalars[index] == "$", index + 1 < end, scalars[index + 1] == "{" else {
+                index += 1
+                continue
+            }
+            let expressionStart = index + 2
+            index = expressionStart
+            var depth = 1
+            var quote: UnicodeScalar?
+            var lineComment = false
+            var blockComment = false
+            while index < end, depth > 0 {
+                let scalar = scalars[index]
+                if lineComment {
+                    if scalar == "\n" || scalar == "\r" { lineComment = false }
+                    index += 1
+                    continue
+                }
+                if blockComment {
+                    if scalar == "*", index + 1 < end, scalars[index + 1] == "/" {
+                        blockComment = false
+                        index += 2
+                    } else {
+                        index += 1
+                    }
+                    continue
+                }
+                if let activeQuote = quote {
+                    if scalar == "\\" {
+                        guard index + 1 < end else {
+                            throw WorkflowScriptAnalysisError.invalidSyntax(
+                                "unterminated template expression string"
+                            )
+                        }
+                        index += 2
+                    } else {
+                        if scalar == activeQuote { quote = nil }
+                        index += 1
+                    }
+                    continue
+                }
+                if scalar == "\"" || scalar == "'" {
+                    quote = scalar
+                    index += 1
+                    continue
+                }
+                if scalar == "`" {
+                    throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                        "nested template expression"
+                    )
+                }
+                if scalar == "/", index + 1 < end, scalars[index + 1] == "/" {
+                    lineComment = true
+                    index += 2
+                    continue
+                }
+                if scalar == "/", index + 1 < end, scalars[index + 1] == "*" {
+                    blockComment = true
+                    index += 2
+                    continue
+                }
+                if scalar == "/" {
+                    // Distinguishing division from a regular-expression literal needs a full parser.
+                    // Keep interpolation fail-closed; equivalent arithmetic can be computed outside.
+                    throw WorkflowScriptAnalysisError.unsupportedConstruct(
+                        "slash inside template expression"
+                    )
+                }
+                if scalar == "\\" {
+                    throw WorkflowScriptAnalysisError.unsupportedConstruct("template escape")
+                }
+                if scalar == "{" { depth += 1 }
+                if scalar == "}" {
+                    depth -= 1
+                    if depth == 0 {
+                        let expression = String(
+                            String.UnicodeScalarView(scalars[expressionStart ..< index])
+                        )
+                        guard !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                            throw WorkflowScriptAnalysisError.invalidSyntax(
+                                "empty template expression"
+                            )
+                        }
+                        expressions.append(expression)
+                    }
+                }
+                index += 1
+            }
+            guard depth == 0, quote == nil, !blockComment else {
+                throw WorkflowScriptAnalysisError.invalidSyntax(
+                    "unterminated template expression"
+                )
+            }
+        }
+        return expressions
     }
 
     private struct Instrumentation {

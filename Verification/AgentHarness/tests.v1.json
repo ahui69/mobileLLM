@@ -1981,6 +1981,59 @@
       }
     },
     {
+      "id": "AHT-DYNAMIC-EXPLORATION-001",
+      "title": "Real-model Dynamic Workflow complex-goal decomposition and answer quality matrix",
+      "status": "active",
+      "kind": "ui",
+      "riskTier": "P0",
+      "requirementIDs": [
+        "AH-DYNAMIC-001"
+      ],
+      "selectors": [
+        {
+          "kind": "ui-test",
+          "value": "DynamicWorkflowExplorationUITests/test01KimiLocalWeightsFeasibility"
+        },
+        {
+          "kind": "ui-test",
+          "value": "DynamicWorkflowExplorationUITests/test02AccessibleMultiConstraintTrip"
+        },
+        {
+          "kind": "ui-test",
+          "value": "DynamicWorkflowExplorationUITests/test03HybridAgentArchitectureDecision"
+        },
+        {
+          "kind": "ui-test",
+          "value": "DynamicWorkflowExplorationUITests/test04CrashBoundaryIncidentAnalysis"
+        },
+        {
+          "kind": "ui-test",
+          "value": "DynamicWorkflowExplorationUITests/test05UntrustedGoalCannotWidenAuthority"
+        },
+        {
+          "kind": "ui-test",
+          "value": "DynamicWorkflowExplorationUITests/test99AdHocGoalFromEnvironment"
+        }
+      ],
+      "platforms": [
+        "ios-simulator",
+        "ios-device"
+      ],
+      "verificationTiers": [
+        "nightly",
+        "release-candidate"
+      ],
+      "requiredEvidence": [
+        "Exact generated JavaScript, durable child-call projection, terminal state, actual final assistant answer, semantic-oracle failures, and screenshot retained in xcresult",
+        "Feasibility, constrained planning, architecture, incident, injection-boundary, prefix/suffix command, and parameterized future-goal scenarios"
+      ],
+      "determinism": {
+        "fixedSeedRequired": false,
+        "rotatingSeedRequired": false
+      },
+      "notes": "Live-provider evaluation supplements deterministic runtime and UI gates; it never substitutes for them or for physical-device release evidence."
+    },
+    {
       "id": "AHT-DYNAMIC-DEVICE-001",
       "title": "Physical device: complete Dynamic Workflow candidate and execution lifecycle",
       "status": "active",

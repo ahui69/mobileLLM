@@ -221,7 +221,7 @@ private final class JSCWorkflowExecution: @unchecked Sendable {
 
     private func userFunctionSource() -> String {
         """
-        (async function(agent, parallel, pipeline, workflow, phase, log, args, budget, console,
+        (async function(agent, parallel, pipeline, workflow, phase, log, serialize, args, budget, console,
                         __workflowCheckpoint) {
         'use strict';
         \(script.instrumentedSource)
@@ -408,6 +408,9 @@ private final class JSCWorkflowExecution: @unchecked Sendable {
             __phaseNative(title);
           };
           const log = value => __logNative(typeof value === 'string' ? value : __stringify(value));
+          // Public bounded structured handoff. Unlike JSON.stringify/Array.join, this route runs
+          // the checkpointed node/depth/collection/size validator before the native serializer.
+          const serialize = value => __stringify(value);
           const workflow = (name, value) => {
             if (typeof name !== 'string' || name.trim().length === 0) {
               return __RealPromise.reject(new Error('workflow name is required'));
@@ -484,7 +487,7 @@ private final class JSCWorkflowExecution: @unchecked Sendable {
             try { __finishedNative(true, __stringify(value === undefined ? null : value)); }
             catch (error) { __finishedNative(false, __safeMessage(error)); }
           };
-          __userFunction(agent, parallel, pipeline, workflow, phase, log, args, budget, console,
+          __userFunction(agent, parallel, pipeline, workflow, phase, log, serialize, args, budget, console,
                          __checkpoint).then(
             __finishSuccess,
             error => __finishedNative(false, __safeMessage(error))
@@ -730,7 +733,9 @@ private final class JSCWorkflowExecution: @unchecked Sendable {
             catch { throw WorkflowScriptRuntimeError.invalidAgentOptions("schema is not fully supported") }
         } else { schema = nil }
         let isolation = try optionalString(object["isolation"], field: "isolation")
-        guard isolation == nil || isolation == "worktree" || isolation == "sandbox" else {
+        guard isolation == nil
+            || isolation.map(WorkflowAgentOptionContract.supportedIsolationValues.contains) == true
+        else {
             throw WorkflowScriptRuntimeError.invalidAgentOptions("unsupported isolation")
         }
         let stall: UInt64?

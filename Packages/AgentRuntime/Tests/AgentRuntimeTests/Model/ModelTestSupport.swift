@@ -28,7 +28,8 @@ struct ModelFixture {
         providerID: String? = nil,
         remoteDestination: String? = nil,
         modelID: String? = nil,
-        userMessage: String? = nil
+        userMessage: String? = nil,
+        outputRequirement: AgentOutputRequirement = .text
     ) throws {
         let version = SemanticVersion("1.0.0")!
         let resolvedProviderID = providerID ?? "local.scripted.\(offset)"
@@ -97,7 +98,7 @@ struct ModelFixture {
                 seed: 7,
                 outputBudgetMode: outputBudgetMode
             ),
-            outputRequirement: .text
+            outputRequirement: outputRequirement
         )
         let payload = try SanitizedCanonicalJSON(
             value: request.authorizationPayload(),

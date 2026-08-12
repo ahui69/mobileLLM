@@ -9,6 +9,7 @@ enum WorkflowAgentOptionContract {
     static let allowedKeys: Set<String> = [
         "label", "phase", "schema", "model", "agentType", "isolation", "stallMs",
     ]
+    static let supportedIsolationValues: Set<String> = ["worktree", "sandbox"]
 }
 
 public enum WorkflowAgentBridgeResult: Hashable, Sendable {

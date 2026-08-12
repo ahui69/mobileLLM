@@ -5,7 +5,8 @@ import XCTest
 // TEST-ID: AHT-DYNAMIC-UI-001
 /// Simulator E2E for the message-anchored Dynamic Workflow surface (spec §34): `/workflow <goal>`
 /// records one exact analyzed JavaScript candidate, converts the explicit slash command into a
-/// one-run approval, and starts child work without exposing a redundant launch-permission prompt.
+/// one-run approval, runs a parallel research/fan-in workflow, and projects a substantive final
+/// answer without exposing a redundant launch-permission prompt.
 final class WorkflowUITests: XCTestCase {
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -22,6 +23,8 @@ final class WorkflowUITests: XCTestCase {
 
         let field = app.textFields["composer.field"]
         XCTAssertTrue(field.waitForExistence(timeout: 20), "composer never appeared")
+        let answerCount = app.descendants(matching: .any)
+            .matching(identifier: "assistant.answer").count
         field.tap()
         field.typeText("/workflow deploy Kimi K3 on iPhone 16 Pro")
         let send = app.buttons["Send"]
@@ -68,7 +71,12 @@ final class WorkflowUITests: XCTestCase {
             "the explicit /workflow command must auto-start after validation, got '\(candidateState)'"
         )
 
-        row.tap()
+        let workflowBar = app.navigationBars["Workflow"]
+        for _ in 0 ..< 5 where !workflowBar.exists {
+            if row.exists, row.isHittable { row.tap() }
+            if workflowBar.waitForExistence(timeout: 2) { break }
+        }
+        XCTAssertTrue(workflowBar.exists, "workflow row did not open its summary page")
         let sourceDisclosure = app.buttons["JavaScript source"]
         XCTAssertTrue(sourceDisclosure.waitForExistence(timeout: 20), "source disclosure is missing")
         sourceDisclosure.tap()
@@ -78,6 +86,41 @@ final class WorkflowUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Always"].exists)
         XCTAssertFalse(app.buttons["Deny"].exists)
         XCTAssertFalse(app.descendants(matching: .any)["workflow.approval"].exists)
+
+        let sourceText = (source.value as? String) ?? source.label
+        XCTAssertTrue(sourceText.contains("parallel("), "complex fixture must exercise parallel fan-out")
+        XCTAssertTrue(sourceText.contains("KIMI_SYNTHESIS_TRACK"), "complex fixture must fan in to synthesis")
+        sourceDisclosure.tap()
+
+        let state = app.descendants(matching: .any)["workflow.state"]
+        let deadline = Date().addingTimeInterval(180)
+        while Date() < deadline, state.label != "Completed", state.label != "Failed" {
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        XCTAssertEqual(state.label, "Completed", "complex workflow did not complete")
+
+        let callsDisclosure = app.buttons["Agent calls"]
+        XCTAssertTrue(callsDisclosure.waitForExistence(timeout: 10), "agent-call evidence is missing")
+        XCTAssertTrue(
+            ((callsDisclosure.value as? String) ?? "").hasPrefix("4 calls"),
+            "three parallel research agents plus one synthesis agent must be durably projected"
+        )
+        callsDisclosure.tap()
+
+        workflowBar.buttons.firstMatch.tap()
+        let answers = app.descendants(matching: .any).matching(identifier: "assistant.answer")
+        let answerDeadline = Date().addingTimeInterval(20)
+        while Date() < answerDeadline, answers.count <= answerCount {
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        XCTAssertGreaterThan(answers.count, answerCount, "workflow result was not projected into chat")
+        let answer = answers.allElementsBoundByIndex.last
+        let answerText = answer.flatMap { ($0.value as? String) ?? $0.label } ?? ""
+        XCTAssertTrue(answerText.contains("EVAL_KIMI_LOCAL"), "final answer lost the user's acceptance token")
+        XCTAssertTrue(answerText.localizedCaseInsensitiveContains("not feasible"))
+        XCTAssertTrue(answerText.localizedCaseInsensitiveContains("iPhone 16 Pro"))
+        XCTAssertTrue(answerText.localizedCaseInsensitiveContains("smaller"))
+        XCTAssertTrue(answerText.localizedCaseInsensitiveContains("remote"))
     }
 
     /// Reading `.value` immediately after `waitForExistence` can race a list re-render; retry a few

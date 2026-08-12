@@ -4,8 +4,8 @@
   "documentID": "AH-REQUIREMENTS-V1",
   "sourceSpecification": {
     "path": "spec.md",
-    "sha256": "3a3dcd141e905d3759418be844938e466e0910ea15dde3a100889402b6eade69",
-    "capturedAtUTC": "2026-08-09T12:37:37Z"
+    "sha256": "ad3f74a5fb3e9725abe8b84d1f9616de8f46f5adb82923c13062c807267e65ef",
+    "capturedAtUTC": "2026-08-09T15:15:35Z"
   },
   "requirements": [
     {
@@ -1748,7 +1748,7 @@
         {
           "section": "34.5",
           "heading": "Parallel subagent, authority, and lifecycle contract",
-          "lineStart": 1772,
+          "lineStart": 1775,
           "lineEnd": 1787
         }
       ],
@@ -1840,7 +1840,7 @@
           "section": "34",
           "heading": "P0 full Dynamic Workflows program",
           "lineStart": 1639,
-          "lineEnd": 1812
+          "lineEnd": 1838
         }
       ],
       "platforms": [
@@ -1856,11 +1856,12 @@
         "AHT-DYNAMIC-001",
         "AHT-DYNAMIC-UI-001",
         "AHT-DYNAMIC-UI-002",
+        "AHT-DYNAMIC-EXPLORATION-001",
         "AHT-DYNAMIC-DEVICE-001"
       ],
       "requiredEvidence": [
         "Analyzer and realm-escape rejection corpora; runtime ABI ordering; approval binding; hash-chain, CAS, and exact-prefix replay; scheduler fairness; budget and authority attenuation; reconciliation; and saved-version nesting",
-        "Unified application launch preview, accessibility, long-run resource evidence, and matched local/online performance baselines"
+        "Unified application launch preview, accessibility, long-run resource evidence, matched local/online performance baselines, and real-model complex-goal source/child/result evidence"
       ]
     },
     {

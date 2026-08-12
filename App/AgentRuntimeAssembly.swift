@@ -152,9 +152,11 @@ extension AgentRunRequestSnapshot {
     func withText(
         _ text: String,
         maximumOutputTokens: Int? = nil,
-        reasoningEnabled: Bool? = nil
+        reasoningEnabled: Bool? = nil,
+        toolsEnabled: Bool? = nil
     ) -> AgentRunRequestSnapshot {
-        AgentRunRequestSnapshot(
+        let resolvedToolsEnabled = toolsEnabled ?? self.toolsEnabled
+        return AgentRunRequestSnapshot(
             conversationID: conversationID,
             userTurnID: userTurnID,
             text: text,
@@ -173,14 +175,17 @@ extension AgentRunRequestSnapshot {
             topP: topP,
             topK: topK,
             repetitionPenalty: repetitionPenalty,
-            toolsEnabled: toolsEnabled,
+            toolsEnabled: resolvedToolsEnabled,
             localToolNames: localToolNames,
             memorySeamAvailable: memorySeamAvailable,
             eventSeamAvailable: eventSeamAvailable,
             locationSeamAvailable: locationSeamAvailable,
             mcpToolDescriptors: mcpToolDescriptors,
             webSearchDestinations: webSearchDestinations,
-            toolPolicy: toolPolicy,
+            // Candidate/repair generation is a pure source-compilation pass. When its caller turns
+            // tools off, discard the conversation policy too; otherwise the frozen manifest could
+            // still advertise policy entries from the parent even though its catalog is empty.
+            toolPolicy: resolvedToolsEnabled ? toolPolicy : nil,
             onlineModelEnabled: onlineModelEnabled,
             onlineModelID: onlineModelID,
             onlineServiceID: onlineServiceID,
@@ -1722,20 +1727,36 @@ public final class AgentRuntimeAssembly {
         Write one mobileLLM Dynamic Workflow V1 as plain JavaScript for the user's goal.
         Return only source code, with no Markdown fence or explanation. The first statement must be
         a pure-literal `export const meta = { name, description, whenToUse, phases }`, where phases
-        is an array of `{ title, detail?, model? }` objects (never an array of strings). The body may
+        is an array of `{ title, detail?, model? }` objects (never an array of strings). `meta.name`
+        MUST match `[a-z][a-z0-9-]{0,40}` exactly: lowercase kebab-case only, with no spaces,
+        underscores, uppercase letters, or camelCase. The body may
         use top-level await/return and only these injected values: agent(prompt, options),
         parallel(thunks), pipeline(items, ...stages), workflow(name, args), phase(title), log(value),
-        args, and budget. It has no direct filesystem, shell, network, clock, random, module, eval,
-        native-object, or secret access. Use agents for all effects. Keep independent work parallel,
-        give every agent a bounded concrete instruction, and return one useful final JSON value.
+        serialize(value), args, and budget. `serialize(value)` is the only supported way to turn a
+        structured child result into bounded JSON text for a downstream prompt. It has no direct
+        filesystem, shell, network, clock, random, module, eval,
+        native-object, or secret access. Use agents for all effects. Independent work MUST be one
+        explicit `await parallel([() => agent(...), () => agent(...)])` fan-out; never await those
+        independent agents sequentially. Each independent child appears exactly once, only as a
+        thunk in that fan-out—do not pre-run, pre-declare, or duplicate it. A dependent
+        synthesis/review agent runs only after the fan-out. Give every agent a bounded concrete
+        instruction and return one useful final JSON value. If a later agent reviews or synthesizes
+        earlier outputs, explicitly include those outputs in its prompt; variables are not ambient
+        child context. Prefer quoted-string `+` concatenation for dependent prompts; do not use
+        backtick template literals or `${...}` interpolation.
         The optional second argument to agent must be a direct object literal and may contain only
         these exact keys: label, phase, schema, model, agentType, isolation, stallMs. Never add
         tools, timeout, temperature, token limits, or other fields. Agents automatically inherit the
-        user's frozen tool policy; scripts cannot select or widen tools.
+        user's frozen tool policy; scripts cannot select or widen tools. For generated candidates,
+        omit model, agentType, isolation, and stallMs unless the user explicitly requires one and the
+        exact host-supported value is known. In particular, omission means the normal child runtime;
+        never invent isolation values such as none, default, logical, logical-realm, or process. The
+        only valid isolation strings are `worktree` and `sandbox`.
         Keep the complete source concise (under 8,000 output tokens) and use no more than 12 agent
         calls, so its exact source remains comfortably inspectable in the workflow view.
         For structured child output, pass a literal JSON Schema in `agent` options and consume the
-        returned object directly. Never parse or stringify JSON in the script. Do not use regular
+        returned object directly. Use `serialize(value)` for structured handoff text; never parse or
+        stringify JSON by any other mechanism in the script. Do not use regular
         expressions or high-amplification synchronous APIs including repeat, padStart, padEnd, fill,
         join, concat, flat, flatMap, copyWithin, Array.from, Object.assign, Object.fromEntries,
         String conversion, toJSON, match, search, replace, or split. These are rejected because the
@@ -1771,14 +1792,27 @@ public final class AgentRuntimeAssembly {
 
         The first statement must be a pure-literal
         `export const meta = { name, description, whenToUse, phases }`, where phases is an array of
-        `{ title, detail?, model? }` objects (never strings). Only use agent(prompt, options),
+        `{ title, detail?, model? }` objects (never strings). `meta.name` MUST match
+        `[a-z][a-z0-9-]{0,40}` exactly: lowercase kebab-case only, never spaces, underscores,
+        uppercase letters, or camelCase. Only use agent(prompt, options),
         parallel(thunks), pipeline(items, ...stages), workflow(name, args), phase(title), log(value),
-        args, budget, ordinary bounded object/array operations, and checkpointable braced loops.
+        serialize(value), args, budget, ordinary bounded object/array operations, and checkpointable
+        braced loops. `serialize(value)` is the only supported bounded structured-to-text handoff.
+        Independent agents MUST be started in one explicit
+        `await parallel([() => agent(...), () => agent(...)])` fan-out, never awaited sequentially,
+        pre-run, or duplicated. Prefer quoted-string `+` concatenation for dependent prompts; do not
+        use backtick template literals or `${...}` interpolation.
+        A downstream review/synthesis agent must receive upstream outputs explicitly in its prompt;
+        merely keeping them in variables does not share them with that child.
         The optional agent options value must be a direct object literal containing only label,
         phase, schema, model, agentType, isolation, or stallMs. Remove tools, timeout, temperature,
-        token limits, and every other option; child agents inherit the frozen host tool policy.
+        token limits, and every other option; child agents inherit the frozen host tool policy. Omit
+        model, agentType, isolation, and stallMs unless the user explicitly requires one and its exact
+        host-supported value is known. Omission is the normal child runtime; never write isolation as
+        none, default, logical, logical-realm, or process. Only `worktree` and `sandbox` are valid.
         For structured child output, use a literal JSON Schema in `agent` options and consume the
-        returned object directly. Never use JSON.parse or JSON.stringify, regular expressions,
+        returned object directly. Use `serialize(value)` when a downstream prompt needs that object.
+        Never use JSON.parse or JSON.stringify, regular expressions,
         repeat, padStart, padEnd, fill, join, concat, flat, flatMap, copyWithin, Array.from,
         Object.assign, Object.fromEntries, String conversion, toJSON, match, search, replace, or split.
         Do not use filesystem, shell, network, clock, random, modules, eval, native objects, secrets,
@@ -1804,9 +1838,13 @@ public final class AgentRuntimeAssembly {
         operation: String
     ) throws -> AgentRequest {
         let source = try frozenBuilder.request(snapshot: snapshot, artifactReferences: [])
-        // The workflow inherits the conversation's frozen root budget. Child budgets divide its
-        // cumulative capacity; candidate generation must never manufacture additional authority.
-        let workflowBudget = source.budget
+        // Dynamic execution uses the same frozen authority/model/tool policy as the conversation,
+        // but needs a workflow-sized resource envelope. Four-way attenuation of the ordinary chat
+        // defaults leaves each research child only one model pass, which cannot complete even one
+        // search -> observation -> answer cycle. This is an app-owned upper bound, not authority:
+        // children still receive strict quarter shares and the workflow ledger accounts aggregate
+        // actual usage across every wave.
+        let workflowBudget = try dynamicWorkflowBudget(from: source.budget)
         let request = try AgentRequest(
             id: AgentRequestID(),
             runID: AgentRunID(),
@@ -1830,13 +1868,28 @@ public final class AgentRuntimeAssembly {
         let frozen = try frozenBuilder.frozenInputs(
             snapshot: snapshot.withText(
                 instruction,
-                maximumOutputTokens: 8_192,
-                reasoningEnabled: false
+                // Reserve a context-scaled input window for the generator instruction and frozen
+                // policy. Using the whole context as output makes admission impossible; a fixed
+                // output number also breaks local models with smaller native contexts. The 24K cap
+                // still gives reasoning-first compatible services room to emit source.
+                maximumOutputTokens: dynamicWorkflowGeneratorOutputTokens(for: snapshot),
+                reasoningEnabled: false,
+                toolsEnabled: false
             ),
             artifactReferences: []
         )
         pendingSubmissions.store(AgentRunSubmission(request: request, frozenInputs: frozen))
         return request
+    }
+
+    private func dynamicWorkflowGeneratorOutputTokens(
+        for snapshot: AgentRunRequestSnapshot
+    ) -> Int {
+        let context = snapshot.onlineModelEnabled && snapshot.onlineModelID != nil
+            ? snapshot.onlineContextLength
+            : ContextPolicy.effective(requested: snapshot.contextLength, model: snapshot.model)
+        let reservedInput = min(8_192, max(1_024, context / 2))
+        return max(1, min(24_576, context - reservedInput))
     }
 
     /// Builds the reserved workflow-root request from a normal conversation snapshot. The root's
@@ -1846,31 +1899,7 @@ public final class AgentRuntimeAssembly {
         workflowID: UUID
     ) throws -> AgentRequest {
         let source = try frozenBuilder.request(snapshot: snapshot, artifactReferences: [])
-        // Workflow children legitimately need several web searches per phase; the default 3-tool
-        // ceiling would make every child fail at its third search. Give the root a generous tool
-        // budget so attenuated children can inherit up to 8 tool invocations.
-        let rootBudgetValues = Dictionary(
-            uniqueKeysWithValues: BudgetDimension.allCases.map {
-                ($0, source.budget.limits[$0])
-            }
-        )
-        var workflowBudgetValues = rootBudgetValues
-        workflowBudgetValues[.toolInvocations] = 12
-        workflowBudgetValues[.modelAttempts] = 16
-        // Deep research phases make several searches AND read pages; the default 8 MB network
-        // ceiling dies on the second Brave page. Enlarge the network/time budgets for the whole
-        // workflow tree (children still attenuate strictly).
-        workflowBudgetValues[.networkRequestBytes] = 32 * 1_024 * 1_024
-        workflowBudgetValues[.networkResponseBytesPerOperation] = 8 * 1_024 * 1_024
-        workflowBudgetValues[.networkResponseBytesTotal] = 64 * 1_024 * 1_024
-        workflowBudgetValues[.generatedArtifactBytes] = 64 * 1_024 * 1_024
-        workflowBudgetValues[.persistedOutputBytes] = 64 * 1_024 * 1_024
-        workflowBudgetValues[.activeMilliseconds] = 30 * 60 * 1_000
-        let workflowBudget = try AgentBudget(
-            limits: BudgetQuantities(workflowBudgetValues),
-            maximumThermalState: source.budget.maximumThermalState,
-            memoryPressureResponse: source.budget.memoryPressureResponse
-        )
+        let workflowBudget = try dynamicWorkflowBudget(from: source.budget)
         let planInstruction = """
         You are a workflow planner. Decompose the user's goal into 2-4 execution phases. Each phase \
         must contain 1-4 subagent instructions. Return ONLY the JSON plan:
@@ -1899,6 +1928,36 @@ public final class AgentRuntimeAssembly {
             labels: source.labels,
             provenance: AgentRequestProvenance(source: .workflow),
             approvalMode: source.approvalMode
+        )
+    }
+
+    private func dynamicWorkflowBudget(from baseline: AgentBudget) throws -> AgentBudget {
+        var values = Dictionary(uniqueKeysWithValues: BudgetDimension.allCases.map {
+            ($0, baseline.limits[$0])
+        })
+        func raise(_ dimension: BudgetDimension, to minimum: UInt64) {
+            values[dimension] = max(values[dimension, default: 0], minimum)
+        }
+
+        // At the iPhone default concurrency of four, one child may use at most one quarter. These
+        // totals therefore allow eight model turns, six tool calls, and two structured-output
+        // repairs per concurrently admitted child, while the workflow-wide ledger still prevents
+        // aggregate overcommit. Discrete repair capacity must be raised explicitly: floor-sharing
+        // the ordinary single repair among four children would otherwise produce zero and turn one
+        // malformed structured answer into an immediate budget failure.
+        raise(.modelAttempts, to: 32)
+        raise(.toolInvocations, to: 24)
+        raise(.structuredRepairs, to: 8)
+        raise(.networkRequestBytes, to: 32 * 1_024 * 1_024)
+        raise(.networkResponseBytesPerOperation, to: 8 * 1_024 * 1_024)
+        raise(.networkResponseBytesTotal, to: 64 * 1_024 * 1_024)
+        raise(.generatedArtifactBytes, to: 64 * 1_024 * 1_024)
+        raise(.persistedOutputBytes, to: 64 * 1_024 * 1_024)
+        raise(.activeMilliseconds, to: 30 * 60 * 1_000)
+        return try AgentBudget(
+            limits: BudgetQuantities(values),
+            maximumThermalState: baseline.maximumThermalState,
+            memoryPressureResponse: baseline.memoryPressureResponse
         )
     }
 

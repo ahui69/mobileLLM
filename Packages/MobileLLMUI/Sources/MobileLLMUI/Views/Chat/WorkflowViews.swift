@@ -241,6 +241,9 @@ struct WorkflowSummaryPage: View {
                         .textSelection(.enabled)
                         .padding(.vertical, Theme.Space.xs)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Workflow JavaScript source")
+                .accessibilityValue(source)
                 .accessibilityIdentifier("workflow.source")
             }
         }
@@ -306,12 +309,24 @@ struct WorkflowSummaryPage: View {
                     }
                 }
             }
+            .accessibilityValue(
+                (["\(childCalls.count) calls"] + childCalls.map { call in
+                    let name = call.label ?? "Agent \(call.ordinal)"
+                    let phase = call.phase.map { " · \($0)" } ?? ""
+                    let detail = call.detail.map { " · \($0)" } ?? ""
+                    return "\(call.ordinal). \(name) · attempt \(call.attempt) · "
+                        + "\(call.status.label)\(phase)\(detail)"
+                }).joined(separator: "\n")
+            )
             .accessibilityIdentifier("workflow.agent.calls")
         }
         if let failure = dynamic.failure {
             Label(failure, systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
                 .foregroundStyle(Theme.danger)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(failure)
+                .accessibilityIdentifier("workflow.failure")
         }
         dynamicActions(
             dynamic.state,

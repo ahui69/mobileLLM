@@ -888,7 +888,8 @@ extension AgentRunController {
             && failure.requiredUserAction == .none
             && failure.retryAdvice == .never
             && (failure.code == "model.local.malformed-action"
-                || failure.code == "model.local.structured-output-invalid")
+                || failure.code == "model.local.structured-output-invalid"
+                || failure.code == "model.online.structured-output-invalid")
     }
 
     private func generationParameters(

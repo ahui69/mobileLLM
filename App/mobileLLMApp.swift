@@ -30,22 +30,40 @@ private final class DynamicWorkflowUITestResponsesProtocol: URLProtocol, @unchec
         }
         let body = Self.requestBodyString(request)
         let text: String
-        if body.contains("mobileLLM Dynamic Workflow V1")
+        if body.contains("KIMI_SYNTHESIS_TRACK") {
+            text = """
+            EVAL_KIMI_LOCAL: Running the complete Kimi K3 weights entirely offline on an iPhone 16 Pro is not feasible. The phone's RAM and storage are far below the order of magnitude required even after aggressive quantization. Use a much smaller on-device model, or keep Kimi K3 on a remote server/API and make the iPhone a private client.
+            """
+        } else if body.contains("KIMI_MODEL_TRACK") {
+            text = "The full model has an enormous parameter footprint; quantization reduces bytes per weight but does not make phone-class deployment realistic."
+        } else if body.contains("IPHONE_LIMIT_TRACK") {
+            text = "An iPhone 16 Pro has phone-class unified memory and storage, both orders of magnitude below the complete model's practical runtime requirements."
+        } else if body.contains("DEPLOYMENT_PATH_TRACK") {
+            text = "Realistic paths are a smaller local model for offline work or a remote Kimi deployment/API with explicit network and privacy controls."
+        } else if body.contains("mobileLLM Dynamic Workflow V1")
             || body.contains("Repair one mobileLLM Dynamic Workflow V1")
         {
             text = """
             export const meta = {
-              name: "simulator-workflow",
-              description: "Exercises validated automatic workflow start.",
-              whenToUse: "Simulator UI verification",
-              phases: [{ title: "Delegate", detail: "Run one bounded child task." }]
+              name: "kimi-local-feasibility",
+              description: "Researches model scale, device limits, and deployment alternatives before producing a concrete verdict.",
+              whenToUse: "A user asks whether a very large model can run fully locally on an iPhone.",
+              phases: [
+                { title: "Research", detail: "Run three independent constraint tracks in parallel." },
+                { title: "Synthesize", detail: "Turn the evidence into a direct deployment verdict." }
+              ]
             };
-            phase("Delegate");
-            const result = await agent("Return a concise simulator fixture result.");
-            return { result };
+            phase("Research");
+            const findings = await parallel([
+              () => agent("KIMI_MODEL_TRACK: Estimate the complete Kimi K3 weight and runtime footprint.", { label: "Model scale", phase: "Research" }),
+              () => agent("IPHONE_LIMIT_TRACK: Assess iPhone 16 Pro RAM and storage constraints.", { label: "Device limits", phase: "Research" }),
+              () => agent("DEPLOYMENT_PATH_TRACK: Identify honest local and remote deployment alternatives.", { label: "Alternatives", phase: "Research" })
+            ]);
+            phase("Synthesize");
+            return await agent(`KIMI_SYNTHESIS_TRACK: Give a direct verdict using all three findings. Preserve the token EVAL_KIMI_LOCAL. Model: ${findings[0]} Device: ${findings[1]} Alternatives: ${findings[2]}`, { label: "Final verdict", phase: "Synthesize" });
             """
         } else {
-            text = "simulator child completed"
+            text = "unexpected simulator workflow request"
         }
         do {
             let delta = try JSONSerialization.data(

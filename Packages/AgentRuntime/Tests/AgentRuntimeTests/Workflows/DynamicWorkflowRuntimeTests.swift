@@ -57,13 +57,37 @@ final class DynamicWorkflowRuntimeTests: XCTestCase {
         XCTAssertNoThrow(try analyze(wrapped("// fetch eval\nreturn 'Function constructor fetch'")))
     }
 
+    func testAnalyzerFailurePublishesItsSafeDiagnosticThroughLocalizedError() throws {
+        let error = WorkflowScriptAnalysisError.malformedMetadata(
+            "workflow name must be lowercase kebab-case"
+        )
+        XCTAssertEqual(
+            error.localizedDescription,
+            "Invalid workflow metadata: workflow name must be lowercase kebab-case"
+        )
+    }
+
+    func testTemplateAnalysisIgnoresRawProseAndChecksEveryInterpolation() throws {
+        XCTAssertNoThrow(try analyze(wrapped(
+            "return `Synthesize with ${args.model} and review with ${args.device.name}.`;"
+        )))
+
+        for body in [
+            "return `unsafe ${fetch('https://example.com')}`;",
+            "return `unsafe ${Object['pro' + 'totype']}`;",
+            "return `hidden dispatch ${agent('not-visible')}`;",
+        ] {
+            XCTAssertThrowsError(try analyze(wrapped(body)), body)
+        }
+    }
+
     func testJavaScriptCoreRunsSequentialAgentArgsPhaseLogAndBudget() async throws {
         let recorder = WorkflowInvocationRecorder()
         let analysis = try analyze("""
         export const meta = { name: 'sequential', description: 'Sequential bridge' };
         phase('Research');
         log({ started: true });
-        const answer = await agent(`hello ${args.name}`, { label: 'primary' });
+        const answer = await agent('hello ' + args.name + ' ' + serialize({ tags: ['a', 'b'] }), { label: 'primary' });
         return { answer, total: budget.total, spent: budget.spent(), remaining: budget.remaining() };
         """)
         let arguments = try CanonicalJSON(.object(["name": .string("Dong")]))
@@ -88,13 +112,13 @@ final class DynamicWorkflowRuntimeTests: XCTestCase {
         )
         let value = try decode(result)
         XCTAssertEqual(value, .object([
-            "answer": .string("hello Dong!"),
+            "answer": .string("hello Dong {\"tags\":[\"a\",\"b\"]}!"),
             "total": .integer(100),
             "spent": .integer(25),
             "remaining": .integer(75),
         ]))
         let snapshot = await recorder.snapshot()
-        XCTAssertEqual(snapshot.prompts, ["hello Dong"])
+        XCTAssertEqual(snapshot.prompts, ["hello Dong {\"tags\":[\"a\",\"b\"]}"])
         XCTAssertEqual(snapshot.options.first?.label, "primary")
         XCTAssertEqual(snapshot.options.first?.phase, "Research")
         XCTAssertEqual(snapshot.phases, ["Research"])
@@ -187,6 +211,8 @@ final class DynamicWorkflowRuntimeTests: XCTestCase {
             "return await agent('bad', { tools: ['web'] });",
             "const options = { label: 'hidden' }; return await agent('bad', options);",
             "return await agent('bad', { ['label']: 'hidden' });",
+            "return await agent('bad', { isolation: 'logical-realm' });",
+            "return await agent('bad', { isolation: 'none' });",
         ] {
             XCTAssertThrowsError(try analyze(wrapped(invalid))) { error in
                 guard case WorkflowScriptAnalysisError.unsupportedConstruct = error else {

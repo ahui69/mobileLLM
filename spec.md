@@ -1689,6 +1689,9 @@ The injected V1 surface is deliberately small:
 - `parallel(thunks)` starts independent thunks concurrently, applies a full barrier, and preserves input result order;
 - `pipeline(items, ...stages)` lets each item advance through its stages independently with no global stage barrier;
 - `phase(title)` and `log(value)` publish bounded observability events but grant no authority;
+- `serialize(value)` converts a JSON-compatible value to bounded JSON handoff text only after checkpointed
+  node, depth, collection, and conservative byte-limit validation; raw `JSON.stringify`, array `join`, and other
+  non-preemptible amplification APIs remain unavailable;
 - `args` is the immutable JSON input supplied at launch;
 - `budget.total`, `budget.spent()`, and `budget.remaining()` expose read-only run accounting;
 - a saved-workflow call primitive may be enabled only with one-level nesting and a registry-pinned script digest. It
@@ -1810,3 +1813,26 @@ prompt/options invalidation; pause/resume/stop/restart/relaunch; authority/tool/
 binding; uncertain-effect reconciliation; saved-version migration; staged-workflow compatibility; accessibility; long-run
 resource/leak tests; and matched local/online performance baselines. Test source must materially exceed happy-path coverage,
 and no Dynamic Workflows requirement becomes release-green from a scripted demonstration alone.
+
+### 34.7 Complex-goal exploratory evaluation
+
+Deterministic runtime and UI fixtures prove mechanics, not whether a real model produces a useful workflow or answer.
+Nightly and release-candidate evaluation therefore runs an online model through the same app UI, candidate analyzer,
+durable engine, child executor, selected-tool policy, approvals, and final chat projection used by a person. The initial
+matrix covers at least five materially different problem shapes: current-fact feasibility research with a strict local-vs-
+cloud distinction, multi-constraint planning with fallbacks, architecture and security tradeoffs, crash-boundary incident
+analysis, and an untrusted-goal/prompt-injection boundary. `/workflow` is exercised at both the beginning and end of the
+message. A parameterized ad-hoc probe must accept newly reported complex goals without requiring a new test harness.
+
+An exploratory run passes only when the candidate reaches execution, independent work is genuinely decomposed (and uses
+parallel fan-out when requested), the durable projection exposes the expected child calls, the run completes, and the
+actual final assistant answer satisfies scenario-specific semantic oracles. For example, a request about installing the
+complete Kimi K3 weights on an iPhone 16 Pro must answer that exact local/offline question; substituting an official app or
+cloud API is not success. Exact JavaScript source, projected child status/details, terminal state, final answer, diagnostic
+failures, and a screenshot are retained in the xcresult. Candidate-analysis, runtime, approval, budget, reconciliation,
+missing-answer, or semantic-quality failures remain visible test failures rather than being converted into demonstrations.
+
+Live-model results are intentionally nondeterministic evidence and never replace deterministic gates. Provider drift is
+handled with repeated evidence or an explicit time-bounded quarantine, not by weakening semantic assertions. Simulator
+coverage is the fast path for online workflows; physical-device evidence remains required for release claims involving
+local models, device resources, suspension, or hardware-specific behavior.

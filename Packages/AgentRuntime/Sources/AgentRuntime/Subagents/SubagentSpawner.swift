@@ -169,34 +169,60 @@ public struct DurableSubagentSpawner: SubagentSpawning, Sendable {
 
     public func cancel(_ handleID: AgentExecutionHandleID, runID: AgentRunID) async throws {
         let handle = try await executor.attach(to: handleID)
-        let commandID = SubagentStableID.cancelCommand(runID: runID, handleID: handleID)
-        let envelope: AgentCommandEnvelope
-        if let existing = try await repository.loadCommand(commandID) {
-            guard existing.runID == runID, existing.envelope.payload.action == .cancel else {
-                throw SubagentSpawnError.invalidResult
-            }
-            if existing.state == .completed {
-                guard existing.receipt?.payload.disposition == .accepted else {
-                    throw SubagentSpawnError.resultUnavailable
-                }
-                return
-            }
-            envelope = existing.envelope
-        } else {
+        // A model/tool callback can advance the run between the status read and command CAS. A
+        // stale receipt proves that no cancellation was applied, so retry against the receipt's
+        // newer durable version instead of incorrectly escalating a harmless race to workflow
+        // reconciliation. The expected version is part of the stable command identity: every
+        // retry remains idempotent across a crash, while a completed stale command can never poison
+        // a later cancellation attempt for the same child.
+        for _ in 0 ..< 16 {
             let status = try await handle.status()
             guard !status.state.isTerminal else { return }
-            envelope = try AgentCommandEnvelope(payload: AgentCommand(
+            let commandID = SubagentStableID.cancelCommand(
+                runID: runID,
+                handleID: handleID,
+                expectedRunStateVersion: status.stateVersion
+            )
+            let envelope: AgentCommandEnvelope
+            if let existing = try await repository.loadCommand(commandID) {
+                guard existing.runID == runID,
+                      existing.envelope.payload.action == .cancel,
+                      existing.envelope.payload.expectedRunStateVersion == status.stateVersion
+                else { throw SubagentSpawnError.invalidResult }
+                if existing.state == .completed {
+                    guard let receipt = existing.receipt?.payload else {
+                        throw SubagentSpawnError.invalidResult
+                    }
+                    switch receipt.disposition {
+                    case .accepted:
+                        return
+                    case .stale:
+                        continue
+                    case .rejected:
+                        throw SubagentSpawnError.resultUnavailable
+                    }
+                }
+                envelope = existing.envelope
+            } else {
+                envelope = try AgentCommandEnvelope(payload: AgentCommand(
                 commandID: commandID,
                 runID: runID,
                 expectedRunStateVersion: status.stateVersion,
                 action: .cancel,
                 issuedAt: try AgentTimestamp(Date())
-            ))
+                ))
+            }
+            let receipt = try await handle.send(envelope)
+            switch receipt.disposition {
+            case .accepted:
+                return
+            case .stale:
+                continue
+            case .rejected:
+                throw SubagentSpawnError.resultUnavailable
+            }
         }
-        let receipt = try await handle.send(envelope)
-        guard receipt.disposition == .accepted else {
-            throw SubagentSpawnError.resultUnavailable
-        }
+        throw SubagentSpawnError.resultUnavailable
     }
 
     public func reconcile(
@@ -331,10 +357,18 @@ enum SubagentStableID {
         ))
     }
 
-    static func cancelCommand(runID: AgentRunID, handleID: AgentExecutionHandleID) -> AgentCommandID {
+    static func cancelCommand(
+        runID: AgentRunID,
+        handleID: AgentExecutionHandleID,
+        expectedRunStateVersion: UInt64
+    ) -> AgentCommandID {
         AgentCommandID(rawValue: uuid(
-            domain: "subagent-cancel-command.v1",
-            components: [runID.description, handleID.description]
+            domain: "subagent-cancel-command.v2",
+            components: [
+                runID.description,
+                handleID.description,
+                String(expectedRunStateVersion),
+            ]
         ))
     }
 
