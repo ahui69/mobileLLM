@@ -5,8 +5,9 @@ import Foundation
 
 /// Where a model provider performs inference.
 ///
-/// The first Agent Harness release admits only ``onDevice`` providers. The explicit remote
-/// value is a compatibility seam: merely registering one never makes it eligible for fallback.
+/// ``onDevice`` providers run over the resident local engine; ``remote`` providers (the OpenAI-compatible
+/// Responses adapter) are selected explicitly per conversation and authorized as external operations.
+/// Registering a remote provider never makes it a fallback: a run pinned to a local model stays local.
 public enum AgentModelProviderLocation: String, CaseIterable, Hashable, Codable, Sendable {
     case onDevice
     case remote

@@ -1,6 +1,6 @@
 # mobileLLM — Architecture
 
-What the code *is* today (2026-08-06). For the original design intent and how the build diverged from it,
+What the code *is* today (2026-08-15). For the original design intent and how the build diverged from it,
 see the frozen [DESIGN.md](DESIGN.md); for the dependency wiring of the local-weight engines, see
 [WIRING.md](WIRING.md); the normative requirements live in [spec.md](../spec.md).
 
@@ -9,7 +9,8 @@ engines — Apple **MLX** (resident weights), **llama.cpp** (memory-mapped GGUF)
 (the OS's own model, no weights of ours at all) — behind one protocol, so everything above the engine is
 engine-agnostic and unit-testable without a Metal toolchain. Above the engines sits a durable **agent
 runtime** (`AgentRuntime`): normal app sends use frozen-input, journaled runs with approvals, budgets, recovery,
-optional online models, subagents, and staged workflows. Assembly failure still has a legacy compatibility path.
+optional online models, subagents, and dynamic workflows. If runtime assembly fails at launch, sending is
+disabled with a visible reason — there is no silent fallback to the legacy in-process tool loop.
 
 ## Package graph
 
@@ -25,9 +26,9 @@ App (mobileLLM.app, Xcode target)
 ├─▶ AgentContracts ◀─ shared by runtime, sandbox API, UI       versioned run/step/request/   (MLX-free)
 │                        approval/budget/workflow contracts
 ├─▶ AgentRuntime ──▶ AgentContracts, LLMCore     durable executor, SQLite journal, approval  (MLX-free,
-│                                                policy, budgets, recovery, subagents,       sqlite3)
-│                                                parallel tool batches, workflow orchestrator,
-│                                                online Responses API provider
+│                                                policy, budgets, recovery, subagents,       sqlite3 +
+│                                                parallel tool batches, dynamic workflow      JavaScriptCore)
+│                                                engine + JS runtime, online Responses provider
 ├─▶ AgentSandboxAPI ──▶ AgentContracts           protocol-only sandbox seam (no provider     (MLX-free)
 │                                                ships in the open-source build)
 ├─▶ MobileLLMUI ──▶ AppUI, AppRuntime, LLMCore,  SwiftUI surface + @Observable stores,        (MLX-free)
@@ -54,7 +55,8 @@ kernels or GGUF Metal (agent/online/workflow behavior is validated on the simula
 `SQLiteRunJournal` (CAS commands, idempotency, recovery), projects run state to `AgentRunStore` for the
 UI, and drives the state machine: context compiled → model attempt → tool invocation → synthesis →
 terminal/final answer, with explicit waiting states for approval, user input, foreground, and model
-resources. The legacy in-process `ToolLoop` remains only as an assembly-failure/test-preview compatibility path.
+resources. The legacy in-process `ToolLoop` survives only for tests and previews that construct a `ChatStore`
+without an `AgentRunStore`; production never routes a send through it.
 
 Submission and finalization atomically write canonical journal message references plus outbox rows. The SQLite
 claim/ack primitives feed a production `ConversationOutboxProjector` (App wiring over `SQLiteOutboxProvider` +
@@ -91,9 +93,14 @@ arrive; truncated-`max_output_tokens` runs get one bounded continuation retry th
 streamed text. The provider is itself an authorized external operation
 (destination `openai.responses:<serviceID>:<modelName>`), so Ask mode requests bounded conversation consent;
 Safe preset and Full access bind authorization without presenting a prompt. Multiple services can be configured in Settings → Online
-models; at most one is active.
+models; at most one is active. Hosts under `api.deepseek.com` are spoken to over the Chat Completions wire
+shape (`thinking` + `reasoning_effort`) because DeepSeek's `/responses` route ignores the thinking toggle;
+every other service uses the Responses shape. Gateway quirks get exactly one bounded retry each: a 400 that
+names `max_output_tokens` falls back from Auto to the runtime ceiling, a 400 that names reasoning omits the
+directive, a reasoning-only reply is re-asked without reasoning, and byte-identical repeated
+`function_call` items are collapsed so a chatty gateway cannot drain the tool budget.
 
-## Subagents, parallel tool batches, and staged workflows
+## Subagents, parallel tool batches, and dynamic workflows
 
 - **Subagents** (`SubagentSpawner`): a parent run can spawn bounded children with a strict subset of its
   capability ceiling and attenuated budgets (model attempts, tool calls, network bytes, active time).
@@ -103,21 +110,37 @@ models; at most one is active.
   model turn may execute concurrently (default 1 = serial). Each call keeps its own cancellation token,
   and journal settlement of the batch is serialized with stale-retry protection so parallel execution
   never races the durable ledger.
-- **Staged workflows v1** (`/workflow <goal>`): the launcher submits a workflow-root *planner* run that
-  emits a structured JSON plan (2–4 phases, each with 1–4 child instructions); if the planner can't
-  produce valid JSON after its bounded repair, the deterministic fallback is Explore → Plan → Audit →
-  Revise → Verify → Deliver (6 phases, 7 children). `WorkflowOrchestrator` fans out subagents per phase,
-  passes structured `WorkflowHandoff`s (including audit findings) into the next phase, and delivers the
-  final plan back to the conversation. The UI is message-anchored: a live record row under the
-  `/workflow` message shows `phase x/y · subagents a/b · tokens · tool calls`, and the summary page shows
-  each phase's acceptance criteria and every child's task/status. This is not the future Dynamic Workflows
-  language/graph system: there is no branching DAG, saved definition, or parallel child scheduler.
+- **Dynamic workflows** (`/workflow <goal>`, spec §34): the primary orchestration path since 2026-08-09.
+  The `/workflow` marker may appear anywhere in the message; the remaining text is the goal. `WorkflowLauncher`
+  (App) first submits an ordinary durable *generator* run — tools disabled — whose answer is a small
+  JavaScript orchestration script beginning with a literal `export const meta = {...}`.
+  `DynamicWorkflowScriptAnalyzer` rejects anything outside the closed vocabulary (no `eval`, classes, `this`,
+  regex literals, `Date`, `Symbol`, `Proxy`, template-literal tricks, or agent options other than
+  `label/phase/schema/model/agentType/isolation/stallMs`); one analyzer-guided repair pass is allowed. The
+  accepted script is content-addressed, journaled, and digest-bound to a launch approval (`/workflow` itself
+  is the launch intent, so no extra Once/Always/Deny prompt), then `DynamicWorkflowEngine` runs it in
+  `JavaScriptCoreWorkflowRuntime`: the script sees only `agent(prompt, options)`, `parallel(thunks)`,
+  `pipeline(items, ...stages)`, `workflow(name, args)` (one nesting level, digest-pinned saved scripts),
+  `phase`, `log`, `serialize`, `args`, and `budget`. It has no filesystem, network, tool, model, secret,
+  clock, or RNG of its own — every `agent()` call becomes an ordinary attenuated subagent run whose tool
+  policy is the conversation's frozen policy verbatim. The realm is a logical boundary, not an OS sandbox
+  (spec §34.3). Execution is event-sourced in `SQLiteDynamicWorkflowJournal` (hash-chained, CAS appends);
+  a rolling per-call prefix key lets a relaunched run reuse the committed prefix (Claude Code's
+  started-order rule) and re-collect submitted-but-unsettled children without respawning them; a fair FIFO
+  `WorkflowDispatchScheduler` (≤16 permits, default `min(4, cores − 2)`) and `WorkflowBudgetCoordinator`
+  (recovered children form a dispatch fence) bound fan-out; controls are pause / resume / stop /
+  restart-agent / reconcile. Hard ceilings: 1 000 agent calls, 4 096 items per collection, 30 min wall
+  clock, one active workflow root per engine. The UI is message-anchored: a live record row under the
+  `/workflow` message shows progress, tokens, and tool calls, and the summary page shows the exact accepted
+  source, every child call, and the terminal result. App bootstrap only re-projects persisted workflows —
+  it never starts one or loads a model.
+- **Staged orchestrator (archived)**: `WorkflowOrchestrator` — the earlier fixed-phase planner/handoff
+  design — is retained for `WorkflowLauncher.resume` of legacy summaries that carry a `WorkflowPlan`, and
+  for `MultiAgentWorkflowIntegrationTests`. New launches never use it.
 
-Both workflow integration gaps are closed (2026-08-08): workflows inherit the initiating conversation's exact tool
-policy without force-enabling tools or imposing a web requirement, and child ceilings remain strictly attenuated.
-Interrupted workflows stay visible after relaunch but remain inert until the user presses **Resume**; only then does
-`WorkflowLauncher.resume` reconstruct the workflow from its durable summary/plan and journaled root request and
-advance remaining phases with idempotent child re-collection (`WorkflowOrchestrator.resume`).
+Workflows inherit the initiating conversation's exact tool policy without force-enabling tools or imposing a web
+requirement, and child ceilings remain strictly attenuated (spec §33 gap 1, closed 2026-08-08). Interrupted
+workflows stay visible after relaunch but remain inert until the user acts on them.
 
 ## iOS lifecycle and continued processing
 

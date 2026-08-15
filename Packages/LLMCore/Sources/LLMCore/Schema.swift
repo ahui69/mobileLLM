@@ -316,9 +316,9 @@ public enum AttentionShape: Sendable, Hashable, Codable {
     }
 }
 
-/// An input the model can natively take. NOTE: the app currently runs every model **text-only** — we load
-/// just the language weights and skip the vision/audio projector — so this describes the CHECKPOINT's own
-/// capability, which the UI surfaces so you know what a model could do once we wire those inputs.
+/// An input the model can natively take. This describes the CHECKPOINT's own capability. The app honors
+/// `.image` only for llama.cpp GGUF variants that declare a `visionProjector` (mmproj, run through mtmd);
+/// audio and any other modality are surfaced as a capability of the model, not of the app.
 public enum Modality: String, Sendable, Hashable, Codable, CaseIterable {
     case text, vision, audio, video
 
@@ -385,8 +385,9 @@ public struct LLMArchitecture: Sendable, Hashable, Codable {
     /// seed models; a non-Qwen GGUF sets these to onboard cleanly without touching the engine).
     public let promptTemplate: PromptTemplate
     public let reasoningStyle: ReasoningStyle
-    /// What the checkpoint natively accepts. We run text-only today, so anything beyond `.text` is shown
-    /// as a capability of the model, not of the app (yet).
+    /// What the checkpoint natively accepts. Image input is wired only where a variant carries an mmproj
+    /// projector (see `LLMVariant.visionProjector`); anything else beyond `.text` is shown as a
+    /// capability of the model, not of the app (yet).
     public let modalities: [Modality]
 
     /// Native inputs beyond text (empty for a pure text model) — what the UI badges.

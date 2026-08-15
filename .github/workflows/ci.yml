@@ -1,22 +1,20 @@
 name: CI
 
-# Fast tests cover all eight packages that build under plain SwiftPM without Metal or vendored artifacts.
-# A second, cached integration job builds the pinned llama.cpp XCFramework on a cache miss, then proves the
-# generated app project for both shipped platforms and every engine test target with xcodebuild. No
-# signing identity or repository secret is required.
+# Hosted CI is deliberately Linux-only. Every gate that needs a macOS runner (Xcode, `swift test` against
+# Apple frameworks, simulators, Metal, mutation kills, package coverage, engine tests) is run on a
+# maintainer Mac through the checked-in scripts — see CONTRIBUTING.md "What runs where" — because paid
+# macOS runner minutes are not in this project's budget. What remains here is the part that can be
+# checked anywhere and that protects the verification documents from drifting silently: the JSON and
+# test-plan files must parse, the verification scripts must be syntactically valid shell, and the
+# `spec.md` digest recorded in the requirement manifest and the semantic registries must match the
+# checked-in specification. No signing identity or repository secret is required.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  schedule:
-    - cron: "17 2 * * *"
   workflow_dispatch:
-
-env:
-  # Every CI invocation receives a reproducible but rotating semantic/property-test seed.
-  AGENT_HARNESS_ROTATING_SEED: ${{ github.run_id }}
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -26,330 +24,60 @@ permissions:
   contents: read
 
 jobs:
-  agent-harness-verification:
-    name: agent harness specification gate
-    runs-on: macos-15
+  verification-documents:
+    name: verification documents (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Select latest stable Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          swift --version
 
       - name: Validate verification JSON and test plans
         run: |
           find Verification/AgentHarness -type f \( -name '*.json' -o -name '*.xctestplan' \) -print0 \
             | xargs -0 -n1 jq empty
-          bash -n scripts/verification/reset-agent-test-container.sh
-          bash -n scripts/verification/run-agent-package-coverage.sh
-          bash -n scripts/verification/run-agent-mutation-gates.sh
-          bash -n scripts/verification/verify-xcode-coverage.sh
 
-      - name: Test the verification gate
-        run: swift test --package-path Tools/AgentHarnessVerification
-
-      - name: Enforce static requirement traceability
-        run: >-
-          swift run --package-path Tools/AgentHarnessVerification
-          agent-harness-verify static
-          --repo-root "$GITHUB_WORKSPACE"
-
-  agent-package-coverage:
-    name: ${{ matrix.package }} coverage evidence
-    needs: agent-harness-verification
-    runs-on: macos-15
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        package:
-          - AgentContracts
-          - AgentRuntime
-          - AgentSandboxAPI
-    steps:
-      - name: Checkout full history
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Select latest stable Xcode
+      - name: Check verification script syntax
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          swift --version
-
-      - name: Resolve changed-lines base
-        id: coverage-base
-        env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-        run: |
-          zero_sha='0000000000000000000000000000000000000000'
-          if [[ -n "${PR_BASE_SHA:-}" ]] && git cat-file -e "${PR_BASE_SHA}^{commit}"; then
-            base_sha="$PR_BASE_SHA"
-          elif [[ -n "${PUSH_BEFORE_SHA:-}" && "$PUSH_BEFORE_SHA" != "$zero_sha" ]] \
-              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}"; then
-            base_sha="$PUSH_BEFORE_SHA"
-          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            base_sha="$(git rev-parse HEAD^)"
-          else
-            base_sha="$(git rev-parse HEAD)"
-          fi
-          echo "base-sha=$base_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Test once and enforce package coverage
-        timeout-minutes: 18
-        run: |
-          bash scripts/verification/run-agent-package-coverage.sh \
-            --package "${{ matrix.package }}" \
-            --base-ref "${{ steps.coverage-base.outputs.base-sha }}" \
-            --output-dir "$RUNNER_TEMP/agent-package-coverage"
-
-      - name: Upload normalized coverage evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.package }}-coverage-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/agent-package-coverage
-          if-no-files-found: error
-          retention-days: 14
-
-  agent-evidence-freshness:
-    name: coherent agent evidence
-    needs: agent-package-coverage
-    runs-on: macos-15
-    steps:
-      - name: Checkout exact source
-        uses: actions/checkout@v4
-
-      - name: Download all coverage evidence
-        uses: actions/download-artifact@v4
-        with:
-          pattern: "*-coverage-${{ github.run_id }}-${{ github.run_attempt }}"
-          path: ${{ runner.temp }}/agent-evidence
-
-      - name: Require one clean report from the same commit and specification
-        run: |
-          reports=()
-          while IFS= read -r report; do reports+=(--report "$report"); done < <(
-            find "$RUNNER_TEMP/agent-evidence" -name coverage-report.v1.json -type f | sort
-          )
-          spec_sha="$(shasum -a 256 spec.md | awk '{print $1}')"
-          swift run --package-path Tools/AgentHarnessVerification agent-harness-verify freshness \
-            --expected-source-commit "$GITHUB_SHA" \
-            --expected-spec-sha256 "$spec_sha" \
-            "${reports[@]}"
-
-  test:
-    name: swift test (${{ matrix.package }})
-    needs: agent-harness-verification
-    runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        package:
-          - AppUI
-          - AppRuntime
-          - LLMCore
-          - MobileLLMUI
-          - LLMEngineApple
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Select latest stable Xcode
-        # /Applications/Xcode.app is the runner image's default (latest stable) Xcode. Bump the runner
-        # image (macos-15 → newer) to move to a newer default toolchain.
-        run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          swift --version
-          xcodebuild -version
-
-      - name: Test package
-        run: swift test --package-path "Packages/${{ matrix.package }}"
-
-  agent-harness-mutations:
-    name: curated agent mutation gates
-    needs: agent-harness-verification
-    runs-on: macos-15
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Select latest stable Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          swift --version
-
-      - name: Kill all six security mutations
-        run: bash scripts/verification/run-agent-mutation-gates.sh
-
-  agent-nightly-stress:
-    name: nightly recovery and concurrency stress
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: agent-harness-verification
-    runs-on: macos-15
-    timeout-minutes: 60
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Select latest stable Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          swift --version
-
-      - name: Run the complete runtime fault and recovery corpus
-        run: swift test --package-path Packages/AgentRuntime
-
-      - name: Repeat the bounded parallel-subagent oracle
-        run: |
-          for pass in {1..25}; do
-            swift test --package-path Packages/AgentRuntime \
-              --filter MultiAgentWorkflowIntegrationTests/testWorkflowRunsChildrenInBoundedParallelBatchesAndMergesInPlanOrder
+          for script in scripts/verification/*.sh scripts/*.sh; do
+            bash -n "$script"
           done
 
-  build-app-and-engines:
-    name: xcodebuild (app + engines)
-    needs: [test, agent-package-coverage, agent-evidence-freshness, agent-harness-mutations]
-    runs-on: macos-15
-    timeout-minutes: 90
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Select latest stable Xcode
+      - name: Require the requirement manifest and registries to bind the checked-in spec.md
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          swift --version
-          xcodebuild -version
+          expected="$(sha256sum spec.md | awk '{print $1}')"
+          echo "spec.md sha256: $expected"
+          status=0
+          for manifest in Verification/AgentHarness/requirements.v1.json \
+                          Verification/AgentHarness/Registries/*.json; do
+            recorded="$(jq -r '.sourceSpecification.sha256 // empty' "$manifest")"
+            path="$(jq -r '.sourceSpecification.path // empty' "$manifest")"
+            if [[ -z "$recorded" ]]; then
+              echo "::error file=$manifest::missing sourceSpecification.sha256"
+              status=1
+            elif [[ "$path" != "spec.md" ]]; then
+              echo "::error file=$manifest::sourceSpecification.path is '$path', expected 'spec.md'"
+              status=1
+            elif [[ "$recorded" != "$expected" ]]; then
+              echo "::error file=$manifest::sourceSpecification.sha256 $recorded does not match spec.md $expected"
+              status=1
+            else
+              echo "ok  $manifest"
+            fi
+          done
+          exit "$status"
 
-      - name: Resolve changed-lines base
-        id: xcode-coverage-base
-        env:
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
+      - name: Refuse committed secrets and generated artifacts
         run: |
-          zero_sha='0000000000000000000000000000000000000000'
-          if [[ -n "${PR_BASE_SHA:-}" ]] && git cat-file -e "${PR_BASE_SHA}^{commit}"; then
-            base_sha="$PR_BASE_SHA"
-          elif [[ -n "${PUSH_BEFORE_SHA:-}" && "$PUSH_BEFORE_SHA" != "$zero_sha" ]] \
-              && git cat-file -e "${PUSH_BEFORE_SHA}^{commit}"; then
-            base_sha="$PUSH_BEFORE_SHA"
-          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            base_sha="$(git rev-parse HEAD^)"
-          else
-            base_sha="$(git rev-parse HEAD)"
+          status=0
+          for forbidden in Signing.xcconfig mobileLLM.xcodeproj Packages/LLMEngineLlama/Vendor/llama.xcframework; do
+            if git ls-files --error-unmatch "$forbidden" >/dev/null 2>&1; then
+              echo "::error::$forbidden must never be committed"
+              status=1
+            fi
+          done
+          if git ls-files | grep -E '\.(gguf|safetensors)$'; then
+            echo "::error::model weights must never be committed"
+            status=1
           fi
-          echo "base-sha=$base_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Install project tools
-        run: |
-          brew install xcodegen
-          if ! command -v cmake >/dev/null; then
-            brew install cmake
-          fi
-
-      - name: Cache pinned llama.cpp XCFramework
-        id: llama-cache
-        uses: actions/cache@v4
-        with:
-          path: Packages/LLMEngineLlama/Vendor/llama.xcframework
-          key: llama-xcframework-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-llama-xcframework.sh') }}
-
-      - name: Build pinned llama.cpp XCFramework
-        if: steps.llama-cache.outputs.cache-hit != 'true'
-        run: ./scripts/build-llama-xcframework.sh
-
-      - name: Verify vendor artifact
-        run: test -f Packages/LLMEngineLlama/Vendor/llama.xcframework/Info.plist
-
-      - name: Generate unsigned project
-        run: |
-          cp Signing.xcconfig.example Signing.xcconfig
-          xcodegen generate
-          xcodebuild -project mobileLLM.xcodeproj -scheme UITests -showTestPlans
-          xcodebuild -project mobileLLM.xcodeproj -scheme SimulatorCI -showTestPlans
-          xcodebuild -project mobileLLM.xcodeproj -scheme DeviceE2E -showTestPlans
-
-      - name: Build macOS app
-        run: |
-          xcodebuild build \
-            -project mobileLLM.xcodeproj \
-            -scheme mobileLLM \
-            -destination 'platform=macOS,arch=arm64' \
-            -skipMacroValidation \
-            MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Build iOS app
-        run: |
-          xcodebuild build \
-            -project mobileLLM.xcodeproj \
-            -scheme mobileLLM \
-            -destination 'generic/platform=iOS' \
-            -skipMacroValidation \
-            MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Run deterministic iOS simulator UI gate
-        run: |
-          simulator_udid="$(xcrun simctl list devices available -j | jq -r '
-            [.devices[][] | select(.isAvailable and (.name | startswith("iPhone")))]
-            | sort_by(.name) | last | .udid // empty')"
-          test -n "$simulator_udid"
-          xcodebuild test \
-            -project mobileLLM.xcodeproj \
-            -scheme SimulatorCI \
-            -destination "platform=iOS Simulator,id=$simulator_udid" \
-            -parallel-testing-enabled NO \
-            -enableCodeCoverage YES \
-            -resultBundlePath "$RUNNER_TEMP/SimulatorCI.xcresult" \
-            -skipMacroValidation \
-            MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Test MLX, llama.cpp, and Apple engines
-        run: |
-          xcodebuild test \
-            -project mobileLLM.xcodeproj \
-            -scheme EngineTests \
-            -destination 'platform=macOS,arch=arm64' \
-            -enableCodeCoverage YES \
-            -resultBundlePath "$RUNNER_TEMP/EngineTests.xcresult" \
-            -skipMacroValidation \
-            MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Export Xcode coverage evidence
-        run: |
-          mkdir -p "$RUNNER_TEMP/xcode-coverage"
-          xcrun xccov view --report --json "$RUNNER_TEMP/SimulatorCI.xcresult" \
-            > "$RUNNER_TEMP/xcode-coverage/SimulatorCI.xccov.json"
-          xcrun xccov view --report --json "$RUNNER_TEMP/EngineTests.xcresult" \
-            > "$RUNNER_TEMP/xcode-coverage/EngineTests.xccov.json"
-          jq -e '.targets | type == "array" and length > 0' \
-            "$RUNNER_TEMP/xcode-coverage/SimulatorCI.xccov.json"
-          jq -e '.targets | type == "array" and length > 0' \
-            "$RUNNER_TEMP/xcode-coverage/EngineTests.xccov.json"
-          bash scripts/verification/verify-xcode-coverage.sh \
-            --base-ref "${{ steps.xcode-coverage-base.outputs.base-sha }}" \
-            --report "$RUNNER_TEMP/xcode-coverage/SimulatorCI.xccov.json" \
-            --report "$RUNNER_TEMP/xcode-coverage/EngineTests.xccov.json" \
-            --output "$RUNNER_TEMP/xcode-coverage/coverage-report.v1.json"
-
-      - name: Upload Xcode result and coverage evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: xcode-coverage-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/SimulatorCI.xcresult
-            ${{ runner.temp }}/EngineTests.xcresult
-            ${{ runner.temp }}/xcode-coverage
-          if-no-files-found: error
-          retention-days: 14
+          exit "$status"

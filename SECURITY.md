@@ -55,8 +55,8 @@ account, analytics, or telemetry service.
 
 - Master tool access is off by default. The security contract permits only individually selected built-in tools and
   MCP servers to be advertised; a network-tool call sends its arguments to that service. Workflow roots and children
-  inherit only the initiating conversation's allowed tool set — never force-enabled — and a missing required
-  research tool pauses the launch for the user to explicitly enable it (spec §33 gap 1, closed 2026-08-07). Tool responses are
+  inherit only the initiating conversation's allowed tool set — never force-enabled, never widened, and with no
+  hard-coded dependency on web search or the page reader (spec §33 gap 1, closed 2026-08-08). Tool responses are
   framed as untrusted external data before being returned to the model. Every external operation —
   online-model inference and every tool call — passes an immutable `prepare → authorize → execute`
   boundary: a prepared plan (destination, data categories, argument digest, response ceiling) cannot be
@@ -70,7 +70,12 @@ account, analytics, or telemetry service.
   Sending a conversation to an online service is data egress. Ask requests bounded conversation consent;
   Safe preset and Full access bind authorization without presenting a prompt, still inside the frozen ceiling.
 - Subagents and workflow children receive a strict subset of the parent run's capability ceiling and
-  attenuated budgets; a child can never grant itself an authority the parent did not hold. Future
+  attenuated budgets; a child can never grant itself an authority the parent did not hold. A dynamic
+  workflow's model-written orchestration script is statically analyzed against a closed vocabulary, journaled
+  and digest-bound before it may run, and executes in a JavaScriptCore realm with no filesystem, network,
+  tool, model, secret, clock, or RNG access — its only effect is to request ordinary attenuated child runs.
+  That realm is a logical boundary, not an OS sandbox (iOS JavaScriptCore has no public hard heap limit or
+  pre-emptive interruption), which is why static rejection is conservative (spec §34.3). Future
   server-side native tools (e.g. DeepSeek `web_search`) are provider-executed: the app advertises either
   the native tool or the local adapter for a capability, never both, and the provider's output item is
   treated as untrusted external data (spec §15.5).

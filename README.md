@@ -57,13 +57,16 @@ discovery/downloads, online models you enable and approve, or tools you explicit
   controls (Streamable HTTP, per-server enable + per-tool mute). Tool access is off by default, only
   selected tools are advertised to the model, and tool results are framed as **untrusted data**
   (prompt-injection fenced) before another model pass. Runtime assembly failures are visible and
-  fail closed instead of silently changing execution semantics. Workflows inherit only the conversation's enabled tools; a missing required
-  research tool pauses the launch and asks the user to enable it explicitly.
-- 🧩 **Subagents + parallel tool batches + staged workflows.** The runtime can spawn bounded
+  fail closed instead of silently changing execution semantics. Workflows inherit only the conversation's enabled tools —
+  never force-enabled, and with no hard-coded dependency on web search or the page reader.
+- 🧩 **Subagents + parallel tool batches + dynamic workflows.** The runtime can spawn bounded
   subagents with attenuated ceilings, run tool batches in parallel inside one run, and orchestrate a
-  message-anchored **workflow** (`/workflow <goal>`): a planner decomposes the goal into phases
-  (explore → plan → audit → revise → verify → deliver fallback), fans out subagents per phase, passes
-  structured handoffs between phases, and shows live x/y progress, tokens, and tool-call counts.
+  message-anchored **workflow** (`/workflow <goal>`, the marker may sit anywhere in the message): the
+  model writes a small orchestration script (`agent` / `parallel` / `pipeline` / `phase` / `log`), a static
+  analyzer rejects anything outside that vocabulary, the script is journaled and digest-bound, then it runs
+  in a JavaScriptCore realm with no filesystem, network, tool, or model access of its own — every child is an
+  ordinary attenuated subagent run. Runs are event-sourced (pause / resume / stop / restart-agent, prefix
+  reuse after relaunch) and the message row shows live progress, tokens, and tool-call counts.
 - 🌐 **Online models (OpenAI-compatible Responses API).** Add any number of services (base URL, model
   id, API key in the device Keychain only); one active service routes the conversation to the provider.
   Per-conversation: approval (see below), reasoning on/off + effort (low/medium/high), context length,
@@ -244,12 +247,15 @@ swift test --package-path Packages/LLMEngineApple
 Two xcodebuild-only suites remain: `-scheme EngineTests` runs the engine packages' unit tests (the MLX
 package's macros can't build under plain SwiftPM), and `-scheme UITests` drives the iOS simulator
 (keyboard/composer geometry, agent-run UI, workflow E2E). The checked-in test plans live in
-`Verification/AgentHarness/TestPlans` (`SimulatorUI.xctestplan`, `DeviceE2E.xctestplan`); online-model
-scenarios read `~/.mobilellm/openai.json` through launch-environment variables (see below).
-CI also executes the model-free `SimulatorCI` plan, including maximum-Dynamic-Type approval content and
-single-activation coverage. Agent verification checks all 6,328 reducer registry cells with fixed and rotating
+`Verification/AgentHarness/TestPlans` (`SimulatorUI.xctestplan`, `SimulatorCI.xctestplan`,
+`DeviceE2E.xctestplan`); online-model scenarios read `~/.mobilellm/openai.json` through launch-environment
+variables (see below). The model-free `SimulatorCI` plan covers maximum-Dynamic-Type approval content and
+single-activation. Agent verification checks all 6,328 reducer registry cells with fixed and rotating
 seeds, kills six curated production-source mutants, and rejects package coverage reports unless all required
-reports are clean and bound to the same source commit and exact `spec.md` digest. Rich online-model and local-weight
+reports are clean and bound to the same source commit and exact `spec.md` digest. All of these gates run on a
+maintainer Mac through the checked-in scripts (`scripts/verification/`, `Tools/AgentHarnessVerification`);
+the hosted GitHub workflow is deliberately Linux-only (JSON/test-plan validity, script syntax, and the
+`spec.md` digest binding) to avoid paid macOS runner minutes. Rich online-model and local-weight
 physical-device scenarios remain release-candidate gates.
 
 See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full development setup and package map.

@@ -1407,10 +1407,10 @@ gate. P0 tests cannot be quarantined, and a diagnostic rerun cannot rewrite thei
 Before the first Agent Harness production-code change, the repository must add the traceability manifest, generated or
 scripted model fixtures, deterministic app-container reset/provisioning, and checked-in `.xctestplan` files. SwiftPM
 coverage is collected with its coverage mode; Xcode tests use `-enableCodeCoverage YES` and an explicit
-`-resultBundlePath`. A versioned CI script normalizes SwiftPM/LLVM and `xccov` results, enforces target/diff floors and
-test discovery, and publishes machine-readable reports plus redacted result bundles. The existing SwiftPM/build/engine
-jobs are only a baseline: simulator UI, coverage, nightly fault/fuzz, and controlled physical-device runners are
-required before their corresponding gates can be considered implemented. Simulator UI fixtures must not depend on a
+`-resultBundlePath`. Versioned scripts (`scripts/verification/`, `agent-harness-verify`) normalize SwiftPM/LLVM and `xccov` results, enforce target/diff floors and
+test discovery, and publish machine-readable reports plus redacted result bundles. In this document "CI" names a gate, not a hosted runner: since 2026-08-15 the hosted GitHub workflow is Linux-only (JSON/test-plan validity, script syntax, spec-digest binding) and every
+macOS-dependent gate (SwiftPM package tests and coverage, mutation kills, simulator UI, engine tests, nightly fault/fuzz, and controlled physical-device runs) is executed by those scripts on a maintainer Mac, with its evidence attached to the release record; such gates are
+considered implemented only when that evidence exists for the release-candidate commit. Simulator UI fixtures must not depend on a
 developer manually seeding a GGUF file.
 
 The CI gate compares coverage against both these floors and the target's accepted baseline; a change may not lower the
@@ -1461,8 +1461,8 @@ Implementation is one dependency-ordered program, followed by one consolidated i
 
 **Status (2026-08-09):** the runtime, SQLite journal and idempotent conversation outbox projection, Tool V2/MCP/
 online adapters, approvals, budgets, subagents, bounded parallel tool batches, staged workflow orchestrator,
-explicit workflow recovery, progressive UI, static traceability gate, and a deterministic model-free simulator CI
-gate are implemented. Maximum-Dynamic-Type approval coverage, complete semantic-registry evaluation, a curated
+explicit workflow recovery, progressive UI, static traceability gate, and a deterministic model-free simulator
+gate (`SimulatorCI` plan) are implemented. Maximum-Dynamic-Type approval coverage, complete semantic-registry evaluation, a curated
 six-mutant source gate, and commit/spec-bound coverage freshness enforcement are also implemented. The implementation
 is not release-green: matched device performance evidence, the complete physical-device matrix, and consolidated
 release evidence remain open. Step 6 is in progress; steps 7-8 remain pending.
@@ -1620,7 +1620,7 @@ Open conformance gaps:
    `AH-APPROVAL-AUTHORITY-022` recognizes conversation-scoped online-model consent
    (`authorizeMatchingReceipt`/`boundedConversationRead`). `agent-harness-verify static` exits 0.
 6. **Evidence freshness:** CLOSED for automated package coverage (2026-08-09). Every report records its source commit,
-   exact `spec.md` digest, source-tree cleanliness, structured test-result digest, and diff digest; CI downloads all package
+   exact `spec.md` digest, source-tree cleanliness, structured test-result digest, and diff digest; the freshness gate (`agent-harness-verify freshness`, run on a maintainer Mac since hosted macOS CI was retired on 2026-08-15) consumes all package
    reports and fails closed unless the required set is successful, clean, and bound to the same expected commit/spec.
    Physical-device results must still be regenerated from that release-candidate commit before the consolidated audit.
 7. **Accepted-send execution snapshot:** CLOSED (2026-08-08). `ChatStore` now asks `AgentRunStore` to capture an

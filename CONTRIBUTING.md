@@ -53,9 +53,8 @@ for the MLX-fork + llama.cpp dependency pins.
 
 ## Running the tests
 
-The eight MLX-free packages are the fast inner loop and CI's first matrix. CI then performs the unsigned app
-build and the three-engine `EngineTests` gate. Point local SwiftPM build output outside the source tree so
-nothing stray lands in the repo:
+The eight MLX-free packages are the fast inner loop. Point local SwiftPM build output outside the source
+tree so nothing stray lands in the repo:
 
 ```sh
 swift test --package-path Packages/AppUI          --scratch-path /tmp/mllm-appui
@@ -77,7 +76,7 @@ The two local-weight engine packages (`LLMEngineMLX`, `LLMEngineLlama`) build an
 (`llm-smoke`, `llama-smoke`) run against real weights on a device.
 
 ```sh
-# Unsigned app builds matching CI's two platform gates:
+# Unsigned app builds for both shipped platforms:
 xcodebuild -project mobileLLM.xcodeproj -scheme mobileLLM \
   -destination 'platform=macOS,arch=arm64' -skipMacroValidation \
   MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
@@ -102,9 +101,59 @@ xcodebuild -skipMacroValidation -scheme UITests \
   -only-testing:mobileLLMUITests/WorkflowUITests test
 ```
 
-The simulator suite is currently a required manual/local command: CI validates discovery of both test plans but does
-not yet execute `SimulatorUI.xctestplan`. Do not report simulator coverage as a CI gate until that job is added and
-archives its `.xcresult` evidence.
+### What runs where
+
+**Hosted CI is Linux-only and deliberately small.** `.github/workflows/ci.yml` runs one `ubuntu-latest` job:
+every `Verification/**` JSON and `.xctestplan` must parse, every `scripts/verification/*.sh` must pass
+`bash -n`, and the `spec.md` SHA-256 recorded in `Verification/AgentHarness/requirements.v1.json` and the
+four semantic registries must match the checked-in `spec.md`. Nothing that needs a macOS runner (Xcode,
+`swift test` against Apple frameworks, simulators, Metal) runs on GitHub — paid macOS minutes are not in
+this project's budget.
+
+**Everything else is a maintainer-run gate on a Mac**, using the checked-in scripts, and its evidence is
+attached to the release record rather than to a CI run:
+
+```sh
+# Static traceability + spec/registry/schema/architecture gates (agent-harness-verify):
+swift test --package-path Tools/AgentHarnessVerification --scratch-path /tmp/mllm-verify
+swift run  --package-path Tools/AgentHarnessVerification --scratch-path /tmp/mllm-verify \
+  agent-harness-verify static --repo-root "$PWD"
+
+# Package coverage evidence for the three agent packages (one report each), then the freshness gate:
+for p in AgentContracts AgentRuntime AgentSandboxAPI; do
+  bash scripts/verification/run-agent-package-coverage.sh --package "$p" \
+    --base-ref "$(git rev-parse HEAD^)" --output-dir /tmp/mllm-evidence/"$p"
+done
+swift run --package-path Tools/AgentHarnessVerification --scratch-path /tmp/mllm-verify \
+  agent-harness-verify freshness \
+  --expected-source-commit "$(git rev-parse HEAD)" \
+  --expected-spec-sha256 "$(shasum -a 256 spec.md | awk '{print $1}')" \
+  $(find /tmp/mllm-evidence -name coverage-report.v1.json | sed 's/^/--report /' | tr '\n' ' ')
+
+# The six curated source mutants (each must be killed by its sentinel test):
+bash scripts/verification/run-agent-mutation-gates.sh
+
+# Model-free simulator gate + engine tests + Xcode coverage evidence:
+xcodebuild test -project mobileLLM.xcodeproj -scheme SimulatorCI \
+  -destination 'platform=iOS Simulator,name=iPhone 17' -parallel-testing-enabled NO \
+  -enableCodeCoverage YES -resultBundlePath /tmp/mllm-evidence/SimulatorCI.xcresult \
+  -skipMacroValidation MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
+  CODE_SIGNING_ALLOWED=NO
+xcodebuild test -project mobileLLM.xcodeproj -scheme EngineTests \
+  -destination 'platform=macOS,arch=arm64' -enableCodeCoverage YES \
+  -resultBundlePath /tmp/mllm-evidence/EngineTests.xcresult \
+  -skipMacroValidation MTL_COMPILER_FLAGS='$(inherited) -Wno-c++17-extensions -Wno-c++20-extensions' \
+  CODE_SIGNING_ALLOWED=NO
+xcrun xccov view --report --json /tmp/mllm-evidence/SimulatorCI.xcresult > /tmp/mllm-evidence/SimulatorCI.xccov.json
+xcrun xccov view --report --json /tmp/mllm-evidence/EngineTests.xcresult > /tmp/mllm-evidence/EngineTests.xccov.json
+bash scripts/verification/verify-xcode-coverage.sh --base-ref "$(git rev-parse HEAD^)" \
+  --report /tmp/mllm-evidence/SimulatorCI.xccov.json --report /tmp/mllm-evidence/EngineTests.xccov.json \
+  --output /tmp/mllm-evidence/xcode-coverage-report.v1.json
+```
+
+The full `SimulatorUI.xctestplan` (keyboard geometry, agent-run UI, workflow E2E) and the `DeviceE2E` plan
+remain manual gates as well; a green hosted CI badge only says the verification documents are well-formed
+and bound to the current specification.
 
 Note the simulator runs **llama.cpp on CPU only and cannot run MLX at all** — activation refuses MLX
 variants there by design; anything MLX is validated on real hardware.
