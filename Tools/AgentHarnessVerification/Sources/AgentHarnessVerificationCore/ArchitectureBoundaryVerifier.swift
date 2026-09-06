@@ -113,11 +113,11 @@ enum ArchitectureBoundaryVerifier {
     ) {
         for invocation in invocations(named: "package", tokens: tokens) {
             if let dependencyPath = stringArgument(named: "path", in: invocation.body) {
-                let resolved = URL(fileURLWithPath: dependencyPath, relativeTo: packageURL)
-                    .standardizedFileURL
+                let dependencyLocation = dependencyPath.hasPrefix("/") ? dependencyPath : packageURL.path + "/" + dependencyPath
+                let resolved = URL(fileURLWithPath: dependencyLocation, isDirectory: true).standardizedFileURL
                 let dependency = resolved.lastPathComponent
                 let expected = root.appending(path: "Packages/\(dependency)").standardizedFileURL
-                if !rule.allowedPackageDependencies.contains(dependency) || resolved != expected {
+                if !rule.allowedPackageDependencies.contains(dependency) || resolved.path != expected.path {
                     add(&diagnostics, "AHV-ARCH-PACKAGE-DEPENDENCY", "\(path):\(invocation.line)",
                         "\(rule.name) may not declare local package dependency \(dependencyPath)")
                 }

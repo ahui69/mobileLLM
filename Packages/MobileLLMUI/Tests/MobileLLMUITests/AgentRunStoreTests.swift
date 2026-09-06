@@ -9,6 +9,31 @@ import AgentRuntime
 // TEST-ID: AHT-UI-001
 // TEST-ID: AHT-LIFECYCLE-001
 final class AgentRunStoreTests: XCTestCase {
+    func testPreparedSendFromBeforeEraseNeverReachesExecutor() async throws {
+        let executor = MockAgentExecutor()
+        let store = AgentRunStore(executor: executor,
+            requestBuilder: MockAgentRunRequestBuilder(submission: try makeSubmission()))
+        let prepared = try store.prepareStart(conversationID: UUID(), userMessageID: UUID(),
+            assistantMessageID: UUID(), text: "private old draft", imageRefs: [])
+        await store.discardAllForDataErase()
+        do { _ = try await store.start(prepared); XCTFail("stale send must be discarded") }
+        catch is CancellationError { }
+        XCTAssertEqual(executor.submitCount, 0)
+    }
+
+    func testLateRecoveryReadCannotRepopulateErasedInbox() async throws {
+        let source = DeferredRecoveryListing()
+        let store = AgentRunStore(executor: MockAgentExecutor(),
+            requestBuilder: MockAgentRunRequestBuilder(submission: try makeSubmission()), recovery: source)
+        let pending = Task { await store.refreshRecoverableRuns() }
+        await source.waitUntilStarted()
+        await store.discardAllForDataErase()
+        await source.finish()
+        await pending.value
+        XCTAssertTrue(store.recoverableRuns.isEmpty)
+        XCTAssertFalse(store.isRefreshingRecovery)
+    }
+
     func testNeedsPanelOnlyForComplexRuns() throws {
         let runID = AgentRunID(rawValue: UUID())
         let base = AgentRunPresentation(conversationID: UUID(), runID: runID, state: .generating)
@@ -572,4 +597,24 @@ private func makeSubmission(instruction: String = "hello") throws -> AgentRunSub
         approvalPolicyVersion: 1
     )
     return AgentRunSubmission(request: request, frozenInputs: frozen)
+}
+
+private actor DeferredRecoveryListing: AgentRunRecoveryListing {
+    private var continuation: CheckedContinuation<[RecoverableAgentRun], Never>?
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    func recoverableRuns() async throws -> [RecoverableAgentRun] {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            for waiter in startWaiters { waiter.resume() }
+            startWaiters.removeAll()
+        }
+    }
+    func waitUntilStarted() async {
+        if continuation == nil { await withCheckedContinuation { startWaiters.append($0) } }
+    }
+    func finish() {
+        continuation?.resume(returning: [RecoverableAgentRun(conversationID: UUID(), runID: AgentRunID(),
+            handleID: AgentExecutionHandleID(), state: .paused, updatedAt: Date())])
+        continuation = nil
+    }
 }

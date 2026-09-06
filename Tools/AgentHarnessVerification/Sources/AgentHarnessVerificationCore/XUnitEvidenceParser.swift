@@ -32,7 +32,7 @@ enum XUnitEvidenceParser {
         parser.shouldProcessNamespaces = false
         parser.shouldReportNamespacePrefixes = false
         parser.shouldResolveExternalEntities = false
-        guard parser.parse(), delegate.sawSupportedRoot else {
+        guard parser.parse(), parser.parserError == nil, delegate.documentIsComplete else {
             let detail = parser.parserError?.localizedDescription ?? "unsupported xUnit document root"
             diagnostics.append(.init(
                 code: "AHV-TEST-EVIDENCE-DECODE", location: url.path,
@@ -78,6 +78,7 @@ private final class Delegate: NSObject, XMLParserDelegate {
     var errors = 0
     var skipped = 0
 
+    var documentIsComplete: Bool { sawSupportedRoot && depth == 0 && !insideTestCase }
     private var depth = 0
     private var insideTestCase = false
     private var currentFailure = false
