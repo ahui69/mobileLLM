@@ -206,6 +206,17 @@ public final class WorkflowStore: WorkflowRecording {
         }
     }
 
+    public func eraseAllData() throws {
+        workflows.removeAll()
+        resumingWorkflowIDs.removeAll()
+        executingWorkflowIDs.removeAll()
+        actioningWorkflowIDs.removeAll()
+        lastError = nil
+        for url in [fileURL, fileURL.appendingPathExtension("tmp"), fileURL.appendingPathExtension("corrupt")] {
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+        }
+    }
+
     private func persist() throws {
         let data = try encoder.encode(Array(workflows.values.sorted {
             $0.startTime < $1.startTime

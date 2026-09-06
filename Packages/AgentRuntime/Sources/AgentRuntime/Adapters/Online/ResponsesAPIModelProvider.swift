@@ -137,7 +137,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             toolCallingMode: .nativeStructured,
             cancellationGranularity: .token,
             resourceConstraints: ModelResourceConstraints(
-                maximumConcurrentAttempts: 1,
+                maximumConcurrentAttempts: 16,
                 requiresResidentModel: false,
                 requiresDrainBeforeSwitch: false
             ),
@@ -250,6 +250,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
                 )
             }
         }
+        let accounting = ResponsesAPIAccounting(emitter: emitter)
         let emitReasoning = request.generationParameters.thinkingMode != .disabled
         // A structured answer is normalized before it becomes the terminal action (for example,
         // outer whitespace/fences are removed). Streaming the raw bytes first would make the
@@ -264,8 +265,25 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             streamEmission: Bool = true
         ) async throws -> (parsed: ParsedResponse, streamed: Bool, data: Data) {
             var urlRequest = makeRequest()
-            urlRequest.httpBody = payload
-            let (bytes, response) = try await session.bytes(for: urlRequest)
+            var boundedPayload = payload
+            let spent = await accounting.usage
+            if spent.outputTokens > 0 || spent.inputTokens > 0 {
+                guard spent.outputTokens < parameters.maximumOutputTokens,
+                      spent.inputTokens <= parameters.maximumContextTokens / 2 else {
+                    throw AgentContractError.invalidEventSequence("online retry budget exhausted")
+                }
+                let remaining = parameters.maximumOutputTokens - spent.outputTokens
+                guard var fields = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+                    throw AgentContractError.invalidEventSequence("invalid online request object")
+                }
+                let field = dialect == .responses ? "max_output_tokens" : "max_tokens"
+                let requested = (fields[field] as? NSNumber)?.uint64Value ?? remaining
+                fields[field] = min(requested, remaining)
+                boundedPayload = try JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])
+            }
+            urlRequest.httpBody = boundedPayload
+            let (rawBytes, response) = try await session.bytes(for: urlRequest, delegate: ResponsesAPIRedirectBlocker.shared)
+            let bytes = AccountedResponseBytes(bytes: rawBytes, accounting: accounting)
             try Task.checkCancellation()
             let http = response as? HTTPURLResponse
             guard http?.statusCode == 200 else {
@@ -337,6 +355,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
                         emit: streamEmission
                     )
                 }
+                try await accounting.record(parsed.usage)
                 return (parsed, true, Data())
             }
             var data = Data()
@@ -345,6 +364,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             case .responses: try Self.parseResponse(data)
             case .deepSeekChatCompletions: try Self.parseChatCompletion(data)
             }
+            try await accounting.record(parsed.usage)
             return (parsed, false, data)
         }
 
@@ -441,9 +461,10 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         let elapsedMilliseconds = UInt64(
             (started.duration(to: .now) / .milliseconds(1))
         )
+        let totalUsage = await accounting.usage
         let usage = try AgentModelUsage(
-            inputTokens: parsed.usage.inputTokens,
-            outputTokens: parsed.usage.outputTokens,
+            inputTokens: totalUsage.inputTokens,
+            outputTokens: totalUsage.outputTokens,
             activeMilliseconds: elapsedMilliseconds,
             peakMemoryBytes: 0
         )
@@ -499,18 +520,18 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
         }
         try await emitter.emit(
             .completed(try AgentModelCompletion(action: action, usage: usage)),
-            responseBytes: UInt64(data.count)
+            responseBytes: 0
         )
         return AgentModelBoundaryCompletion(
             outcome: .completed(try AgentModelCompletion(action: action, usage: usage)),
-            responseDigest: StableDigest.sha256(data)
+            responseDigest: try await accounting.digest
         )
     }
 
     // MARK: - Event-stream consumption
 
     private static func consumeEventStream(
-        _ bytes: URLSession.AsyncBytes,
+        _ bytes: AccountedResponseBytes,
         emitter: AgentModelBoundaryEmitter,
         emitReasoning: Bool,
         emit: Bool = true
@@ -644,7 +665,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
     }
 
     private static func consumeChatCompletionsEventStream(
-        _ bytes: URLSession.AsyncBytes,
+        _ bytes: AccountedResponseBytes,
         emitter: AgentModelBoundaryEmitter,
         emitReasoning: Bool,
         emit: Bool = true

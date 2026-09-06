@@ -1208,7 +1208,7 @@ private func nullablePercent(
 
 private func nonnegativeInt(_ value: Any?) -> Int? {
     guard let number = value as? NSNumber, !isBoolean(number) else { return nil }
-    if !CFNumberIsFloatType(number) {
+    if !["f", "d"].contains(String(cString: number.objCType)) {
         let integer = number.int64Value
         guard integer >= 0 else { return nil }
         return Int(integer)

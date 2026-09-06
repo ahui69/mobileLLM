@@ -401,7 +401,7 @@ bookmarks, artifacts with no remaining owner, projection outbox entries, snapsho
 diagnostics for that conversation. Recovery replays an incomplete deletion intent until every owned store agrees.
 
 `Delete All` first atomically writes a non-sensitive, protected, backup-excluded marker at
-`<Application Support>/mobileLLM.delete-all.pending`, owned by the app-level erase coordinator and outside every
+`<conversation-directory>.erase-pending`, owned by the app-level erase coordinator and outside every
 database/artifact/conversation directory being removed. On launch, that marker blocks all store opening and mutation
 until deletion finishes. The operation
 then closes the database, removes the database together with `-wal` and `-shm`, conversation projections, artifacts,
@@ -1408,7 +1408,7 @@ Before the first Agent Harness production-code change, the repository must add t
 scripted model fixtures, deterministic app-container reset/provisioning, and checked-in `.xctestplan` files. SwiftPM
 coverage is collected with its coverage mode; Xcode tests use `-enableCodeCoverage YES` and an explicit
 `-resultBundlePath`. Versioned scripts (`scripts/verification/`, `agent-harness-verify`) normalize SwiftPM/LLVM and `xccov` results, enforce target/diff floors and
-test discovery, and publish machine-readable reports plus redacted result bundles. In this document "CI" names a gate, not a hosted runner: since 2026-08-15 the hosted GitHub workflow is Linux-only (JSON/test-plan validity, script syntax, spec-digest binding) and every
+test discovery, and publish machine-readable reports plus redacted result bundles. In this document "CI" names a gate, not a hosted runner: since 2026-09-06 the hosted GitHub workflow runs portable Swift contract/API/verifier tests on Linux in addition to JSON/test-plan validity, script syntax, and spec-digest binding and every
 macOS-dependent gate (SwiftPM package tests and coverage, mutation kills, simulator UI, engine tests, nightly fault/fuzz, and controlled physical-device runs) is executed by those scripts on a maintainer Mac, with its evidence attached to the release record; such gates are
 considered implemented only when that evidence exists for the release-candidate commit. Simulator UI fixtures must not depend on a
 developer manually seeding a GGUF file.

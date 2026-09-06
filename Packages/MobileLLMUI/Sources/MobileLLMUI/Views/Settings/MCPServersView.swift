@@ -36,11 +36,12 @@ final class MCPProbe {
         if !force, case .ok = status(for: server) { return }
         inFlight[server.id]?.cancel()
         status[server.id] = .checking
+        let cacheGeneration = MCPDiscoveryCache.shared.generation
         inFlight[server.id] = Task { [weak self] in
             let client = MCPClient(server: server)
             do {
                 let tools = try await client.connect()
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, MCPDiscoveryCache.shared.generation == cacheGeneration else { return }
                 self?.status[server.id] = .ok(tools)
                 self?.onDiscovered(server, tools)
             } catch {

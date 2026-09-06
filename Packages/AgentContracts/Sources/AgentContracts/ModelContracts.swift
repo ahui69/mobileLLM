@@ -1252,6 +1252,15 @@ public actor AgentModelBoundaryEmitter {
     }
 
     /// Accounts the source chunk, validates ordering, and immediately forwards one event.
+    public func accountResponseBytes(_ count: UInt64) async throws {
+        guard !isClosed, !isEmitting, terminalEvent == nil else {
+            throw AgentContractError.authorizationBindingMismatch("closed model boundary emitter")
+        }
+        isEmitting = true
+        defer { isEmitting = false }
+        try await control.consumeResponseBytes(count)
+    }
+
     public func emit(_ event: AgentModelEvent, responseBytes: UInt64) async throws {
         guard !isClosed, !isEmitting, terminalEvent == nil else {
             throw AgentContractError.authorizationBindingMismatch("closed model boundary emitter")

@@ -65,6 +65,20 @@ final class ArchitectureBoundaryVerifierTests: XCTestCase {
         XCTAssertTrue(codes.contains("AHV-ARCH-IMPORT"))
     }
 
+    func testLinuxCryptoAllowanceRequiresOfficialExactPin() throws {
+        let fixture = try ArchitectureFixture()
+        for (dependency, allowed) in [
+            (#".package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.2")"#, true),
+            (#".package(url: "https://github.com/apple/swift-crypto.git", from: "4.5.2")"#, false),
+            (#".package(url: "https://example.com/swift-crypto.git", exact: "4.5.2")"#, false),
+        ] {
+            try fixture.writePackage(name: "AgentContracts", packageDependencies: dependency,
+                targetDependencies: #".product(name: "Crypto", package: "swift-crypto")"#,
+                source: "import Foundation\nimport Crypto\npublic struct AgentRequest {}\n")
+            XCTAssertEqual(fixture.verify().isEmpty, allowed)
+        }
+    }
+
     // TEST-ID: AHT-ARCH-002
     func testDeferredImplementationsAndShellEntryPointsAreRejected() throws {
         let fixture = try ArchitectureFixture()

@@ -98,7 +98,7 @@ public actor LLMCoreModelResidencyDriver: ModelResidencyDriver {
     }
 
     private let engine: any LLMEngine
-    private let registrations: [AgentModelSelection: LocalModelRegistration]
+    private var registrations: [AgentModelSelection: LocalModelRegistration]
     public nonisolated let registeredSelections: [AgentModelSelection]
     private var residentSelection: AgentModelSelection?
     private var activeGeneration: ActiveGeneration?
@@ -120,6 +120,17 @@ public actor LLMCoreModelResidencyDriver: ModelResidencyDriver {
         self.engine = engine
         self.registrations = indexed
         registeredSelections = indexed.keys.sorted()
+    }
+
+    /// Returns false for the same immutable registration; rejects identity reuse with new metadata.
+    @discardableResult
+    public func register(_ registration: LocalModelRegistration) throws -> Bool {
+        if let existing = registrations[registration.selection] {
+            guard existing == registration else { throw LocalModelAdapterError.duplicateSelection(registration.selection) }
+            return false
+        }
+        registrations[registration.selection] = registration
+        return true
     }
 
     public func registration(

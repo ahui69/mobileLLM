@@ -8,6 +8,8 @@ extension AgentRunController {
         _ envelope: AgentCommandEnvelope,
         through handleID: AgentExecutionHandleID
     ) async throws -> AgentCommandReceipt {
+        try beginPublicMutation()
+        defer { endPublicMutation() }
         guard let facts = try await repository.loadRunFacts(for: handleID) else {
             throw AgentExecutionError.executionNotFound(handleID)
         }

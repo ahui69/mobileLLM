@@ -359,6 +359,30 @@ final class DynamicWorkflowRuntimeTests: XCTestCase {
         }
     }
 
+    func testRejectsUnbracedWhileAfterUnrelatedBlock() throws {
+        for body in ["if (true) {} while (true);", "{} while (true);", "do {} while (false); while (true);"] {
+            XCTAssertThrowsError(try analyze(wrapped(body)))
+        }
+    }
+
+    func testExpressionArrowsAndAsyncMethodsCannotSpinWithoutCheckpoints() async throws {
+        for body in [
+            "const spin = () => Promise.resolve().then(spin); return await spin();",
+            "const obj = { async spin() { await 0; return obj.spin(); } }; return await obj.spin();",
+            "const spin = () => spin(); return spin();",
+            "while ((() => { while (true) {} })()) {}",
+            "do {} while ((() => { while (true) {} })());",
+        ] {
+            let script = try analyze(wrapped(body))
+            await XCTAssertThrowsErrorAsync(expected: WorkflowScriptRuntimeError.stepLimitExceeded) {
+                _ = try await JavaScriptCoreWorkflowRuntime().execute(
+                    script, args: nil, limits: try self.limits(maximumScriptSteps: 32),
+                    requirement: .init(), host: WorkflowScriptHost(agent: { _ in .stopped })
+                )
+            }
+        }
+    }
+
     private func analyze(_ source: String) throws -> AnalyzedWorkflowScriptV1 {
         let script = try WorkflowScriptV1(scriptID: WorkflowScriptID(), version: 1, source: source)
         return try DynamicWorkflowScriptAnalyzer().analyze(script)

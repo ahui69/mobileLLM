@@ -346,6 +346,10 @@ struct MobileLLMApp: App {
                 continuedProcessing: continuedProcessing
             )
         }
+        container.mcpDiscovery.setCredentialResolver { server in
+            try? KeychainBox(service: AppSettings.defaultKeychainService)
+                .readString(account: server.url)
+        }
         // Weight unloading is independent of agent assembly. If assembly later fails, sending is
         // fail-closed, but the app can still release any selected model cleanly.
         container.lifecycle.suspendModel = { [weak container] in
@@ -410,6 +414,7 @@ struct MobileLLMApp: App {
         // model providers over the same routing engine, and the run store the UI projects. A failure
         // is visible and fail-closed; production never silently changes to the legacy tool loop.
         MainActor.assumeIsolated {
+            container.runtimeBootstrap = {
             #if os(iOS)
             // Register the iOS 26 continued-processing launch handler (spec §19.2). The wildcard
             // identifier must match BGTaskSchedulerPermittedIdentifiers in Info.plist.
@@ -446,6 +451,7 @@ struct MobileLLMApp: App {
                     engine: engine,
                     downloadBase: base,
                     conversationDirectory: container.conversationStore.directory,
+                    models: container.models.allModels,
                     snapshot: { [weak container] conversationID, userTurnID, text, imageRefs in
                         if let template = AppWorkflowSnapshotRegistry.shared.template(
                             conversationID: conversationID,
@@ -521,6 +527,13 @@ struct MobileLLMApp: App {
                     downloadBase: base,
                     onlineConfigBox: onlineConfigBox
                 )
+                container.prepareRuntimeDataErase = { try await launcher.suspendForDataErase() }
+                container.eraseRuntimeData = { try await assembly.eraseAllRuntimeData() }
+                container.finishRuntimeDataErase = {
+                    await assembly.executor.controller.resumeAfterDataErase()
+                    await assembly.dynamicWorkflows.resumeAfterDataErase()
+                }
+                container.quiesceWorkflows = { try await launcher.quiesceForBackground() }
                 container.chat.workflowLaunch = { [launcher] goal, conversationID,
                     userMessageID, workflowID in
                     try await launcher.launch(
@@ -575,6 +588,7 @@ struct MobileLLMApp: App {
                     "Agent runtime unavailable; sending disabled: \(error.localizedDescription)"
                 )
             }
+        }
         }
         #if DEBUG && os(macOS)
         if let appearance = macScreenshotRequest?.appearance {

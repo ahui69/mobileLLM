@@ -68,6 +68,14 @@ public actor ContentAddressedArtifactStore {
         startupCleanupReport = recovered.report
     }
 
+    /// Called only after every producer has drained. The filesystem lock stays held while all
+    /// user content, orphaned objects, and metadata are removed and a fresh empty index is written.
+    public func eraseAllData() throws {
+        try fileSystem.eraseContents()
+        index = .empty
+        try Self.writeIndex(index, fileSystem: fileSystem, temporaryName: temporaryNameGenerator())
+    }
+
     /// Atomically publishes verified content before durably creating its reference.
     public func commit(_ request: ArtifactCommitRequest) throws -> ArtifactReference {
         let byteCount = UInt64(request.data.count)

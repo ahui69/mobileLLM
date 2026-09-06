@@ -11,11 +11,15 @@ public protocol OpenAICredentialStoring: Sendable {
     func saveAPIKey(_ key: String, serviceID: String) throws
     func loadAPIKey(serviceID: String) throws -> String?
     func deleteAPIKey(serviceID: String) throws
+    func deleteAllAPIKeys(serviceIDs: [String]) throws
 }
 
 /// Convenience for the legacy single-service surface (the Mac-local config / test env seeding and the
 /// default service). Defaults to `OnlineService.defaultID`.
 public extension OpenAICredentialStoring {
+    func deleteAllAPIKeys(serviceIDs: [String]) throws {
+        for id in Set(serviceIDs + [OnlineService.defaultID]) { try deleteAPIKey(serviceID: id) }
+    }
     func saveAPIKey(_ key: String) throws {
         try saveAPIKey(key, serviceID: OnlineService.defaultID)
     }
@@ -54,6 +58,8 @@ public struct KeychainOpenAICredentialStore: OpenAICredentialStoring, Sendable {
     public func deleteAPIKey(serviceID: String) throws {
         try box.delete(account: serviceID)
     }
+
+    public func deleteAllAPIKeys(serviceIDs: [String]) throws { try box.deleteAll() }
 }
 
 /// In-memory store for unit tests, previews, and any environment that must never touch the device
@@ -75,6 +81,8 @@ public final class EphemeralOpenAICredentialStore: OpenAICredentialStoring, @unc
     public func deleteAPIKey(serviceID: String) throws {
         lock.withLock { keys[serviceID] = nil }
     }
+
+    public func deleteAllAPIKeys(serviceIDs: [String]) throws { lock.withLock { keys.removeAll() } }
 }
 
 /// Debug-only launch-environment seeding: when the test runner injects

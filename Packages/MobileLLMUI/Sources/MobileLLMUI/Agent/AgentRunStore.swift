@@ -41,6 +41,7 @@ public protocol AgentRunRecoveryListing: Sendable {
 /// One UI-owned start whose execution-defining inputs were captured at the accepted-send boundary.
 /// The asynchronous start path carries this value rather than looking the conversation up again.
 struct PreparedAgentRunStart: Sendable {
+    let projectionEpoch: UInt64
     let conversationID: UUID
     let assistantMessageID: UUID
     let submission: AgentRunSubmissionPreparation
@@ -62,6 +63,7 @@ public final class AgentRunStore {
     public private(set) var recoverableRuns: [RecoverableAgentRun] = []
     public private(set) var isRefreshingRecovery = false
     public var recoveryError: String?
+    private var projectionEpoch: UInt64 = 0
 
     /// Invoked on the main actor when a run commits its final answer.
     public var onAnswer: (@MainActor (UUID, UUID, String, String?, [AgentRunStep]) -> Void)?
@@ -115,6 +117,7 @@ public final class AgentRunStore {
             imageRefs: imageRefs
         )
         return PreparedAgentRunStart(
+            projectionEpoch: projectionEpoch,
             conversationID: conversationID,
             assistantMessageID: assistantMessageID,
             submission: submission
@@ -124,12 +127,16 @@ public final class AgentRunStore {
     /// Starts a previously captured durable root run after attachment/residency preparation.
     @discardableResult
     func start(_ prepared: PreparedAgentRunStart) async throws -> AgentRunID {
+        let epoch = prepared.projectionEpoch
+        guard epoch == projectionEpoch else { throw CancellationError() }
         let submission = try await prepared.submission.build()
+        guard epoch == projectionEpoch else { throw CancellationError() }
         let handleID = try await executor.submit(
             submission.request,
             commandID: AgentCommandID(rawValue: UUID())
         )
         let handle = try await executor.attach(to: handleID)
+        guard epoch == projectionEpoch else { throw CancellationError() }
         handles[submission.request.runID] = handle
         assistantMessageIDs[prepared.conversationID] = prepared.assistantMessageID
         runs[prepared.conversationID] = AgentRunPresentation(
@@ -150,7 +157,9 @@ public final class AgentRunStore {
     /// Reattaches to a recoverable run and starts projecting it again. This does NOT resume it;
     /// the user must press Resume, exactly as the spec requires.
     public func reopen(recoverable: RecoverableAgentRun, assistantMessageID: UUID?) async throws {
+        let epoch = projectionEpoch
         let handle = try await executor.attach(to: recoverable.handleID)
+        guard epoch == projectionEpoch else { throw CancellationError() }
         handles[recoverable.runID] = handle
         if let assistantMessageID {
             assistantMessageIDs[recoverable.conversationID] = assistantMessageID
@@ -169,14 +178,17 @@ public final class AgentRunStore {
     /// Refreshes the recoverable-run inbox (neutral launch / pull to refresh).
     public func refreshRecoverableRuns() async {
         guard let recovery else { return }
+        let epoch = projectionEpoch
         isRefreshingRecovery = true
         recoveryError = nil
-        defer { isRefreshingRecovery = false }
+        defer { if epoch == projectionEpoch { isRefreshingRecovery = false } }
         do {
             let listed = try await recovery.recoverableRuns()
+            guard epoch == projectionEpoch else { return }
             let known = Set(runs.values.compactMap(\.handleID))
             recoverableRuns = listed.filter { !known.contains($0.handleID) }
         } catch {
+            guard epoch == projectionEpoch else { return }
             recoveryError = error.localizedDescription
         }
     }
@@ -313,6 +325,17 @@ public final class AgentRunStore {
         eventTasks.removeValue(forKey: run.runID)
         ephemeralTasks.removeValue(forKey: run.runID)
         handles.removeValue(forKey: run.runID)
+    }
+
+    public func discardAllForDataErase() async {
+        projectionEpoch &+= 1
+        isRefreshingRecovery = false
+        let observers = Array(eventTasks.values) + Array(ephemeralTasks.values)
+        for task in observers { task.cancel() }
+        for task in observers { await task.value }
+        for id in Array(runs.keys) { discard(conversationID: id) }
+        recoverableRuns.removeAll()
+        recoveryError = nil
     }
 
     // MARK: - Internals
@@ -606,11 +629,14 @@ public final class AgentRunStore {
         makeCommand: @Sendable (AgentRunStatus, AgentRunID) throws -> AgentCommand
     ) async {
         guard let run = runs[conversationID] else { return }
+        let epoch = projectionEpoch
         do {
             let status = try await status(of: run)
+            guard epoch == projectionEpoch else { return }
             let command = try makeCommand(status, run.runID)
             try await sendCommand(command, conversationID: conversationID)
         } catch {
+            guard epoch == projectionEpoch else { return }
             recoveryError = error.localizedDescription
         }
     }
@@ -626,7 +652,8 @@ public final class AgentRunStore {
         guard let run = runs[conversationID], let handle = handles[run.runID] else { return }
         let receipt = try await handle.send(try AgentCommandEnvelope(payload: command))
         if receipt.disposition == .accepted,
-           let updated = try? await handle.status()
+           let updated = try? await handle.status(),
+           runs[conversationID]?.runID == run.runID
         {
             applyStatus(updated, conversationID: conversationID)
         }

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 
 /// A deterministic timestamp represented as milliseconds since the Unix epoch.

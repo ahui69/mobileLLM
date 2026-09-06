@@ -1,6 +1,6 @@
 # mobileLLM — Architecture
 
-What the code *is* today (2026-08-15). For the original design intent and how the build diverged from it,
+What the code *is* today (2026-09-06). For the original design intent and how the build diverged from it,
 see the frozen [DESIGN.md](DESIGN.md); for the dependency wiring of the local-weight engines, see
 [WIRING.md](WIRING.md); the normative requirements live in [spec.md](../spec.md).
 
@@ -14,7 +14,12 @@ disabled with a visible reason — there is no silent fallback to the legacy in-
 
 ## Package graph
 
-Ten Swift packages plus the app target. MLX and llama.cpp are quarantined to one package each; the other
+Ten Swift packages plus the app target. App assembly is split into frozen-input construction
+(`AgentRunInputs.swift`), tool registration (`AgentToolCatalog.swift`), and runtime wiring
+(`AgentRuntimeAssembly.swift`). Pure legacy chat context preparation lives in
+`ChatContextPreparation.swift` alongside the UI state owner.
+
+ MLX and llama.cpp are quarantined to one package each; the other
 eight are MLX-free and keep a fast `swift test` loop.
 
 ```
@@ -437,3 +442,30 @@ springs to short eases. Shared controls: `Chip`, `Segmented` (sliding `matchedGe
 The shell (`RootView`): **iOS** is a `TabView` — Chat (NavigationStack list → thread), Models, Settings;
 **macOS** is a `NavigationSplitView` (conversation sidebar + thread, ⌘N new). The Models screen is a
 `Featured` / `Explore` segmented split.
+
+## Runtime integration hardening (2026-09-06)
+
+MCP discovery persists credential-free server metadata. Legacy inline tokens are scrubbed when the
+cache opens; invocation resolves the current Keychain credential. Endpoint edits invalidate prior
+explicit discovery. Clearing the cache also invalidates late discovery callbacks.
+
+The app-level erase coordinator writes `<conversation-directory>.erase-pending` before removal.
+It blocks new actions, drains workflow launch/monitor tasks, runtime mutations and workers, pauses
+the outbox projector, and then removes conversation, workflow, journal and artifact content. Full
+app erase also clears model data, memory, custom skills, all online credentials, discovery and settings.
+The marker survives failure; bootstrap completes it before opening the runtime. Successful erasure
+reopens clean execution lanes and leaves the existing container usable.
+
+Local model registration is append-only. Bootstrap hydrates adopted models before assembling providers,
+and an explicit send or workflow generation registers a newly adopted exact model before submission.
+Changing metadata under an existing frozen selection fails rather than replacing that selection.
+
+RunGroupAdmission admits one root family at a time, with up to sixteen sibling lanes. Remote siblings
+use independent attempt lanes and can overlap network requests; local work retains the shared model
+arbiter. Workflow foreground loss is wired through the app lifecycle coordinator.
+
+Online transport accounts bounded byte chunks before parsing, hashes the received bytes, rejects
+redirects, sums usage across fallback attempts, and reduces retry output limits by prior consumption.
+Workflow analysis recognizes exact do/while pairs and instruments expression arrows, callable method
+bodies, and callbacks nested in loop conditions. JavaScriptCore remains a logical realm with cooperative
+termination; the project does not advertise an OS sandbox or a hard heap limit.

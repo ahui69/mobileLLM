@@ -1,17 +1,11 @@
 name: CI
 
-# Hosted CI is deliberately Linux-only. Every gate that needs a macOS runner (Xcode, `swift test` against
-# Apple frameworks, simulators, Metal, mutation kills, package coverage, engine tests) is run on a
-# maintainer Mac through the checked-in scripts — see CONTRIBUTING.md "What runs where" — because paid
-# macOS runner minutes are not in this project's budget. What remains here is the part that can be
-# checked anywhere and that protects the verification documents from drifting silently: the JSON and
-# test-plan files must parse, the verification scripts must be syntactically valid shell, and the
-# `spec.md` digest recorded in the requirement manifest and the semantic registries must match the
-# checked-in specification. No signing identity or repository secret is required.
+# Hosted Linux runs portable contract/API/verification behavior tests as well as document checks.
+# Apple-framework/Metal gates remain available on an explicitly enabled self-hosted Mac.
 
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -81,3 +75,28 @@ jobs:
             status=1
           fi
           exit "$status"
+
+  portable-swift:
+    name: portable Swift behavior tests
+    runs-on: ubuntu-latest
+    container: swift:6.2.4-jammy
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run contract, sandbox API, and verifier tests
+        run: |
+          for package in Packages/AgentContracts Packages/AgentSandboxAPI Tools/AgentHarnessVerification; do
+            swift test --package-path "$package" --scratch-path /tmp/mobilellm-portable
+          done
+      - name: Verify repository semantics and architecture
+        run: swift run --package-path Tools/AgentHarnessVerification --scratch-path /tmp/mobilellm-portable agent-harness-verify static --repo-root "$GITHUB_WORKSPACE"
+
+  macos-behavior:
+    name: Apple package behavior tests (self-hosted)
+    if: vars.MOBILELLM_SELF_HOSTED_MAC == 'true' && (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run every non-Metal package suite
+        run: bash scripts/verification/run-behavior-tests.sh

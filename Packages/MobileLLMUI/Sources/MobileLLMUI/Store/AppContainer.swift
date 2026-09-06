@@ -46,7 +46,12 @@ public final class AppContainer {
     /// App-assembled hook that returns the bounded redacted agent-runtime log (diagnostics only).
     public var agentDiagnosticSnapshot: (@MainActor () async -> String)?
     /// Explicit MCP discovery cache shared by the settings UI (writer) and the agent catalog (reader).
-    public let mcpDiscovery = MCPDiscoveryCache.shared
+    public let mcpDiscovery: MCPDiscoveryCache
+    public var prepareRuntimeDataErase: (@MainActor () async throws -> Void)?
+    public var eraseRuntimeData: (@MainActor () async throws -> Void)?
+    public var finishRuntimeDataErase: (@MainActor () async -> Void)?
+    public var quiesceWorkflows: (@MainActor () async throws -> Void)?
+    public internal(set) var isErasingData = false
 
     /// A one-shot navigation intent the shell (RootView) honors and clears — e.g. a "not installed" error
     /// banner jumping to Models. The container can't push tabs itself (RootView owns the section state).
@@ -56,6 +61,11 @@ public final class AppContainer {
     /// Guards `bootstrap()` so the App scene + RootView both awaiting it decode sessions / restore the
     /// default selection exactly once (DESIGN §2 — the two `.task` sites used to race).
     private var bootstrapTask: Task<Void, Never>?
+    public var runtimeBootstrap: (@MainActor () async -> Void)? {
+        didSet {
+            if runtimeBootstrap != nil { chat.markAgentRuntimeUnavailable("Preparing the agent runtime.") }
+        }
+    }
     /// The in-flight conversation-model restore, and the generation that owns it. Selecting another thread
     /// bumps the generation: a superseded restore must neither win the engine nor rewrite the newly
     /// selected thread's remembered identity when it completes late.
@@ -84,10 +94,12 @@ public final class AppContainer {
                 agentRuns: AgentRunStore? = nil,
                 lifecycle: LifecycleCoordinator? = nil,
                 continuedProcessing: ContinuedProcessingCoordinator? = nil,
-                workflowStore: WorkflowStore? = nil) {
+                workflowStore: WorkflowStore? = nil,
+                mcpDiscovery: MCPDiscoveryCache = .shared) {
         let settings = settings ?? AppSettings(fallbackDefaultModelID: LLMCatalog.defaultModel(for: device).id)
         let store = conversationStore ?? ConversationStore()
         self.settings = settings
+        self.mcpDiscovery = mcpDiscovery
         self.lifecycle = lifecycle ?? LifecycleCoordinator()
         self.continuedProcessing = continuedProcessing
             ?? ContinuedProcessingCoordinator()
@@ -152,17 +164,20 @@ public final class AppContainer {
     /// container's stores at submission time, so wiring happens post-init at app assembly).
     public func attachAgentRuns(_ agentRuns: AgentRunStore) {
         self.agentRuns = agentRuns
+        agentRuntimeError = nil
         chat.attachAgentRuntime(agentRuns)
         // Lifecycle wiring (spec §19.1): the coordinator drives admission, quiescence, and weight
         // unloading through the same stores the UI uses, so tests exercise the real seam.
         lifecycle.quiesce = { [weak self] in
+            do { try await self?.quiesceWorkflows?() }
+            catch { self?.chat.showToast(Toast(error.localizedDescription, kind: .error)) }
             await self?.chat.agentRuns?.quiesceForBackground()
         }
         lifecycle.stopAdmittingActions = { [weak self] in
             self?.chat.setAcceptingNewActions(false)
         }
         lifecycle.resumeAdmittingActions = { [weak self] in
-            self?.chat.setAcceptingNewActions(true)
+            self?.chat.setAcceptingNewActions(self?.isErasingData == false && self?.hasPendingDataErase == false)
             Task { await self?.outboxProjector?.drain() }
         }
         lifecycle.suspendModel = { [weak self] in
@@ -171,6 +186,8 @@ public final class AppContainer {
         // Continued-processing wiring (spec §19.2): submit eligible runs when they start, settle the
         // system task when they terminate, and keep progress truthful.
         continuedProcessing.quiesce = { [weak self] in
+            do { try await self?.quiesceWorkflows?() }
+            catch { self?.chat.showToast(Toast(error.localizedDescription, kind: .error)) }
             await self?.chat.agentRuns?.quiesceForBackground()
         }
         continuedProcessing.cancelRun = { [weak self] conversationID in
@@ -337,9 +354,14 @@ public final class AppContainer {
     }
 
     private func performBootstrap() async {
+        do { try await resumePendingDataErase() }
+        catch { recordAgentRuntimeFailure(error); bootstrapTask = nil; return }
         // Merge persisted community (Explore) models before resolving the default, so an adopted default
         // and the storage/switcher lists see them (DESIGN §2.4). This also rescans install state.
         await models.loadAdoptedRegistry()
+        await runtimeBootstrap?()
+        runtimeBootstrap = nil
+        await chat.recoverAgentRuns()
         do {
             try await skills.load()   // seed the built-in skills on first launch, else read them back from disk
         } catch {

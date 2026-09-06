@@ -113,15 +113,18 @@ enum ArchitectureBoundaryVerifier {
     ) {
         for invocation in invocations(named: "package", tokens: tokens) {
             if let dependencyPath = stringArgument(named: "path", in: invocation.body) {
-                let resolved = URL(fileURLWithPath: dependencyPath, relativeTo: packageURL)
-                    .standardizedFileURL
+                let dependencyLocation = dependencyPath.hasPrefix("/") ? dependencyPath : packageURL.path + "/" + dependencyPath
+                let resolved = URL(fileURLWithPath: dependencyLocation, isDirectory: true).standardizedFileURL
                 let dependency = resolved.lastPathComponent
                 let expected = root.appending(path: "Packages/\(dependency)").standardizedFileURL
-                if !rule.allowedPackageDependencies.contains(dependency) || resolved != expected {
+                if !rule.allowedPackageDependencies.contains(dependency) || resolved.path != expected.path {
                     add(&diagnostics, "AHV-ARCH-PACKAGE-DEPENDENCY", "\(path):\(invocation.line)",
                         "\(rule.name) may not declare local package dependency \(dependencyPath)")
                 }
-            } else if stringArgument(named: "url", in: invocation.body) != nil {
+            } else if let url = stringArgument(named: "url", in: invocation.body) {
+                // The sole external contract dependency is the pinned Linux CryptoKit equivalent.
+                if rule.name == "AgentContracts", url == "https://github.com/apple/swift-crypto.git",
+                   stringArgument(named: "exact", in: invocation.body) == "4.5.2" { continue }
                 add(&diagnostics, "AHV-ARCH-PACKAGE-DEPENDENCY", "\(path):\(invocation.line)",
                     "\(rule.name) may not declare remote package dependencies")
             } else {
@@ -146,7 +149,12 @@ enum ArchitectureBoundaryVerifier {
             return
         }
         let dependencies = targetDependencyNames(in: target.body)
+        let pinnedCrypto = rule.name == "AgentContracts" && invocations(named: "package", tokens: tokens).contains {
+            stringArgument(named: "url", in: $0.body) == "https://github.com/apple/swift-crypto.git"
+                && stringArgument(named: "exact", in: $0.body) == "4.5.2"
+        }
         for dependency in dependencies.sorted() where !rule.allowedPackageDependencies.contains(dependency) {
+            if dependency == "Crypto", pinnedCrypto { continue }
             add(&diagnostics, "AHV-ARCH-TARGET-DEPENDENCY", "\(path):\(target.line)",
                 "\(rule.name) target may not depend on \(dependency)")
         }
@@ -362,6 +370,8 @@ enum ArchitectureBoundaryVerifier {
 
     private static func targetDependencyNames(in body: ArraySlice<SwiftToken>) -> Set<String> {
         let tokens = Array(body)
+        if let label = tokens.indices.first(where: { tokens[$0].identifier == "dependencies" }),
+           label + 2 < tokens.count, tokens[label + 2].identifier == "cryptoTargets" { return ["Crypto"] }
         guard let label = tokens.indices.first(where: { tokens[$0].identifier == "dependencies" }),
               label + 2 < tokens.count, tokens[label + 1].isPunctuation(":"),
               tokens[label + 2].isPunctuation("["),

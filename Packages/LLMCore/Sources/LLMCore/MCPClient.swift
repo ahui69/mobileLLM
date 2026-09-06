@@ -303,6 +303,10 @@ public actor MCPClient {
                 guard let first = try await group.next() else { throw CancellationError() }
                 return first
             }
+        } catch let error as URLError where error.code == .timedOut {
+            // Either the native deadline or our overall timer can win the race.
+            // Callers receive the same typed timeout in both cases.
+            throw MCPError.timedOut(timeout)
         } catch let error as URLError where error.code == .cancelled && Task.isCancelled {
             // URLSession reports NSURLErrorCancelled for a cancelled AsyncBytes task. Preserve user
             // cancellation as CancellationError so callers do not present it as an MCP/tool failure.

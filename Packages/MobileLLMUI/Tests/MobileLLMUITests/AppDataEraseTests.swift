@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 import XCTest
+import AgentRuntime
 import AppRuntime
 @testable import LLMCore
 @testable import MobileLLMUI
@@ -24,7 +25,9 @@ final class AppDataEraseTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
-    private func makeContainer(memoryStore: (any MemoryStoring)? = nil) -> AppContainer {
+    private func makeContainer(memoryStore: (any MemoryStoring)? = nil,
+                               credentials: any OpenAICredentialStoring = EphemeralOpenAICredentialStore(),
+                               cache: MCPDiscoveryCache? = nil) -> AppContainer {
         let settings = AppSettings(defaults: defaults, fallbackDefaultModelID: "bonsai-8b", keychain: nil)
         return AppContainer(
             engine: MockLLMEngine(),
@@ -34,7 +37,9 @@ final class AppDataEraseTests: XCTestCase {
             conversationStore: ConversationStore(directory: root.appending(component: "conversations")),
             memoryStore: memoryStore,
             installProbe: { _, _ in false },
-            availableMemory: { .max }
+            availableMemory: { .max },
+            openAICredentials: credentials,
+            mcpDiscovery: cache ?? MCPDiscoveryCache(defaults: defaults)
         )
     }
 
@@ -98,6 +103,57 @@ final class AppDataEraseTests: XCTestCase {
         XCTAssertEqual(relaunched.systemPrompt, SystemPrompt.standard)
         XCTAssertFalse(relaunched.toolsEnabled)
         XCTAssertTrue(relaunched.mcpServers.isEmpty)
+    }
+
+    func testFullEraseIncludesRuntimeCacheCredentialsAndOnlineSelection() async throws {
+        let credentials = EphemeralOpenAICredentialStore()
+        let cache = MCPDiscoveryCache(defaults: defaults)
+        let container = makeContainer(credentials: credentials, cache: cache)
+        let directory = container.conversationStore.directory
+        let runtime = directory.appending(component: "agent")
+        try FileManager.default.createDirectory(at: runtime, withIntermediateDirectories: true)
+        try Data("private input".utf8).write(to: runtime.appending(component: "journal.sqlite"))
+        try Data("[]".utf8).write(to: directory.appending(component: "workflows.json"))
+        let service = OnlineService(id: "fixture", name: "fixture", baseURL: "https://fixture.test", isEnabled: true)
+        container.settings.upsertOnlineService(service)
+        try credentials.saveAPIKey("fixture-secret", serviceID: service.id)
+        cache.update(server: MCPServer(name: "fixture", url: "https://fixture.test/mcp", token: "fixture-mcp"), specs: [])
+        try await container.eraseAllAppData()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: runtime.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(component: "workflows.json").path))
+        XCTAssertNil(try credentials.loadAPIKey(serviceID: service.id))
+        XCTAssertTrue(container.settings.onlineServices.isEmpty)
+        XCTAssertNil(defaults.data(forKey: "mobilellm.mcpDiscovery.v1"))
+        XCTAssertFalse(container.hasPendingDataErase)
+    }
+
+    func testInterruptedEraseResumesBeforeBootstrapCanOpenRuntime() async throws {
+        let failed = makeContainer(memoryStore: DeleteFailingMemoryStore())
+        do { try await failed.eraseAllAppData(); XCTFail("injected failure") } catch { }
+        XCTAssertTrue(failed.hasPendingDataErase)
+        let recovered = makeContainer()
+        var runtimeOpened = false
+        recovered.runtimeBootstrap = {
+            XCTAssertFalse(recovered.hasPendingDataErase)
+            runtimeOpened = true
+        }
+        await recovered.bootstrap()
+        XCTAssertTrue(runtimeOpened)
+        XCTAssertFalse(recovered.hasPendingDataErase)
+    }
+
+    func testRuntimeDrainFailureNeverDeletesLiveDataOrClearsIntent() async throws {
+        let container = makeContainer()
+        let conversation = Conversation(modelID: "bonsai-8b", variantID: "fixture")
+        try await container.conversationStore.save(conversation)
+        container.prepareRuntimeDataErase = { throw ConversationEraseInProgressError() }
+        do { try await container.deleteAllChats(); XCTFail("drain failure") } catch { }
+        let retained = await container.conversationStore.load(conversation.id)
+        XCTAssertNotNil(retained)
+        XCTAssertTrue(container.hasPendingDataErase)
+        container.prepareRuntimeDataErase = nil
+        try await container.resumePendingDataErase()
+        XCTAssertFalse(container.hasPendingDataErase)
     }
 
     func testEraseAggregatesFailureAndStillAttemptsOtherScopes() async throws {

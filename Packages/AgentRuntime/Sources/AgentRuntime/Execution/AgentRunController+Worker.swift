@@ -21,6 +21,8 @@ private enum DurableToolBatchRecoveryPhase {
 extension AgentRunController {
     func drive(runID: AgentRunID) async {
         var rootLease: RootExecutionLease?
+        var groupLease: RunGroupAdmission.Lease?
+        var executionArbiter = arbiter
         do {
             let (facts, history) = try await loadRun(runID)
             guard !facts.projection.isTerminal,
@@ -29,11 +31,20 @@ extension AgentRunController {
             guard let admissionSequence = facts.submission?.admissionSequence else {
                 throw AgentExecutionError.invalidRecoveryBoundary
             }
-            rootLease = try await arbiter.acquireRoot(
+            guard let request = facts.submission?.request.payload else { throw AgentExecutionError.invalidRecoveryBoundary }
+            groupLease = try await rootGroups.acquire(group: request.parent?.runID ?? runID, sequence: admissionSequence)
+            // Remote siblings own no native model resources. Giving them independent attempt lanes
+            // permits actual I/O overlap while the root-family gate excludes unrelated roots.
+            if !request.modelPolicy.localOnly,
+               let selection = request.modelPolicy.allowedSelections.first,
+               try modelProviders.provider(for: selection).descriptor.location == .remote {
+                executionArbiter = ResourceArbiter(driver: residencyDriver)
+            }
+            rootLease = try await executionArbiter.acquireRoot(
                 runID: runID,
                 admissionSequence: admissionSequence
             )
-            if let rootLease { try await driveOwned(runID: runID, rootLease: rootLease) }
+            if let rootLease { try await driveOwned(runID: runID, rootLease: rootLease, arbiter: executionArbiter) }
         } catch is CancellationError {
             await cancelActiveTool(runID: runID)
             try? await finishQuiescence(runID: runID)
@@ -52,12 +63,14 @@ extension AgentRunController {
             )
             try? await failRun(runID: runID, workerError: error)
         }
-        if let rootLease { _ = await arbiter.releaseRoot(rootLease) }
+        if let rootLease { _ = await executionArbiter.releaseRoot(rootLease) }
+        if let groupLease { await rootGroups.release(groupLease) }
     }
 
     private func driveOwned(
         runID: AgentRunID,
-        rootLease: RootExecutionLease
+        rootLease: RootExecutionLease,
+        arbiter: ResourceArbiter
     ) async throws {
         for _ in 0 ..< 64 {
             try Task.checkCancellation()
@@ -102,6 +115,7 @@ extension AgentRunController {
                     facts: facts,
                     history: history,
                     rootLease: rootLease,
+                    arbiter: arbiter,
                     toolFree: false
                 )
             case .synthesizing:
@@ -109,6 +123,7 @@ extension AgentRunController {
                     facts: facts,
                     history: history,
                     rootLease: rootLease,
+                    arbiter: arbiter,
                     toolFree: true
                 )
             case .validatingAction:
@@ -611,6 +626,7 @@ extension AgentRunController {
         facts: RuntimeRunFacts,
         history: ExecutionHistory,
         rootLease: RootExecutionLease,
+        arbiter: ResourceArbiter,
         toolFree: Bool
     ) async throws {
         let frozen = try await frozenInputs(facts)

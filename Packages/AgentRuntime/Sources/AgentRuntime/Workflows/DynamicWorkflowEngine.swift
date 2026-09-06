@@ -101,6 +101,7 @@ public actor DynamicWorkflowEngine {
     private let valueStore: any WorkflowValueStoring
     private let clock: any AgentExecutionClock
     private var active: [WorkflowRunID: ActiveRun] = [:]
+    private var dataEraseSuspended = false
 
     public init(
         journal: any DynamicWorkflowJournal,
@@ -241,6 +242,7 @@ public actor DynamicWorkflowEngine {
     /// Starts durable background execution and returns immediately. Repeated calls attach to the
     /// same in-process task; relaunch recovery reconstructs a new task from journal facts.
     public func start(runID: WorkflowRunID) async throws {
+        guard !dataEraseSuspended else { throw WorkflowScriptRuntimeError.cancelled }
         let projection = try await requiredProjection(runID)
         guard projection.reconciliationCallID == nil,
               projection.state != .waitingForReconciliation
@@ -384,6 +386,17 @@ public actor DynamicWorkflowEngine {
         try await current.session.stop()
         current.task.cancel()
         _ = await current.task.result
+    }
+
+    public func suspendForDataErase() async throws {
+        dataEraseSuspended = true
+        for id in Array(active.keys) { try await stop(runID: id) }
+    }
+
+    public func resumeAfterDataErase() { dataEraseSuspended = false }
+
+    public func quiesceForBackground() async throws {
+        for id in Array(active.keys) { try await deferToForeground(runID: id) }
     }
 
     public func projection(runID: WorkflowRunID) async throws -> WorkflowRunProjectionV1? {

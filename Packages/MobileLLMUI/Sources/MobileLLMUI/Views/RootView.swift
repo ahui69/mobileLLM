@@ -48,6 +48,7 @@ public struct RootView: View {
 
     private var standardBody: some View {
         shell
+            .disabled(container.isErasingData)
             .tint(Theme.accent)
             .background(Theme.bg)
             #if os(macOS)
