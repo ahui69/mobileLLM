@@ -401,7 +401,7 @@ bookmarks, artifacts with no remaining owner, projection outbox entries, snapsho
 diagnostics for that conversation. Recovery replays an incomplete deletion intent until every owned store agrees.
 
 `Delete All` first atomically writes a non-sensitive, protected, backup-excluded marker at
-`<Application Support>/mobileLLM.delete-all.pending`, owned by the app-level erase coordinator and outside every
+`<conversation-directory>.erase-pending`, owned by the app-level erase coordinator and outside every
 database/artifact/conversation directory being removed. On launch, that marker blocks all store opening and mutation
 until deletion finishes. The operation
 then closes the database, removes the database together with `-wal` and `-shm`, conversation projections, artifacts,

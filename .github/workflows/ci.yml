@@ -86,10 +86,10 @@ jobs:
       - name: Run contract, sandbox API, and verifier tests
         run: |
           for package in Packages/AgentContracts Packages/AgentSandboxAPI Tools/AgentHarnessVerification; do
-            swift test --package-path "$package" --scratch-path "/tmp/$(basename "$package")"
+            swift test --package-path "$package" --scratch-path /tmp/mobilellm-portable
           done
       - name: Verify repository semantics and architecture
-        run: swift run --package-path Tools/AgentHarnessVerification --scratch-path /tmp/AgentHarnessVerification agent-harness-verify static --repo-root "$GITHUB_WORKSPACE"
+        run: swift run --package-path Tools/AgentHarnessVerification --scratch-path /tmp/mobilellm-portable agent-harness-verify static --repo-root "$GITHUB_WORKSPACE"
 
   macos-behavior:
     name: Apple package behavior tests (self-hosted)
