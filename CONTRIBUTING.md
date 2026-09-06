@@ -103,12 +103,17 @@ xcodebuild -skipMacroValidation -scheme UITests \
 
 ### What runs where
 
-**Hosted CI is Linux-only and deliberately small.** `.github/workflows/ci.yml` runs one `ubuntu-latest` job:
+**Hosted CI runs portable Swift behavior tests on Linux.** `.github/workflows/ci.yml` runs one `ubuntu-latest` job:
 every `Verification/**` JSON and `.xctestplan` must parse, every `scripts/verification/*.sh` must pass
 `bash -n`, and the `spec.md` SHA-256 recorded in `Verification/AgentHarness/requirements.v1.json` and the
-four semantic registries must match the checked-in `spec.md`. Nothing that needs a macOS runner (Xcode,
-`swift test` against Apple frameworks, simulators, Metal) runs on GitHub — paid macOS minutes are not in
-this project's budget.
+four semantic registries must match the checked-in `spec.md`. The portable Swift job also compiles and tests `AgentContracts`, `AgentSandboxAPI`, and
+`AgentHarnessVerification`, then runs the semantic/architecture verifier. Apple platforms keep CryptoKit;
+Linux uses Apple's pinned Swift Crypto 4.5.2 implementation. Pushes to `codex/**` run the same gates.
+
+Paid macOS runners remain disabled. A maintainer can enable the `macos-behavior` job by registering a
+trusted self-hosted macOS runner and setting `MOBILELLM_SELF_HOSTED_MAC=true` in repository variables.
+It runs only on main or manual dispatch, never on pull-request code. The same local gate is
+`bash scripts/verification/run-behavior-tests.sh`; set `MOBILELLM_TEST_OUTPUT` to retain logs at a chosen path.
 
 **Everything else is a maintainer-run gate on a Mac**, using the checked-in scripts, and its evidence is
 attached to the release record rather than to a CI run:
