@@ -346,6 +346,10 @@ struct MobileLLMApp: App {
                 continuedProcessing: continuedProcessing
             )
         }
+        container.mcpDiscovery.setCredentialResolver { server in
+            try? KeychainBox(service: AppSettings.defaultKeychainService)
+                .readString(account: server.url)
+        }
         // Weight unloading is independent of agent assembly. If assembly later fails, sending is
         // fail-closed, but the app can still release any selected model cleanly.
         container.lifecycle.suspendModel = { [weak container] in

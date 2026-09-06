@@ -16,27 +16,50 @@ public final class MCPDiscoveryCache: @unchecked Sendable {
     private struct Entry: Codable {
         var server: MCPServer
         var specs: [MCPToolSpec]
+
+        init(server: MCPServer, specs: [MCPToolSpec]) {
+            self.server = server
+            self.server.token = nil
+            self.specs = specs
+        }
     }
 
     private let lock = NSLock()
     private let defaults: UserDefaults
     private let persistenceKey: String
     private var entries: [UUID: Entry] = [:]
+    private var credentialResolver: @Sendable (MCPServer) -> String?
 
     public init(
         defaults: UserDefaults = .standard,
-        persistenceKey: String = "mobilellm.mcpDiscovery.v1"
+        persistenceKey: String = "mobilellm.mcpDiscovery.v1",
+        credentialResolver: @escaping @Sendable (MCPServer) -> String? = { _ in nil }
     ) {
         self.defaults = defaults
         self.persistenceKey = persistenceKey
+        self.credentialResolver = credentialResolver
         if let data = defaults.data(forKey: persistenceKey),
            let decoded = try? JSONDecoder().decode([String: Entry].self, from: data)
         {
             self.entries = decoded.reduce(into: [:]) { result, pair in
                 guard let stableID = UUID(uuidString: pair.key) else { return }
-                result[stableID] = pair.value
+                result[stableID] = Entry(server: pair.value.server, specs: pair.value.specs)
             }
+            // Retire plaintext tokens written by the old cache immediately on opening it.
+            persistLocked()
         }
+    }
+
+    /// Credentials are resolved at invocation time and never become cache data.
+    public func setCredentialResolver(_ resolver: @escaping @Sendable (MCPServer) -> String?) {
+        lock.lock(); defer { lock.unlock() }
+        credentialResolver = resolver
+    }
+
+    public func removeAll() {
+        lock.lock(); defer { lock.unlock() }
+        entries.removeAll()
+        defaults.removeObject(forKey: persistenceKey)
     }
 
     public func update(server: MCPServer, specs: [MCPToolSpec]) {
@@ -48,7 +71,8 @@ public final class MCPDiscoveryCache: @unchecked Sendable {
     /// Preserve discovered specs when a server's enable/mute settings change without re-probing.
     public func upsert(server: MCPServer) {
         lock.lock(); defer { lock.unlock() }
-        let specs = entries[server.stableID]?.specs ?? []
+        let previous = entries[server.stableID]
+        let specs = previous?.server.url == server.url ? previous?.specs ?? [] : []
         entries[server.stableID] = Entry(server: server, specs: specs)
         persistLocked()
     }
@@ -68,8 +92,12 @@ public final class MCPDiscoveryCache: @unchecked Sendable {
     /// discovered; editing the URL requires an explicit re-test, so a changed URL cannot silently
     /// redirect previously approved operations.
     public func server(serverStableID: UUID) -> MCPServer? {
-        lock.lock(); defer { lock.unlock() }
-        return entries[serverStableID]?.server
+        lock.lock()
+        var server = entries[serverStableID]?.server
+        let resolver = credentialResolver
+        lock.unlock()
+        if let snapshot = server { server?.token = resolver(snapshot) }
+        return server
     }
 
     /// The exact Tool V2 descriptors the runtime may advertise for the currently enabled servers.
@@ -82,7 +110,8 @@ public final class MCPDiscoveryCache: @unchecked Sendable {
         for server in servers
             where server.isEnabled && !server.url.trimmingCharacters(in: .whitespaces).isEmpty
         {
-            guard let specs = entries[server.stableID]?.specs else { continue }
+            guard let entry = entries[server.stableID], entry.server.url == server.url else { continue }
+            let specs = entry.specs
             for spec in specs where !server.disabledTools.contains(spec.name) {
                 guard let descriptor = try? MCPToolV2Adapter.descriptor(
                     spec: spec,
