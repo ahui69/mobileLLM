@@ -348,7 +348,16 @@ enum RepositoryJSONSchemaValidator {
                 && (lhs as? NSNumber)?.boolValue == (rhs as? NSNumber)?.boolValue
         }
         if isNumber(lhs), isNumber(rhs) { return numericValue(lhs) == numericValue(rhs) }
-        return (lhs as AnyObject).isEqual(rhs)
+        if let left = lhs as? String, let right = rhs as? String { return left == right }
+        if let left = lhs as? [Any], let right = rhs as? [Any] {
+            return left.count == right.count && zip(left, right).allSatisfy { jsonEqual($0.0, $0.1) }
+        }
+        if let left = lhs as? [String: Any], let right = rhs as? [String: Any] {
+            return Set(left.keys) == Set(right.keys) && left.allSatisfy { key, value in
+                right[key].map { jsonEqual(value, $0) } ?? false
+            }
+        }
+        return false
     }
 
     private static func display(_ value: Any) -> String {

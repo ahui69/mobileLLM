@@ -38,6 +38,19 @@ final class BootstrapIdempotencyTests: XCTestCase {
             availableMemory: { .max })
     }
 
+    func testDeferredRuntimeAssemblyBlocksLegacySendUntilAttachment() async {
+        let c = container(engine: CountingEngine())
+        c.runtimeBootstrap = { }
+        XCTAssertNotNil(c.chat.agentRuntimeUnavailableReason)
+        c.chat.newConversation()
+        c.chat.draft = "must stay in composer"
+        c.chat.send()
+        XCTAssertEqual(c.chat.draft, "must stay in composer")
+        XCTAssertNil(c.chat.streaming)
+        await c.bootstrap()
+        XCTAssertNotNil(c.chat.agentRuntimeUnavailableReason, "only a real runtime attachment may open sending")
+    }
+
     func testConcurrentBootstrapsSelectDefaultWithoutLoadingEngine() async {
         let engine = CountingEngine()
         let c = container(engine: engine)

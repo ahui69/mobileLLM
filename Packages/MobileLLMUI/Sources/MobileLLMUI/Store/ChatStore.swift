@@ -231,6 +231,8 @@ public final class ChatStore {
     /// Wires the durable agent runtime projection into chat. Called at app assembly after the
     /// container exists (the runtime needs a snapshot closure that reads this store).
     public func attachAgentRuntime(_ agentRuns: AgentRunStore) {
+        agentRuntimeUnavailableReason = nil
+        agentLastSendError = nil
         self.agentRuns = agentRuns
         agentRuns.onAnswer = { [weak self] conversationID, assistantMessageID, text, reasoning, steps in
             self?.commitAgentAnswer(

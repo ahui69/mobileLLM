@@ -19,8 +19,14 @@ public extension AppContainer {
     var dataEraseMarkerURL: URL { conversationStore.directory.appendingPathExtension("erase-pending") }
     var hasPendingDataErase: Bool { FileManager.default.fileExists(atPath: dataEraseMarkerURL.path) }
 
-    func deleteAllChats() async throws { try await beginDataErase(allData: false) }
-    func eraseAllAppData() async throws { try await beginDataErase(allData: true) }
+    func deleteAllChats() async throws {
+        try await beginDataErase(allData: false)
+        if runtimeBootstrap != nil { await bootstrap() }
+    }
+    func eraseAllAppData() async throws {
+        try await beginDataErase(allData: true)
+        if runtimeBootstrap != nil { await bootstrap() }
+    }
 
     /// Bootstrap calls this before opening the runtime or hydrating any user store.
     func resumePendingDataErase() async throws {

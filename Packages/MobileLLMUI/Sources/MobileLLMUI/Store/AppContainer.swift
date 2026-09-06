@@ -61,7 +61,11 @@ public final class AppContainer {
     /// Guards `bootstrap()` so the App scene + RootView both awaiting it decode sessions / restore the
     /// default selection exactly once (DESIGN §2 — the two `.task` sites used to race).
     private var bootstrapTask: Task<Void, Never>?
-    public var runtimeBootstrap: (@MainActor () async -> Void)?
+    public var runtimeBootstrap: (@MainActor () async -> Void)? {
+        didSet {
+            if runtimeBootstrap != nil { chat.markAgentRuntimeUnavailable("Preparing the agent runtime.") }
+        }
+    }
     /// The in-flight conversation-model restore, and the generation that owns it. Selecting another thread
     /// bumps the generation: a superseded restore must neither win the engine nor rewrite the newly
     /// selected thread's remembered identity when it completes late.
@@ -160,6 +164,7 @@ public final class AppContainer {
     /// container's stores at submission time, so wiring happens post-init at app assembly).
     public func attachAgentRuns(_ agentRuns: AgentRunStore) {
         self.agentRuns = agentRuns
+        agentRuntimeError = nil
         chat.attachAgentRuntime(agentRuns)
         // Lifecycle wiring (spec §19.1): the coordinator drives admission, quiescence, and weight
         // unloading through the same stores the UI uses, so tests exercise the real seam.

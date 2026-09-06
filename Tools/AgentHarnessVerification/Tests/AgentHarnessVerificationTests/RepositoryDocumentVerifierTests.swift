@@ -6,6 +6,13 @@ import XCTest
 
 // TEST-ID: AHT-INFRA-007
 final class RepositoryDocumentVerifierTests: XCTestCase {
+    func testNestedJSONEqualityKeepsBooleansDistinctFromNumbers() {
+        let schema: [String: Any] = ["const": ["values": [true]]]
+        XCTAssertTrue(RepositoryJSONSchemaValidator.validate(instance: ["values": [true]], against: schema, label: "fixture").isEmpty)
+        XCTAssertFalse(RepositoryJSONSchemaValidator.validate(instance: ["values": [1]], against: schema, label: "fixture").isEmpty)
+        XCTAssertFalse(RepositoryJSONSchemaValidator.validate(instance: ["values": [true, false]], against: schema, label: "fixture").isEmpty)
+    }
+
     // TEST-ID: AHT-INFRA-001
     func testOfflineJSONSchemaValidatorCoversRepositoryDialect() {
         let schema: [String: Any] = [
