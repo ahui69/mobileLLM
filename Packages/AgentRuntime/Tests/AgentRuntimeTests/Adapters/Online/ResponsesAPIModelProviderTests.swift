@@ -1036,7 +1036,7 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
                 """.utf8))
             }
             let decoded = try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
-            XCTAssertEqual(decoded?["max_output_tokens"] as? Int, 4_096)
+            XCTAssertEqual(decoded?["max_output_tokens"] as? Int, 4_091)
             XCTAssertNil(decoded?["reasoning"], "the truncation retry keeps the same reasoning mode")
             return (response, Data("""
             {"status":"completed",
@@ -1116,6 +1116,8 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
               case .finalAnswer(let answer) = completion.action
         else { return XCTFail("expected final answer, got \(result.outcome)") }
         XCTAssertEqual(answer.text, "Sleep doesn’t have to be perfect.")
+        XCTAssertEqual(completion.usage.inputTokens, 3)
+        XCTAssertEqual(completion.usage.outputTokens, 11)
         XCTAssertEqual(MockResponsesURLProtocol.requestCount, 2)
     }
 
@@ -1456,7 +1458,7 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
             }
             let body = MockResponsesURLProtocol.requestBodyString(request)
             let decoded = try JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any]
-            XCTAssertEqual(decoded?["max_output_tokens"] as? Int, 4_096)
+            XCTAssertEqual(decoded?["max_output_tokens"] as? Int, 4_091)
             return (response, Data("""
             data: {"type":"response.output_text.delta","delta":"Sleep doesn"}
 
@@ -1538,6 +1540,8 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
               case .finalAnswer(let answer) = completion.action
         else { return XCTFail("expected final answer, got \(result.outcome)") }
         XCTAssertEqual(answer.text, "Sleep doesn’t have to be perfect.")
+        XCTAssertEqual(completion.usage.inputTokens, 3)
+        XCTAssertEqual(completion.usage.outputTokens, 12)
         XCTAssertEqual(MockResponsesURLProtocol.requestCount, 2)
 
         let answerDeltas = (await sink.events()).compactMap { event -> String? in
@@ -1551,4 +1555,52 @@ final class ResponsesAPIModelProviderTests: XCTestCase {
         )
         XCTAssertEqual(answerDeltas.joined(), answer.text)
     }
+    func testTransportAccountsSSEBytesAndDigestAndRejectsOversizedBodies() async throws {
+        let stream = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\ndata: {\"type\":\"response.completed\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":2}}\n\n"
+        let data = Data(stream.utf8)
+        let result = try await executeTransportFixture(data: data, type: "text/event-stream", limit: 1_024)
+        XCTAssertEqual(result.responseBytes, UInt64(data.count))
+        XCTAssertEqual(result.responseDigest, StableDigest.sha256(data))
+        for type in ["text/event-stream", "application/json"] {
+            do {
+                _ = try await executeTransportFixture(data: data, type: type, limit: 1)
+                XCTFail("transport must reject bytes beyond the prepared limit")
+            } catch let error as AgentModelRuntimeError {
+                guard case .providerContractViolation = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+        }
+        do {
+            _ = try await executeTransportFixture(data: Data(repeating: 65, count: 16_384), type: "text/plain", limit: 1, status: 500)
+            XCTFail("error responses must also be bounded")
+        } catch let error as AgentModelRuntimeError {
+            guard case .providerContractViolation = error else { return XCTFail("Unexpected error: \(error)") }
+        }
+    }
+
+    private func executeTransportFixture(data: Data, type: String, limit: UInt64, status: Int = 200) async throws -> AgentModelExecutionResult {
+        MockResponsesURLProtocol.handler = { request in
+            (HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": type])!, data)
+        }
+        defer { MockResponsesURLProtocol.handler = nil }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockResponsesURLProtocol.self]
+        let provider = try ResponsesAPIModelProvider(
+            configuration: ResponsesAPIConfiguration(baseURL: "https://fixture.test/v1", apiKey: "fixture-key"),
+            session: URLSession(configuration: config)
+        )
+        let fixture = try ModelFixture(location: .remote, providerID: ResponsesAPIModelProvider.providerID,
+            remoteDestination: "openai.responses:responses-api-key:fixture-model")
+        let context = try ModelPreparationContext(conversationID: fixture.context.conversationID,
+            modelPolicy: AgentModelPolicy(localOnly: false, allowedSelections: [fixture.request.selection], strategy: .pinned, requiredCapabilities: AgentModelCapabilitySet([])),
+            capabilityGrant: fixture.context.capabilityGrant, authorizationPayload: fixture.context.authorizationPayload,
+            maximumRequestBytes: fixture.context.maximumRequestBytes, maximumResponseBytes: limit, timeoutMilliseconds: 60_000)
+        let prepared = try await AgentModelRequestPreparer().prepare(provider: provider, request: fixture.request, context: context)
+        let policy = TestApprovalPolicyEngine()
+        let auth = try await policy.bindLocalPolicy(prepared: prepared.preparedRequest.externalOperation,
+            approvalID: ApprovalID(), trustedRunAuthority: fixture.authority, at: AgentTimestamp(rawValue: 1_000))
+        let authorized = AuthorizedAgentModelAttempt(preparedAttempt: prepared, request: try AuthorizedModelRequest(
+            request: fixture.request, authorization: auth, clock: FixedAuthorizationClock(), policyValidator: policy, attemptLedger: TestAttemptLedger()))
+        return try await AgentModelExecutor().execute(provider: provider, authorized: authorized)
+    }
+
 }
