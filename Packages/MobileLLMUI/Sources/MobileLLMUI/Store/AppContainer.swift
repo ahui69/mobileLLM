@@ -46,7 +46,12 @@ public final class AppContainer {
     /// App-assembled hook that returns the bounded redacted agent-runtime log (diagnostics only).
     public var agentDiagnosticSnapshot: (@MainActor () async -> String)?
     /// Explicit MCP discovery cache shared by the settings UI (writer) and the agent catalog (reader).
-    public let mcpDiscovery = MCPDiscoveryCache.shared
+    public let mcpDiscovery: MCPDiscoveryCache
+    public var prepareRuntimeDataErase: (@MainActor () async throws -> Void)?
+    public var eraseRuntimeData: (@MainActor () async throws -> Void)?
+    public var finishRuntimeDataErase: (@MainActor () async -> Void)?
+    public var quiesceWorkflows: (@MainActor () async throws -> Void)?
+    public internal(set) var isErasingData = false
 
     /// A one-shot navigation intent the shell (RootView) honors and clears — e.g. a "not installed" error
     /// banner jumping to Models. The container can't push tabs itself (RootView owns the section state).
@@ -85,10 +90,12 @@ public final class AppContainer {
                 agentRuns: AgentRunStore? = nil,
                 lifecycle: LifecycleCoordinator? = nil,
                 continuedProcessing: ContinuedProcessingCoordinator? = nil,
-                workflowStore: WorkflowStore? = nil) {
+                workflowStore: WorkflowStore? = nil,
+                mcpDiscovery: MCPDiscoveryCache = .shared) {
         let settings = settings ?? AppSettings(fallbackDefaultModelID: LLMCatalog.defaultModel(for: device).id)
         let store = conversationStore ?? ConversationStore()
         self.settings = settings
+        self.mcpDiscovery = mcpDiscovery
         self.lifecycle = lifecycle ?? LifecycleCoordinator()
         self.continuedProcessing = continuedProcessing
             ?? ContinuedProcessingCoordinator()
@@ -157,13 +164,15 @@ public final class AppContainer {
         // Lifecycle wiring (spec §19.1): the coordinator drives admission, quiescence, and weight
         // unloading through the same stores the UI uses, so tests exercise the real seam.
         lifecycle.quiesce = { [weak self] in
+            do { try await self?.quiesceWorkflows?() }
+            catch { self?.chat.showToast(Toast(error.localizedDescription, kind: .error)) }
             await self?.chat.agentRuns?.quiesceForBackground()
         }
         lifecycle.stopAdmittingActions = { [weak self] in
             self?.chat.setAcceptingNewActions(false)
         }
         lifecycle.resumeAdmittingActions = { [weak self] in
-            self?.chat.setAcceptingNewActions(true)
+            self?.chat.setAcceptingNewActions(self?.isErasingData == false && self?.hasPendingDataErase == false)
             Task { await self?.outboxProjector?.drain() }
         }
         lifecycle.suspendModel = { [weak self] in
@@ -172,6 +181,8 @@ public final class AppContainer {
         // Continued-processing wiring (spec §19.2): submit eligible runs when they start, settle the
         // system task when they terminate, and keep progress truthful.
         continuedProcessing.quiesce = { [weak self] in
+            do { try await self?.quiesceWorkflows?() }
+            catch { self?.chat.showToast(Toast(error.localizedDescription, kind: .error)) }
             await self?.chat.agentRuns?.quiesceForBackground()
         }
         continuedProcessing.cancelRun = { [weak self] conversationID in
@@ -338,6 +349,8 @@ public final class AppContainer {
     }
 
     private func performBootstrap() async {
+        do { try await resumePendingDataErase() }
+        catch { recordAgentRuntimeFailure(error); bootstrapTask = nil; return }
         // Merge persisted community (Explore) models before resolving the default, so an adopted default
         // and the storage/switcher lists see them (DESIGN §2.4). This also rescans install state.
         await models.loadAdoptedRegistry()

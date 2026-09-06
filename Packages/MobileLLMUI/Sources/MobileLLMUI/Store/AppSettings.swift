@@ -468,6 +468,7 @@ public final class AppSettings {
         toolsEnabled = false
         dictationLocale = nil
         mcpServers = []
+        onlineServices = []
         disabledBuiltInTools = Self.defaultDisabledBuiltInTools
         searchEngines = [.duckduckgo, .bing, .brave, .yahoo, .marginalia]
         temperature = 0.7

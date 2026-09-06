@@ -527,6 +527,13 @@ struct MobileLLMApp: App {
                     downloadBase: base,
                     onlineConfigBox: onlineConfigBox
                 )
+                container.prepareRuntimeDataErase = { try await launcher.suspendForDataErase() }
+                container.eraseRuntimeData = { try await assembly.eraseAllRuntimeData() }
+                container.finishRuntimeDataErase = {
+                    await assembly.executor.controller.resumeAfterDataErase()
+                    await assembly.dynamicWorkflows.resumeAfterDataErase()
+                }
+                container.quiesceWorkflows = { try await launcher.quiesceForBackground() }
                 container.chat.workflowLaunch = { [launcher] goal, conversationID,
                     userMessageID, workflowID in
                     try await launcher.launch(

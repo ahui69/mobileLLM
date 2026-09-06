@@ -16,6 +16,7 @@ final class WorkflowLauncher {
     private let downloadBase: URL
     private let onlineConfigBox: OpenAIOnlineConfigurationBox
     private let orchestrator: WorkflowOrchestrator
+    private var monitors: [UUID: Task<Void, Never>] = [:]
 
     init(
         container: AppContainer,
@@ -327,10 +328,12 @@ final class WorkflowLauncher {
     }
 
     private func monitorDynamic(workflowID: UUID) {
-        Task { [weak self] in
+        monitors[workflowID]?.cancel()
+        monitors[workflowID] = Task { [weak self] in
             for _ in 0 ..< 14_400 {
                 guard let self else { return }
                 try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled else { return }
                 try? await self.refreshDynamicSummary(workflowID: workflowID)
                 guard let state = self.container?.workflowStore
                     .summary(workflowID: workflowID)?.dynamic?.state,
@@ -338,6 +341,22 @@ final class WorkflowLauncher {
                       .waitingForReconciliation].contains(state)
                 else { return }
             }
+        }
+    }
+
+    func suspendForDataErase() async throws {
+        let tasks = Array(monitors.values)
+        for task in tasks { task.cancel() }
+        for task in tasks { await task.value }
+        monitors.removeAll()
+        try await assembly.dynamicWorkflows.suspendForDataErase()
+        try await assembly.executor.controller.suspendForDataErase()
+    }
+
+    func quiesceForBackground() async throws {
+        try await assembly.dynamicWorkflows.quiesceForBackground()
+        for id in container?.workflowStore.workflows.keys.map({ $0 }) ?? [] {
+            try? await refreshDynamicSummary(workflowID: id)
         }
     }
 
@@ -623,6 +642,14 @@ public actor AppDynamicWorkflowService {
 
     /// Normalizes/analyzes one exact candidate, saves it through the durable workflow journal, and
     /// returns a preview. It never approves or starts the script.
+    public func suspendForDataErase() async throws {
+        try await engine.suspendForDataErase()
+        childRequestBuilder.removeAll()
+    }
+
+    public func resumeAfterDataErase() async { await engine.resumeAfterDataErase() }
+    public func quiesceForBackground() async throws { try await engine.quiesceForBackground() }
+
     public func prepareCandidate(
         source: String,
         scriptID: WorkflowScriptID = WorkflowScriptID(),

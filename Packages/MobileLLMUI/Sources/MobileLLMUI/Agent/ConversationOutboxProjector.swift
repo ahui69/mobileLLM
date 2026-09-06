@@ -38,8 +38,8 @@ public enum ConversationOutboxProjectorError: Error, Equatable, Sendable {
 /// conversation JSON idempotently, and acknowledges delivery. A failed apply leaves the row leased so
 /// a later drain retries it after the lease expires; the journal, never the JSON, is the source of
 /// truth.
-public final class ConversationOutboxProjector: Sendable {
-    public let owner: String
+public actor ConversationOutboxProjector {
+    public nonisolated let owner: String
     private let outbox: any AgentOutboxProviding
     private let payloads: any AgentOutboxPayloadLoading
     private let store: ConversationStore
@@ -65,9 +65,28 @@ public final class ConversationOutboxProjector: Sendable {
         self.shouldProject = shouldProject
     }
 
+    private var suspended = false
+    private var draining = false
+    private var drainWaiters: [CheckedContinuation<Void, Never>] = []
+
+    public func suspendAndDrain() async {
+        suspended = true
+        if draining { await withCheckedContinuation { drainWaiters.append($0) } }
+    }
+
+    public func resume() { suspended = false }
+
     /// One claim → apply → acknowledge pass. Never throws: an unavailable journal or a failing item
     /// simply remains pending for the next drain.
     public func drain(limit: Int = 32) async {
+        guard !suspended, !draining else { return }
+        draining = true
+        defer {
+            draining = false
+            let waiters = drainWaiters
+            drainWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+        }
         let now: AgentTimestamp
         do {
             now = try clock()

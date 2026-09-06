@@ -315,6 +315,15 @@ public final class AgentRunStore {
         handles.removeValue(forKey: run.runID)
     }
 
+    public func discardAllForDataErase() async {
+        let observers = Array(eventTasks.values) + Array(ephemeralTasks.values)
+        for task in observers { task.cancel() }
+        for task in observers { await task.value }
+        for id in Array(runs.keys) { discard(conversationID: id) }
+        recoverableRuns.removeAll()
+        recoveryError = nil
+    }
+
     // MARK: - Internals
 
     private func subscribe(

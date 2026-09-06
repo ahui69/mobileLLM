@@ -60,6 +60,15 @@ final class ArtifactFileSystem: @unchecked Sendable {
         try Self.applyStorageAttributes(to: lock.url, configuration: configuration)
     }
 
+    func eraseContents() throws {
+        for directory in [objectsURL, stagingURL, metadataURL] {
+            try Self.requireDirectoryWithoutSymlink(directory)
+            for child in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+                try FileManager.default.removeItem(at: child)
+            }
+        }
+    }
+
     func locator(for digest: StableDigest) throws -> ArtifactLocator {
         try ArtifactLocator(kind: .managedRelativePath, value: relativeObjectPath(for: digest))
     }

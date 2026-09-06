@@ -115,7 +115,11 @@ public actor AgentRunController {
     let clock: any AgentExecutionClock
     let logger: any AgentExecutionLogging
     let interactionContext: ApprovalInteractionContext
-    let arbiter: ResourceArbiter
+    var arbiter: ResourceArbiter
+    let residencyDriver: any ModelResidencyDriver
+    var dataEraseSuspended = false
+    var publicMutations = 0
+    var mutationDrainWaiters: [CheckedContinuation<Void, Never>] = []
 
     var workers: [AgentRunID: Task<Void, Never>] = [:]
     /// Parallel tool batches may own one live cancellation token per invocation.
@@ -152,6 +156,7 @@ public actor AgentRunController {
         self.clock = clock
         self.logger = logger
         self.interactionContext = interactionContext
+        self.residencyDriver = residencyDriver
         arbiter = ResourceArbiter(driver: residencyDriver)
     }
 
@@ -159,6 +164,8 @@ public actor AgentRunController {
         _ request: AgentRequest,
         commandID: AgentCommandID
     ) async throws -> AgentExecutionHandleID {
+        try beginPublicMutation()
+        defer { endPublicMutation() }
         if let existing = try await repository.loadRunFacts(for: request.runID),
            let submission = existing.submission
         {
@@ -473,8 +480,15 @@ public actor AgentRunController {
         if subscriptions[handleID]?.isEmpty == true { subscriptions[handleID] = nil }
     }
 
+    func discardObserversForDataErase() {
+        for entries in subscriptions.values { for entry in entries.values { entry.continuation.finish() } }
+        subscriptions.removeAll()
+        for entries in ephemeralSubscriptions.values { for continuation in entries.values { continuation.finish() } }
+        ephemeralSubscriptions.removeAll()
+    }
+
     func schedule(runID: AgentRunID) {
-        guard workers[runID] == nil else { return }
+        guard !dataEraseSuspended, workers[runID] == nil else { return }
         workers[runID] = Task { [weak self] in
             guard let self else { return }
             await self.drive(runID: runID)

@@ -209,6 +209,8 @@ final class AppWorkflowSnapshotRegistry {
     static let shared = AppWorkflowSnapshotRegistry()
     private var templates: [String: AgentRunRequestSnapshot] = [:]
 
+    func removeAll() { templates.removeAll() }
+
     func register(conversationID: UUID, userTurnID: UUID, template: AgentRunRequestSnapshot) {
         templates[key(conversationID, userTurnID)] = template
     }
@@ -1111,6 +1113,11 @@ final class PendingSubmissionCache: @unchecked Sendable {
     private var insertionOrder: [AgentRunID] = []
     private let maximumEntries = 32
 
+    func removeAll() {
+        lock.lock(); defer { lock.unlock() }
+        stored.removeAll(); workflowStored.removeAll(); insertionOrder.removeAll()
+    }
+
     func store(_ submission: AgentRunSubmission) {
         lock.withLock {
             let runID = submission.request.runID
@@ -1210,6 +1217,11 @@ final class AppDynamicWorkflowChildRequestBuilder: WorkflowChildRequestBuilding,
 
     init(pendingSubmissions: PendingSubmissionCache) {
         self.pendingSubmissions = pendingSubmissions
+    }
+
+    func removeAll() {
+        lock.lock(); defer { lock.unlock() }
+        parents.removeAll()
     }
 
     func register(launch: WorkflowLaunchSnapshotV1, parent: Parent) throws {
@@ -1725,6 +1737,20 @@ public final class AgentRuntimeAssembly {
         )
     }
 
+    public func eraseAllRuntimeData() async throws {
+        await repository.close()
+        await dynamicWorkflowJournal.close()
+        try await artifactStore.eraseAllData()
+        let directory = repository.location.deletingLastPathComponent()
+        for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            where url.lastPathComponent != "artifacts" {
+            try FileManager.default.removeItem(at: url)
+        }
+        pendingSubmissions.removeAll()
+        AppWorkflowSnapshotRegistry.shared.removeAll()
+        await diagnosticLogger.removeAll()
+    }
+
     /// Builds the explicit model call that proposes a Claude-style JavaScript candidate. The
     /// returned run is only a generator/parent anchor: its answer is analyzed and previewed by
     /// `AppDynamicWorkflowService`; it never executes the proposed source automatically.
@@ -2006,6 +2032,8 @@ public actor AgentDiagnosticLogger: AgentExecutionLogging {
         entries.append(AgentDiagnosticEntry(code: code, metadata: metadata))
         if entries.count > 24 { entries.removeFirst(entries.count - 24) }
     }
+
+    public func removeAll() { entries.removeAll() }
 
     public func snapshot() -> [AgentDiagnosticEntry] {
         entries

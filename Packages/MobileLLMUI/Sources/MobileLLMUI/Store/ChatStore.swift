@@ -753,6 +753,10 @@ public final class ChatStore {
             cancelModelRestore?()
         }
 
+        let launches = Array(workflowLaunchTasks.values)
+        for task in launches { task.cancel() }
+        for task in launches { await task.value }
+        workflowLaunchTasks.removeAll()
         let generation = genTask
         if streaming != nil { stop() }
         generation?.cancel()
@@ -1226,6 +1230,8 @@ public final class ChatStore {
     /// callback keeps the message row live until completion. The workflow inherits the exact
     /// per-conversation tool selection; it can complete without web tools when the goal does not
     /// need them and can never widen the user's selection.
+    private var workflowLaunchTasks: [UUID: Task<Void, Never>] = [:]
+
     private func startWorkflow(goal: String) {
         guard workflowLaunch != nil,
               let convo = activeConversation ?? newConversation(),
@@ -1239,7 +1245,8 @@ public final class ChatStore {
         conversations[idx].messages.append(user)
         conversations[idx].updatedAt = Date()
         persist(conversations[idx])
-        Task { @MainActor in
+        workflowLaunchTasks[workflowID] = Task { @MainActor in
+            defer { workflowLaunchTasks[workflowID] = nil }
             await performWorkflowLaunch(
                 goal: goal,
                 conversationID: convo.id,

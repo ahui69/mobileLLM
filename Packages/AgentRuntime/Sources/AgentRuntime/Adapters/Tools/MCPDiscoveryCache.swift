@@ -28,6 +28,12 @@ public final class MCPDiscoveryCache: @unchecked Sendable {
     private let defaults: UserDefaults
     private let persistenceKey: String
     private var entries: [UUID: Entry] = [:]
+    private var epoch: UInt64 = 0
+
+    public var generation: UInt64 {
+        lock.lock(); defer { lock.unlock() }
+        return epoch
+    }
     private var credentialResolver: @Sendable (MCPServer) -> String?
 
     public init(
@@ -58,6 +64,7 @@ public final class MCPDiscoveryCache: @unchecked Sendable {
 
     public func removeAll() {
         lock.lock(); defer { lock.unlock() }
+        epoch &+= 1
         entries.removeAll()
         defaults.removeObject(forKey: persistenceKey)
     }

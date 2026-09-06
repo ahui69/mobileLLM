@@ -9,6 +9,27 @@ import XCTest
 // TEST-ID: AHT-CHAT-001
 // TEST-ID: AHT-OUTBOX-001
 final class AgentExecutorCoreIntegrationTests: XCTestCase {
+    func testEraseSuspendsAdmissionAndArtifactStoreCanStartFresh() async throws {
+        let model = try ExecutorTestModelDefinition(offset: 950)
+        let harness = try ExecutorTestHarness(offset: 950,
+            provider: FixedCompletionModelProvider(model: model, answer: "private answer"), model: model)
+        let handle = try await harness.executor.submit(harness.request, commandID: ExecutorTestID.command(950))
+        _ = try await collectTerminalEvents(from: harness.executor.attach(to: handle))
+        try await harness.executor.controller.suspendForDataErase()
+        do {
+            _ = try await harness.executor.submit(harness.request, commandID: ExecutorTestID.command(950))
+            XCTFail("erase gate must reject submissions even when idempotent")
+        } catch AgentExecutionError.internalInvariant { }
+        let files = harness.payloadStore.store
+        try await files.eraseAllData()
+        let content = Data("after erase".utf8)
+        let record = try await harness.payloadStore.commit(data: content, mimeType: "text/plain", semanticType: "fixture",
+            runID: harness.request.runID, stepID: nil, invocationID: nil, owner: .run(harness.request.runID), sensitivity: .personalData)
+        let loaded = try await files.data(for: record.id)
+        XCTAssertEqual(loaded, content)
+        await harness.executor.controller.resumeAfterDataErase()
+    }
+
     func testInternalWorkflowRunsSharingOneOriginStayRunScopedAndOutOfChat() async throws {
         let model = try ExecutorTestModelDefinition(offset: 92)
         let originMessageID = MessageID(rawValue: ExecutorTestID.uuid(92_001))
