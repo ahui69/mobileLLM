@@ -51,11 +51,11 @@ public struct LocalModelProvider: AgentModelProvider, Sendable {
         residencyDriver: LLMCoreModelResidencyDriver,
         artifactResolver: any LocalModelArtifactBytesResolving =
             UnavailableLocalModelArtifactResolver(),
-        configuration: LocalModelAdapterConfiguration = try! LocalModelAdapterConfiguration()
+        configuration: LocalModelAdapterConfiguration = try! LocalModelAdapterConfiguration(),
+        registration: LocalModelRegistration? = nil
     ) throws {
         guard descriptor.location == .onDevice,
-              !residencyDriver.registeredSelections.isEmpty,
-              residencyDriver.registeredSelections.contains(where: {
+              (registration.map { [$0.selection] } ?? residencyDriver.registeredSelections).contains(where: {
                   $0.providerID == descriptor.id
                     && $0.capabilityVersion == descriptor.capabilityVersion
               })

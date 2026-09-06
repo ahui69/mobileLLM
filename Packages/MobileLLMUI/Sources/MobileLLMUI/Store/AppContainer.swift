@@ -56,6 +56,7 @@ public final class AppContainer {
     /// Guards `bootstrap()` so the App scene + RootView both awaiting it decode sessions / restore the
     /// default selection exactly once (DESIGN §2 — the two `.task` sites used to race).
     private var bootstrapTask: Task<Void, Never>?
+    public var runtimeBootstrap: (@MainActor () async -> Void)?
     /// The in-flight conversation-model restore, and the generation that owns it. Selecting another thread
     /// bumps the generation: a superseded restore must neither win the engine nor rewrite the newly
     /// selected thread's remembered identity when it completes late.
@@ -340,6 +341,9 @@ public final class AppContainer {
         // Merge persisted community (Explore) models before resolving the default, so an adopted default
         // and the storage/switcher lists see them (DESIGN §2.4). This also rescans install state.
         await models.loadAdoptedRegistry()
+        await runtimeBootstrap?()
+        runtimeBootstrap = nil
+        await chat.recoverAgentRuns()
         do {
             try await skills.load()   // seed the built-in skills on first launch, else read them back from disk
         } catch {

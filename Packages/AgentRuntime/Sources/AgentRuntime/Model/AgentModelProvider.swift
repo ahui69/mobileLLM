@@ -109,10 +109,11 @@ public struct PreparedAgentModelAttempt: Sendable {
     }
 }
 
-/// Immutable provider registry. Resolution is exact by the pinned provider ID and never falls
+/// Append-only provider registry. Resolution is exact by the pinned provider ID and never falls
 /// back to a different (especially remote) provider.
-public struct StaticAgentModelProviderCatalog: Sendable {
-    private let providers: [AgentModelProviderID: any AgentModelProvider]
+public final class StaticAgentModelProviderCatalog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var providers: [AgentModelProviderID: any AgentModelProvider]
 
     public init(providers: [any AgentModelProvider]) throws {
         var indexed: [AgentModelProviderID: any AgentModelProvider] = [:]
@@ -124,9 +125,19 @@ public struct StaticAgentModelProviderCatalog: Sendable {
         self.providers = indexed
     }
 
+    /// Appends an exact provider identity. Existing frozen identities can never be replaced.
+    public func register(_ provider: any AgentModelProvider) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard providers[provider.descriptor.id] == nil else {
+            throw AgentModelRuntimeError.duplicateProvider(provider.descriptor.id)
+        }
+        providers[provider.descriptor.id] = provider
+    }
+
     public func provider(
         for selection: AgentModelSelection
     ) throws -> any AgentModelProvider {
+        lock.lock(); defer { lock.unlock() }
         guard let provider = providers[selection.providerID] else {
             throw AgentModelRuntimeError.providerNotFound(selection.providerID)
         }

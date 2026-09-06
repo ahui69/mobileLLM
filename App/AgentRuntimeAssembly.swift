@@ -999,6 +999,7 @@ struct AppAgentRunRequestBuilder: AgentRunRequestBuilding {
     let snapshot: @MainActor (UUID, UUID, String, [ImageRef]) -> AgentRunRequestSnapshot?
     let artifacts: AppAgentArtifactResolver
     let pendingSubmissions: PendingSubmissionCache
+    let localModels: LocalModelRegistrationCoordinator
 
     @MainActor
     func prepareSubmission(
@@ -1012,6 +1013,9 @@ struct AppAgentRunRequestBuilder: AgentRunRequestBuilding {
             throw AgentExecutionError.internalInvariant("agent snapshot unavailable")
         }
         return AgentRunSubmissionPreparation {
+            if !AppFrozenInputBuilder.isOnline(snapshot: snapshot) {
+                try await localModels.register(frozenBuilder.registration(snapshot: snapshot))
+            }
             let artifactReferences = try await artifacts.resolveCurrent(
                 imageRefs,
                 conversationID: conversationID
@@ -1566,6 +1570,7 @@ public final class AgentRuntimeAssembly {
         engine: any LLMEngine,
         downloadBase: URL,
         conversationDirectory: URL,
+        models: [LLMModel] = LLMCatalog.all,
         snapshot: @escaping @MainActor (UUID, UUID, String, [ImageRef]) -> AgentRunRequestSnapshot?,
         memoryStore: (any MemoryStoring)? = nil,
         eventStore: (any EventStoring)? = nil,
@@ -1607,7 +1612,7 @@ public final class AgentRuntimeAssembly {
         let diagnosticLogger = AgentDiagnosticLogger()
 
         let capabilityVersion = SemanticVersion("1.0.0")!
-        let registrations = try LLMCatalog.all.flatMap { model -> [LocalModelRegistration] in
+        let registrations = try models.flatMap { model -> [LocalModelRegistration] in
             try model.variants.map { variant in
                 try LocalModelRegistration(
                     providerID: try AppFrozenInputBuilder.providerID(model: model, variant: variant),
@@ -1671,7 +1676,10 @@ public final class AgentRuntimeAssembly {
             frozenBuilder: frozenBuilder,
             snapshot: snapshot,
             artifacts: artifactResolver,
-            pendingSubmissions: pendingSubmissions
+            pendingSubmissions: pendingSubmissions,
+            localModels: LocalModelRegistrationCoordinator(
+                catalog: providerCatalog, driver: residencyDriver, artifactResolver: attachmentResolver
+            )
         )
         requestBuilder = builder
         let freezer = AppAgentRunInputFreezer(

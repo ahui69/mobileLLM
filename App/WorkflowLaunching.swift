@@ -366,6 +366,11 @@ final class WorkflowLauncher {
         ) else {
             throw WorkflowLaunchError.snapshotUnavailable("dynamic workflow snapshot unavailable")
         }
+        if !AppFrozenInputBuilder.isOnline(snapshot: snapshot) {
+            try await assembly.requestBuilder.localModels.register(
+                assembly.frozenBuilder.registration(snapshot: snapshot)
+            )
+        }
         let generator = try assembly.makeDynamicWorkflowGenerator(snapshot: snapshot)
         let source = try await generatedSource(from: generator)
         do {
