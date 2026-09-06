@@ -263,7 +263,10 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
         "SharedArrayBuffer", "ArrayBuffer", "setTimeout", "setInterval", "setImmediate",
         "queueMicrotask", "Date", "Temporal", "performance", "crypto", "Reflect", "Proxy",
         "constructor", "prototype", "__proto__", "BigInt", "Symbol", "WeakRef", "FinalizationRegistry",
-        "class", "debugger", "with", "yield", "this", "get", "set",
+        "class", "debugger", "with", "yield", "this", "get", "set", "switch",
+        "Uint8Array", "Uint8ClampedArray", "Int8Array", "Uint16Array", "Int16Array",
+        "Uint32Array", "Int32Array", "Float16Array", "Float32Array", "Float64Array",
+        "BigInt64Array", "BigUint64Array", "DataView",
     ]
 
     /// JavaScriptCore cannot preempt one native builtin. These operations can amplify a small,
@@ -500,6 +503,16 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
 
     private static func instrument(source: String, tokens: [JSToken]) throws -> Instrumentation {
         var insertions: Set<Int> = [0]
+        var expressionStarts: [Int: Int] = [:]
+        var expressionEnds: [Int: Int] = [:]
+        var doTails: Set<Int> = []
+        for i in tokens.indices where tokens[i].identifier == "do" {
+            guard i + 1 < tokens.count, tokens[i + 1].symbol == "{",
+                  let end = matchingClose(in: tokens, openingAt: i + 1, open: "{", close: "}"),
+                  end + 1 < tokens.count, tokens[end + 1].identifier == "while"
+            else { throw WorkflowScriptAnalysisError.unsafeLoop("do requires an exact braced body and while tail") }
+            doTails.insert(end + 1)
+        }
         var index = 0
         while index < tokens.count {
             let token = tokens[index]
@@ -511,14 +524,14 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
                 let after = close + 1
                 if after >= tokens.count || tokens[after].symbol != "{" {
                     // `do { ... } while (...)` is already checkpointed at its `do` body.
-                    if token.identifier == "while", index > 0, tokens[index - 1].symbol == "}" {
-                        index = close + 1
+                    if token.identifier == "while", doTails.contains(index) {
+                        index += 1
                         continue
                     }
                     throw WorkflowScriptAnalysisError.unsafeLoop("\(token.identifier!) requires a braced body")
                 }
                 insertions.insert(tokens[after].end)
-                index = after + 1
+                index += 1
                 continue
             }
             if token.identifier == "do" {
@@ -526,15 +539,37 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
                     throw WorkflowScriptAnalysisError.unsafeLoop("do requires a braced body")
                 }
                 insertions.insert(tokens[index + 1].end)
-            } else if token.identifier == "function" {
-                guard let brace = tokens.indices.dropFirst(index + 1).first(where: {
-                    tokens[$0].symbol == "{" || tokens[$0].symbol == ";"
-                }), tokens[brace].symbol == "{"
-                else { throw WorkflowScriptAnalysisError.invalidSyntax("function body") }
-                insertions.insert(tokens[brace].end)
-            } else if token.symbol == "=>", index + 1 < tokens.count,
-                      tokens[index + 1].symbol == "{"
-            {
+            } else if token.symbol == "=>", index + 1 < tokens.count {
+                if tokens[index + 1].symbol == "{" {
+                    insertions.insert(tokens[index + 1].end)
+                } else {
+                    // Delimiter-balanced expressions preserve nested arrows and call arguments.
+                    // Ambiguous ASI forms are rejected; braces are always an available spelling.
+                    let start = index + 1
+                    var end = start
+                    var stack: [String] = []
+                    while end < tokens.count {
+                        let current = tokens[end]
+                        if stack.isEmpty, [",", ";", ")", "]", "}"].contains(current.symbol ?? "") { break }
+                        if stack.isEmpty, end > start, current.line > tokens[end - 1].line,
+                           ["return", "const", "let", "throw", "if", "for", "while"].contains(current.identifier ?? "") {
+                            throw WorkflowScriptAnalysisError.unsupportedConstruct("expression arrow requires an explicit delimiter or braced body")
+                        }
+                        if let symbol = current.symbol {
+                            if let close = ["(": ")", "[": "]", "{": "}"][symbol] { stack.append(close) }
+                            else if [")", "]", "}"].contains(symbol) {
+                                guard stack.popLast() == symbol else { throw WorkflowScriptAnalysisError.invalidSyntax("arrow expression delimiters") }
+                            }
+                        }
+                        end += 1
+                    }
+                    guard end > start, stack.isEmpty else { throw WorkflowScriptAnalysisError.invalidSyntax("arrow expression") }
+                    expressionStarts[tokens[start].start, default: 0] += 1
+                    expressionEnds[tokens[end - 1].end, default: 0] += 1
+                }
+            }
+            // Ordinary object methods also create callable bodies, including async methods.
+            if token.symbol == ")", index + 1 < tokens.count, tokens[index + 1].symbol == "{" {
                 insertions.insert(tokens[index + 1].end)
             }
             index += 1
@@ -544,12 +579,14 @@ public struct DynamicWorkflowScriptAnalyzer: Sendable {
         var result = ""
         result.reserveCapacity(source.utf8.count + insertions.count * 34)
         for position in 0 ... scalars.count {
-            if insertions.contains(position) {
-                result += "\n__workflowCheckpoint();\n"
+            if let count = expressionEnds[position] { result += String(repeating: ")", count: count) }
+            if insertions.contains(position) { result += "\n__workflowCheckpoint();\n" }
+            if let count = expressionStarts[position] {
+                result += String(repeating: "(__workflowCheckpoint(), ", count: count)
             }
             if position < scalars.count { result.unicodeScalars.append(scalars[position]) }
         }
-        return Instrumentation(source: result, insertions: insertions)
+        return Instrumentation(source: result, insertions: insertions.union(expressionStarts.keys))
     }
 
     private static func matchingClose(
