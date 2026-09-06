@@ -42,15 +42,17 @@ struct ExecutorTestModelDefinition: Sendable {
     init(
         offset: Int,
         toolCallingMode: ModelToolCallingMode = .nativeStructured,
-        additionalCapabilities: [AgentModelCapability] = []
+        additionalCapabilities: [AgentModelCapability] = [],
+        location: AgentModelProviderLocation = .onDevice,
+        providerName: String? = nil
     ) throws {
         let version = SemanticVersion("1.0.0")!
-        let providerID = try AgentModelProviderID("local.executor-test.\(offset)")
+        let providerID = try AgentModelProviderID(providerName ?? "local.executor-test.\(offset)")
         descriptor = AgentModelProviderDescriptor(
             id: providerID,
             adapterVersion: version,
             capabilityVersion: version,
-            location: .onDevice
+            location: location
         )
         selection = AgentModelSelection(
             providerID: providerID,
@@ -167,7 +169,9 @@ struct ExecutorTestHarness {
         budget suppliedBudget: AgentBudget? = nil,
         policyEngine suppliedPolicyEngine: (any ApprovalPolicyEngine)? = nil,
         repositoryFactory: ((SQLiteRunJournal) -> any RuntimeRepository)? = nil,
-        parallelToolBatchLimit: UInt16 = 1
+        parallelToolBatchLimit: UInt16 = 1,
+        localOnly: Bool = true,
+        approvalMode: AgentApprovalMode = .ask
     ) throws {
         self.model = model
         let runID = ExecutorTestID.run(offset)
@@ -187,7 +191,7 @@ struct ExecutorTestHarness {
             instruction: instruction,
             outputRequirement: outputRequirement,
             modelPolicy: AgentModelPolicy(
-                localOnly: true,
+                localOnly: localOnly,
                 allowedSelections: [model.selection],
                 strategy: .pinned,
                 requiredCapabilities: .init([])
@@ -195,6 +199,7 @@ struct ExecutorTestHarness {
             capabilityCeiling: capabilityCeiling,
             budget: budget,
             provenance: suppliedProvenance ?? AgentRequestProvenance(source: .user),
+            approvalMode: approvalMode,
             parallelToolBatchLimit: parallelToolBatchLimit
         )
         let logicalIDs = toolDescriptors.map(\.id.logicalID)

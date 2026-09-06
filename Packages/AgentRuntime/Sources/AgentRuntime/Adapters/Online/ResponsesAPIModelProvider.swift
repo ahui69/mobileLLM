@@ -137,7 +137,7 @@ public final class ResponsesAPIModelProvider: AgentModelProvider, @unchecked Sen
             toolCallingMode: .nativeStructured,
             cancellationGranularity: .token,
             resourceConstraints: ModelResourceConstraints(
-                maximumConcurrentAttempts: 1,
+                maximumConcurrentAttempts: 16,
                 requiresResidentModel: false,
                 requiresDrainBeforeSwitch: false
             ),

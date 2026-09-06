@@ -115,6 +115,7 @@ public actor AgentRunController {
     let clock: any AgentExecutionClock
     let logger: any AgentExecutionLogging
     let interactionContext: ApprovalInteractionContext
+    let rootGroups = RunGroupAdmission()
     var arbiter: ResourceArbiter
     let residencyDriver: any ModelResidencyDriver
     var dataEraseSuspended = false
