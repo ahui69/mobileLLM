@@ -1,59 +1,472 @@
+@'
 name: Build mobileLLM IPA
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: mobilellm-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Build unsigned iOS IPA
     runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      CI: "true"
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
 
-      - name: Install tools
+      - name: Verify Apple toolchain
         run: |
-          brew install xcodegen cmake
+          set -euo pipefail
+
+          if [ ! -d "$DEVELOPER_DIR" ]; then
+            echo "::error::Required Xcode installation not found: $DEVELOPER_DIR"
+            exit 1
+          fi
+
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR == 1 { print $2 }')"
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          ARCH="$(uname -m)"
+
+          echo "Xcode: $XCODE_VERSION"
+          echo "iPhoneOS SDK: $SDK_VERSION"
+          echo "Runner architecture: $ARCH"
+          swift --version
+
+          if [ "$XCODE_VERSION" != "26.3" ]; then
+            echo "::error::Expected Xcode 26.3, got Xcode $XCODE_VERSION"
+            exit 1
+          fi
+
+          case "$SDK_VERSION" in
+            26.*) ;;
+            *)
+              echo "::error::Expected iPhoneOS 26.x SDK, got $SDK_VERSION"
+              exit 1
+              ;;
+          esac
+
+          if [ "$ARCH" != "arm64" ]; then
+            echo "::error::Expected ARM64 runner, got $ARCH"
+            exit 1
+          fi
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+
+          missing=()
+
+          command -v xcodegen >/dev/null 2>&1 || missing+=("xcodegen")
+          command -v cmake >/dev/null 2>&1 || missing+=("cmake")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            brew install "${missing[@]}"
+          fi
+
+          echo "xcodegen:"
+          xcodegen --version
+
+          echo "cmake:"
+          cmake --version
+
+      - name: Allow Swift macros in CI
+        run: |
+          set -euo pipefail
+
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidation -bool YES
+
+      - name: Restore llama XCFramework cache
+        id: llama-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: Packages/LLMEngineLlama/Vendor/llama.xcframework
+          key: >-
+            llama-xcframework-v4-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{
+            hashFiles(
+            'scripts/build-llama-xcframework.sh',
+            'Packages/LLMEngineLlama/Package.swift'
+            ) }}
 
       - name: Build llama XCFramework
+        if: steps.llama-cache.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
+
           chmod +x scripts/build-llama-xcframework.sh
           ./scripts/build-llama-xcframework.sh
 
+      - name: Verify llama XCFramework
+        run: |
+          set -euo pipefail
+
+          XCFRAMEWORK="$GITHUB_WORKSPACE/Packages/LLMEngineLlama/Vendor/llama.xcframework"
+          INFO_PLIST="$XCFRAMEWORK/Info.plist"
+          LLAMA_BINARY="$XCFRAMEWORK/ios-arm64/llama.framework/llama"
+
+          if [ ! -d "$XCFRAMEWORK" ]; then
+            echo "::error::llama.xcframework does not exist"
+            exit 1
+          fi
+
+          if [ ! -f "$INFO_PLIST" ]; then
+            echo "::error::llama.xcframework/Info.plist does not exist"
+            exit 1
+          fi
+
+          python3 - "$INFO_PLIST" <<'PY'
+          import plistlib
+          import sys
+
+          path = sys.argv[1]
+
+          with open(path, "rb") as handle:
+              plist = plistlib.load(handle)
+
+          libraries = plist.get("AvailableLibraries", [])
+          identifiers = {
+              item.get("LibraryIdentifier")
+              for item in libraries
+              if isinstance(item, dict)
+          }
+
+          if "ios-arm64" not in identifiers:
+              raise SystemExit(
+                  "ERROR: llama.xcframework has no ios-arm64 slice; "
+                  f"available={sorted(x for x in identifiers if x)}"
+              )
+
+          print("XCFramework slices:")
+          for identifier in sorted(x for x in identifiers if x):
+              print(f"  {identifier}")
+          PY
+
+          if [ ! -f "$LLAMA_BINARY" ]; then
+            echo "::error::iOS llama framework binary not found: $LLAMA_BINARY"
+            exit 1
+          fi
+
+          LLAMA_ARCHS="$(xcrun lipo -archs "$LLAMA_BINARY")"
+          echo "llama iOS architectures: $LLAMA_ARCHS"
+
+          case " $LLAMA_ARCHS " in
+            *" arm64 "*) ;;
+            *)
+              echo "::error::llama iOS framework is missing arm64"
+              exit 1
+              ;;
+          esac
+
+          echo "llama.xcframework:"
+          du -sh "$XCFRAMEWORK"
+
+      - name: Save llama XCFramework cache
+        if: steps.llama-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: Packages/LLMEngineLlama/Vendor/llama.xcframework
+          key: ${{ steps.llama-cache.outputs.cache-primary-key }}
+
+      - name: Reclaim llama build workspace
+        run: |
+          set -euo pipefail
+
+          rm -rf "$GITHUB_WORKSPACE/.llama-build"
+
+          echo "Disk after llama cleanup:"
+          df -h "$GITHUB_WORKSPACE"
+
       - name: Generate Xcode project
         run: |
-          cp Signing.xcconfig.example Signing.xcconfig
+          set -euo pipefail
+
+          install -m 600 Signing.xcconfig.example Signing.xcconfig
+
           xcodegen generate
 
-      - name: Build unsigned app
+          if [ ! -f mobileLLM.xcodeproj/project.pbxproj ]; then
+            echo "::error::XcodeGen did not create mobileLLM.xcodeproj correctly"
+            exit 1
+          fi
+
+      - name: Resolve Swift packages
         run: |
+          set -euo pipefail
+
+          SPM_DIR="$RUNNER_TEMP/mobilellm-spm"
+          rm -rf "$SPM_DIR"
+          mkdir -p "$SPM_DIR"
+
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project mobileLLM.xcodeproj \
+            -scheme mobileLLM \
+            -clonedSourcePackagesDirPath "$SPM_DIR" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation
+
+          RESOLVED="$(
+            find mobileLLM.xcodeproj \
+              -type f \
+              -name Package.resolved \
+              -print \
+              -quit
+          )"
+
+          if [ -z "$RESOLVED" ] || [ ! -f "$RESOLVED" ]; then
+            echo "::error::Xcode did not generate Package.resolved"
+            exit 1
+          fi
+
+          echo "Resolved package graph:"
+          echo "$RESOLVED"
+
+          shasum -a 256 "$RESOLVED"
+
+      - name: Build unsigned iOS app
+        run: |
+          set -euo pipefail
+
+          SPM_DIR="$RUNNER_TEMP/mobilellm-spm"
+          BUILD_LOG="$RUNNER_TEMP/xcodebuild.log"
+          JOBS="$(sysctl -n hw.logicalcpu)"
+
+          : > "$BUILD_LOG"
+
+          echo "Building with $JOBS parallel jobs"
+
           xcodebuild \
             -project mobileLLM.xcodeproj \
             -scheme mobileLLM \
             -configuration Release \
             -sdk iphoneos \
-            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$GITHUB_WORKSPACE/build" \
+            -clonedSourcePackagesDirPath "$SPM_DIR" \
+            -disableAutomaticPackageResolution \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            -parallelizeTargets \
+            -jobs "$JOBS" \
+            -showBuildTimingSummary \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
-            clean build
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build \
+            2>&1 | tee "$BUILD_LOG"
 
-      - name: Package IPA
+      - name: Verify built app
         run: |
-          APP=$(find build -type d -name "*.app" | head -n 1)
+          set -euo pipefail
 
-          if [ -z "$APP" ]; then
-            echo "APP NOT FOUND"
+          APP="$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos/mobileLLM.app"
+          INFO="$APP/Info.plist"
+
+          if [ ! -d "$APP" ]; then
+            echo "::error::mobileLLM.app not found at expected path:"
+            echo "$APP"
+            echo "Available app bundles:"
+            find "$GITHUB_WORKSPACE/build" -type d -name "*.app" -print || true
             exit 1
           fi
 
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -r mobileLLM-unsigned.ipa Payload
+          if [ ! -f "$INFO" ]; then
+            echo "::error::Built application has no Info.plist"
+            exit 1
+          fi
+
+          plutil -lint "$INFO"
+
+          BUNDLE_ID="$(
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleIdentifier" \
+              "$INFO"
+          )"
+
+          EXECUTABLE="$(
+            /usr/libexec/PlistBuddy \
+              -c "Print :CFBundleExecutable" \
+              "$INFO"
+          )"
+
+          MINIMUM_OS="$(
+            /usr/libexec/PlistBuddy \
+              -c "Print :MinimumOSVersion" \
+              "$INFO"
+          )"
+
+          if [ "$BUNDLE_ID" != "wang.wangdongdong.mobileLLM" ]; then
+            echo "::error::Unexpected bundle identifier: $BUNDLE_ID"
+            exit 1
+          fi
+
+          if [ "$MINIMUM_OS" != "17.0" ]; then
+            echo "::error::Unexpected MinimumOSVersion: $MINIMUM_OS"
+            exit 1
+          fi
+
+          if [ -z "$EXECUTABLE" ] || [ ! -f "$APP/$EXECUTABLE" ]; then
+            echo "::error::Application executable is missing"
+            exit 1
+          fi
+
+          APP_ARCHS="$(xcrun lipo -archs "$APP/$EXECUTABLE")"
+          echo "App architectures: $APP_ARCHS"
+
+          case " $APP_ARCHS " in
+            *" arm64 "*) ;;
+            *)
+              echo "::error::Application executable is missing arm64"
+              exit 1
+              ;;
+          esac
+
+          LLAMA="$APP/Frameworks/llama.framework/llama"
+
+          if [ ! -f "$LLAMA" ]; then
+            echo "::error::Embedded llama.framework is missing"
+            find "$APP" -maxdepth 4 -type f -name llama -print || true
+            exit 1
+          fi
+
+          if ! otool -L "$APP/$EXECUTABLE" | grep -F "llama.framework/llama" >/dev/null; then
+            echo "::error::Application executable is not linked against llama.framework"
+            exit 1
+          fi
+
+          if /usr/bin/codesign -dv "$APP" >/dev/null 2>&1; then
+            echo "::error::Expected unsigned app, but application is code-signed"
+            exit 1
+          fi
+
+          echo "Verified:"
+          echo "  Bundle ID: $BUNDLE_ID"
+          echo "  Executable: $EXECUTABLE"
+          echo "  Minimum OS: $MINIMUM_OS"
+          echo "  Architectures: $APP_ARCHS"
+          echo "  Signing: unsigned"
+
+      - name: Package and verify IPA
+        id: package
+        run: |
+          set -euo pipefail
+
+          APP="$GITHUB_WORKSPACE/build/Build/Products/Release-iphoneos/mobileLLM.app"
+          IPA="$GITHUB_WORKSPACE/mobileLLM-unsigned.ipa"
+          STAGE="$RUNNER_TEMP/mobilellm-ipa-stage"
+          ENTRY_LIST="$RUNNER_TEMP/mobilellm-ipa-entries.txt"
+
+          rm -rf "$STAGE"
+          rm -f "$IPA" "$ENTRY_LIST"
+
+          mkdir -p "$STAGE/Payload"
+
+          /usr/bin/ditto \
+            "$APP" \
+            "$STAGE/Payload/mobileLLM.app"
+
+          (
+            cd "$STAGE"
+
+            COPYFILE_DISABLE=1 \
+              /usr/bin/zip \
+              -qry \
+              "$IPA" \
+              Payload
+          )
+
+          if [ ! -s "$IPA" ]; then
+            echo "::error::IPA was not created or is empty"
+            exit 1
+          fi
+
+          /usr/bin/unzip -tq "$IPA"
+
+          /usr/bin/unzip -Z1 "$IPA" > "$ENTRY_LIST"
+
+          if ! grep -Fxq \
+            "Payload/mobileLLM.app/Info.plist" \
+            "$ENTRY_LIST"
+          then
+            echo "::error::IPA does not contain Payload/mobileLLM.app/Info.plist"
+            exit 1
+          fi
+
+          if grep -Eq '^__MACOSX/|/\._' "$ENTRY_LIST"; then
+            echo "::error::IPA contains forbidden AppleDouble/resource-fork entries"
+            exit 1
+          fi
+
+          SHA256="$(
+            /usr/bin/shasum -a 256 "$IPA" |
+              awk '{ print $1 }'
+          )"
+
+          SIZE_BYTES="$(
+            /usr/bin/stat -f '%z' "$IPA"
+          )"
+
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          echo "size_bytes=$SIZE_BYTES" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### mobileLLM unsigned IPA"
+            echo
+            echo "- Xcode: \`26.3\`"
+            echo "- Bundle: \`wang.wangdongdong.mobileLLM\`"
+            echo "- SHA-256: \`$SHA256\`"
+            echo "- Size: \`$SIZE_BYTES bytes\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "IPA verified:"
+          ls -lh "$IPA"
+          echo "SHA-256: $SHA256"
 
       - name: Upload IPA
-        uses: actions/upload-artifact@v4
+        id: upload-ipa
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: mobileLLM-IPA
           path: mobileLLM-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+          archive: false
+
+      - name: Publish artifact metadata
+        run: |
+          {
+            echo
+            echo "- GitHub artifact digest: \`${{ steps.upload-ipa.outputs.artifact-digest }}\`"
+            echo "- Artifact: ${{ steps.upload-ipa.outputs.artifact-url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Xcode log on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
+          archive: false
+'@ | Set-Content -Encoding UTF8 .github\workflows\build-ios-ipa.yml
