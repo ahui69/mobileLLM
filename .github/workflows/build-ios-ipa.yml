@@ -1,0 +1,59 @@
+name: Build mobileLLM IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          brew install xcodegen cmake
+
+      - name: Build llama XCFramework
+        run: |
+          chmod +x scripts/build-llama-xcframework.sh
+          ./scripts/build-llama-xcframework.sh
+
+      - name: Generate Xcode project
+        run: |
+          cp Signing.xcconfig.example Signing.xcconfig
+          xcodegen generate
+
+      - name: Build unsigned app
+        run: |
+          xcodebuild \
+            -project mobileLLM.xcodeproj \
+            -scheme mobileLLM \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            clean build
+
+      - name: Package IPA
+        run: |
+          APP=$(find build -type d -name "*.app" | head -n 1)
+
+          if [ -z "$APP" ]; then
+            echo "APP NOT FOUND"
+            exit 1
+          fi
+
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -r mobileLLM-unsigned.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobileLLM-IPA
+          path: mobileLLM-unsigned.ipa
