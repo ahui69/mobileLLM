@@ -1,4 +1,3 @@
-@'
 name: Build mobileLLM IPA
 
 on:
@@ -469,4 +468,3 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
           archive: false
-'@ | Set-Content -Encoding UTF8 .github\workflows\build-ios-ipa.yml
